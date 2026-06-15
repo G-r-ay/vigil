@@ -197,10 +197,26 @@ export default function ClaudeDrawer({ open, onClose, initialMessages, initialAg
   const [traceLoading, setTraceLoading] = useState(false)
   const [collapsedThinking, setCollapsedThinking] = useState<Record<string, boolean>>({})
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  // Stick the view to the bottom as new content streams in, but back off the
+  // moment the user scrolls up (so they can read history mid-stream). Resumes
+  // automatically once they scroll back near the bottom. Kept in a ref so the
+  // scroll listener doesn't trigger re-renders or read stale state.
+  const stickToBottomRef = useRef(true)
 
-  const scrollToBottom = () => messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  const scrollToBottom = (smooth = false) => {
+    if (!stickToBottomRef.current) return
+    messagesEndRef.current?.scrollIntoView({ behavior: smooth ? 'smooth' : 'auto' })
+  }
 
-  useEffect(() => { scrollToBottom() }, [tabs, currentTab])
+  const handleMessagesScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    const el = e.currentTarget
+    // within ~80px of the bottom counts as "at bottom"
+    stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+  }
+
+  useEffect(() => { scrollToBottom(true) }, [tabs, currentTab])
+  // Follow streaming content live (instant, not smooth, to keep up with chunks)
+  useEffect(() => { scrollToBottom() }, [streamingText, streamingThinking, isProcessingTools])
   useEffect(() => { try { localStorage.setItem('claudeDrawerTabs', JSON.stringify(tabs)) } catch { /* ignore */ } }, [tabs])
   
   // Debug logging for messages (only in development)
@@ -509,6 +525,7 @@ export default function ClaudeDrawer({ open, onClose, initialMessages, initialAg
     setStreamingText('')
     setIsThinking(false)
     setIsProcessingTools(false)
+    stickToBottomRef.current = true  // re-engage auto-scroll for the new reply
 
     try {
       logger.request('📤 === API REQUEST ===', {
@@ -1087,7 +1104,7 @@ export default function ClaudeDrawer({ open, onClose, initialMessages, initialAg
           </Tooltip>
         </Box>
 
-        <Box sx={{ flex: 1, overflow: 'auto', p: 2 }}>
+        <Box sx={{ flex: 1, overflow: 'auto', p: 2 }} onScroll={handleMessagesScroll}>
           {/* Context window warning banner */}
           {estimatedTokens > 100000 && tabs[currentTab]?.messages.length > 0 && (
             <Box sx={{
@@ -1206,7 +1223,7 @@ export default function ClaudeDrawer({ open, onClose, initialMessages, initialAg
               <Typography variant="caption" sx={{ fontWeight: 600, color: 'text.secondary', mb: 0.5, display: 'block' }}>
                 Vigil
               </Typography>
-              <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>{streamingText}</Typography>
+              <MarkdownMessage>{streamingText}</MarkdownMessage>
             </Box>
           )}
 
