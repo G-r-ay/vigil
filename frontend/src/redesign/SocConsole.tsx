@@ -6,12 +6,17 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import './styles.css'
+import { useAuth } from '../contexts/AuthContext'
+import { configApi, orchestratorApi } from '../services/api'
 import { Icon } from './shared/icons'
 import { NAV, TITLES, type ScreenKey } from './data/data'
-import { ACCENTS, accentVars, lighten, normHex } from './shell/accent'
+import { accentVars } from './shell/accent'
 import Chat from './shell/Chat'
-import Tweaks, { type Columns, type Density, type InsightsMode } from './shell/Tweaks'
+import UserMenu from './shell/UserMenu'
 import ErrorBoundary from './shell/ErrorBoundary'
+import { ToastProvider } from './shell/toast'
+import { useDesktopNotifications } from './shell/useDesktopNotifications'
+import { RedesignThemeProvider, useSocTheme } from './shell/theme'
 import type { ScreenProps } from './shared/types'
 import DashboardScreen from './screens/dashboard/DashboardScreen'
 import CasesScreen from './screens/cases/CasesScreen'
@@ -19,10 +24,10 @@ import MetricsScreen from './screens/metrics/MetricsScreen'
 import AnalyticsScreen from './screens/analytics/AnalyticsScreen'
 import DecisionsScreen from './screens/decisions/DecisionsScreen'
 import WorkflowsScreen from './screens/workflows/WorkflowsScreen'
+import AutoOpsScreen from './screens/autoops/AutoOpsScreen'
 import SettingsScreen from './screens/settings/SettingsScreen'
 import NotFoundScreen from './screens/notfound/NotFoundScreen'
-import vigilMark from './assets/vigil-mark.png'
-import vigilLogo from './assets/vigil-logo.png'
+import { VigilMark, VigilLogo } from './shared/VigilLogo'
 
 const SCREENS: Record<ScreenKey, (props: ScreenProps) => JSX.Element> = {
   dashboard: DashboardScreen,
@@ -31,6 +36,7 @@ const SCREENS: Record<ScreenKey, (props: ScreenProps) => JSX.Element> = {
   analytics: AnalyticsScreen,
   decisions: DecisionsScreen,
   workflows: WorkflowsScreen,
+  autoops: AutoOpsScreen,
   settings: SettingsScreen,
 }
 
@@ -38,26 +44,55 @@ const SCREEN_KEYS = Object.keys(SCREENS) as ScreenKey[]
 const isScreenKey = (s: string | undefined): s is ScreenKey =>
   s !== undefined && (SCREEN_KEYS as string[]).includes(s)
 
-interface AccentState {
-  key: string | null
-  a: string
-  b: string
+/** Per-screen permission gate, mirroring the production ProtectedRoute routes
+ *  (App.tsx). Screens absent here are ungated. In DEV_MODE the auth context
+ *  grants every permission, so all items show in the preview. */
+const SCREEN_PERMS: Partial<Record<ScreenKey, string>> = {
+  cases: 'cases.read',
+  decisions: 'ai_decisions.approve',
+  settings: 'settings.read',
 }
 
 export default function SocConsole() {
+  // the theme provider is the single source of truth for mode + accent, read
+  // here and written from the Appearance settings page; it must wrap the inner
+  // shell (which both styles .soc-console and renders the settings screen).
+  return (
+    <RedesignThemeProvider>
+      <SocConsoleInner />
+    </RedesignThemeProvider>
+  )
+}
+
+function SocConsoleInner() {
   // the active screen comes from the URL (/redesign/<screen>); the cases
   // screen additionally carries its open case in a ?case=<id> query param.
   const navigate = useNavigate()
+  const { hasPermission } = useAuth()
   const { screen } = useParams<{ screen?: string }>()
   // an unknown segment (e.g. /redesign/foo) renders the 404 screen; `current`
   // falls back to dashboard only so the chrome has a valid key to render.
   const valid = isScreenKey(screen)
   const current: ScreenKey = valid ? screen : 'dashboard'
+  // whether the user may view the current screen (DEV_MODE → always true)
+  const currentPerm = valid ? SCREEN_PERMS[current] : undefined
+  const allowed = !currentPerm || hasPermission(currentPerm)
 
+  const { mode, accent } = useSocTheme()
   const [chatOpen, setChatOpen] = useState(false)
   const [chatSeed, setChatSeed] = useState<string | null>(null)
-  const [tweaksOpen, setTweaksOpen] = useState(false)
   const [viewFull, setViewFull] = useState(false)
+  // runtime-dynamic rail membership (mirrors production NavigationRail):
+  // integrations are fetched once, orchestrator status is polled every 10s. No
+  // rail item is gated today — Auto Ops is intentionally always-visible and
+  // Timesketch has no redesign screen yet — but the plumbing is live so adding
+  // a NavGate to data.ts is the only step needed to gate one (see data.ts).
+  const [enabledIntegrations, setEnabledIntegrations] = useState<string[]>([])
+  const [orchestratorEnabled, setOrchestratorEnabled] = useState(false)
+
+  // fire desktop notifications for newly-arrived findings (gated by the General
+  // `show_notifications` setting + browser permission)
+  useDesktopNotifications()
   // nav rail collapsed (icons only) vs. expanded (icons + labels); sticky
   const [railExpanded, setRailExpanded] = useState<boolean>(() => {
     try {
@@ -77,11 +112,6 @@ export default function SocConsole() {
       return next
     })
   }, [])
-
-  const [accent, setAccent] = useState<AccentState>({ key: 'violet', a: '#7d74f3', b: '#9a92f7' })
-  const [density, setDensity] = useState<Density>('comfortable')
-  const [columns, setColumns] = useState<Columns>('auto')
-  const [insights, setInsights] = useState<InsightsMode>('pinned')
 
   const openChat = useCallback((prompt?: string) => {
     setChatOpen(true)
@@ -103,31 +133,36 @@ export default function SocConsole() {
     setViewFull(false)
   }, [current])
 
-  const onPreset = (key: string) => {
-    const [a, b] = ACCENTS[key]
-    setAccent({ key, a, b })
-  }
-  const onHex = (input: string): boolean => {
-    const a = normHex(input)
-    if (!a) return false
-    setAccent({ key: null, a, b: lighten(a, 0.22) })
-    return true
-  }
+  // nav membership: integrations once, orchestrator status on a 10s poll
+  useEffect(() => {
+    configApi
+      .getIntegrations()
+      .then((res) =>
+        setEnabledIntegrations((res.data as { enabled_integrations?: string[] })?.enabled_integrations || []),
+      )
+      .catch(() => setEnabledIntegrations([]))
+    const pollStatus = () =>
+      orchestratorApi
+        .getStatus()
+        .then((res) => setOrchestratorEnabled(Boolean((res.data as { enabled?: boolean })?.enabled)))
+        .catch(() => {
+          /* keep the previous value on a transient failure */
+        })
+    pollStatus()
+    const id = setInterval(pollStatus, 10_000)
+    return () => clearInterval(id)
+  }, [])
 
   const [title, sub] = valid ? TITLES[current] : ['Page not found', 'This page doesn’t exist']
   const Screen = SCREENS[current]
 
-  const wrapperClass = [
-    'soc-console',
-    density === 'compact' ? 'compact' : '',
-    insights === 'inline' ? 'insights-inline' : '',
-    chatOpen ? 'chat-active' : '',
-  ].filter(Boolean).join(' ')
+  const wrapperClass = ['soc-console', chatOpen ? 'chat-active' : ''].filter(Boolean).join(' ')
 
-  const mainClass = ['main', `cols-${columns}`, chatOpen ? 'chat-open' : ''].filter(Boolean).join(' ')
+  const mainClass = ['main', chatOpen ? 'chat-open' : ''].filter(Boolean).join(' ')
 
   return (
-    <div className={wrapperClass} style={accentVars(accent.a, accent.b)}>
+    <div className={wrapperClass} data-theme={mode} style={accentVars(accent.a, accent.b)}>
+      <ToastProvider>
       <div className="shell">
         {/* nav rail */}
         <nav className={`rail${railExpanded ? ' expanded' : ''}`}>
@@ -137,11 +172,17 @@ export default function SocConsole() {
             aria-label={railExpanded ? 'Collapse navigation' : 'Expand navigation'}
             aria-expanded={railExpanded}
           >
-            <img className="nav-logo mark" src={vigilMark} alt="Vigil" />
-            <img className="nav-logo full" src={vigilLogo} alt="Vigil" />
+            <VigilMark className="nav-logo mark" />
+            <VigilLogo className="nav-logo full" />
           </button>
           <div className="rail-sep" />
-          {NAV.map((n) => {
+          {NAV.filter(([, , key, gate]) => {
+            const perm = key ? SCREEN_PERMS[key] : undefined
+            if (perm && !hasPermission(perm)) return false
+            if (gate?.integration && !enabledIntegrations.includes(gate.integration)) return false
+            if (gate?.orchestrator && !orchestratorEnabled) return false
+            return true
+          }).map((n) => {
             const [icon, label, key] = n
             const active = valid && key === current
             return (
@@ -157,6 +198,8 @@ export default function SocConsole() {
               </button>
             )
           })}
+          <div className="nav-spacer" />
+          <UserMenu />
         </nav>
 
         {/* main */}
@@ -167,17 +210,21 @@ export default function SocConsole() {
               <p>{sub}</p>
             </div>
             <div className="grow" />
-            <button className="btn ghost icon" title="Theme tweaks" onClick={() => setTweaksOpen((v) => !v)}>
-              <Icon name="gear" />
-            </button>
           </header>
           <main className="view" style={{ overflowY: viewFull ? 'hidden' : 'auto' }}>
             <div className="screen" style={viewFull ? { height: '100%' } : undefined}>
               <ErrorBoundary resetKey={valid ? current : 'notfound'}>
-                {valid ? (
-                  <Screen openChat={openChat} setViewFull={setViewFull} />
-                ) : (
+                {!valid ? (
                   <NotFoundScreen path={screen} onHome={() => go('dashboard')} />
+                ) : !allowed ? (
+                  <div className="access-denied">
+                    <Icon name="lock" size={26} />
+                    <h2>Access denied</h2>
+                    <p>You don’t have permission to view this page{currentPerm ? ` (requires ${currentPerm})` : ''}.</p>
+                    <button className="btn primary" onClick={() => go('dashboard')}>Back to Dashboard</button>
+                  </div>
+                ) : (
+                  <Screen openChat={openChat} setViewFull={setViewFull} />
                 )}
               </ErrorBoundary>
             </div>
@@ -198,21 +245,7 @@ export default function SocConsole() {
           <span>Ask Vigil</span>
         </button>
       )}
-
-      <Tweaks
-        show={tweaksOpen}
-        onClose={() => setTweaksOpen(false)}
-        accentKey={accent.key}
-        accentHex={accent.a}
-        onPreset={onPreset}
-        onHex={onHex}
-        density={density}
-        onDensity={() => setDensity((d) => (d === 'compact' ? 'comfortable' : 'compact'))}
-        columns={columns}
-        onColumns={setColumns}
-        insights={insights}
-        onInsights={setInsights}
-      />
+      </ToastProvider>
     </div>
   )
 }

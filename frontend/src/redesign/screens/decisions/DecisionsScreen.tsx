@@ -23,7 +23,7 @@ import {
   type ApprovalAction,
 } from './useDecisions'
 import { aiDecisionsApi, approvalsApi } from '../../../services/api'
-import { Popup, Field, TextInput, Select, Rating, Slider, Dropdown } from '../../shared/ui'
+import { Popup, Field, TextInput, Select, Rating, Slider, Dropdown, activateOnKey } from '../../shared/ui'
 
 type DecTab = 'pending' | 'all' | 'analytics' | 'approvals'
 type Assessment = 'agree' | 'partial' | 'disagree'
@@ -469,7 +469,15 @@ function DecisionsDetail({
         </div>
         <div style={{ overflowY: 'auto', flex: 1, minHeight: 0 }}>
           {decisions.map((x) => (
-            <div key={x.id} className={`case-row ${x.id === id ? 'sel' : ''}`} onClick={() => onSelect(x.id)}>
+            <div
+              key={x.id}
+              role="button"
+              tabIndex={0}
+              aria-label={`Open decision ${x.id}`}
+              className={`case-row ${x.id === id ? 'sel' : ''}`}
+              onClick={() => onSelect(x.id)}
+              onKeyDown={activateOnKey(() => onSelect(x.id))}
+            >
               <div className="cr-top">
                 <span className="chip" style={{ borderColor: 'var(--accent-line)', color: 'var(--accent-2)', fontSize: 11 }}>{x.agent}</span>
                 <span style={{ marginLeft: 'auto' }}>{outcomeChip(x.outcome)}</span>
@@ -636,9 +644,15 @@ export default function DecisionsScreen({ setViewFull }: ScreenProps) {
     <>
       <DecKpis s={stats.stats} />
       <div className="bar-row" style={{ borderBottom: 0, paddingBottom: 4 }}>
-        <div className="tabs">
+        <div className="tabs" role="tablist" aria-label="Decision views">
           {tabs.map(([k, label, n]) => (
-            <button key={k} className={`tab ${k === tab ? 'active' : ''}`} onClick={() => setTab(k)}>
+            <button
+              key={k}
+              role="tab"
+              aria-selected={k === tab}
+              className={`tab ${k === tab ? 'active' : ''}`}
+              onClick={() => setTab(k)}
+            >
               {label}{n != null ? ` (${n})` : ''}
             </button>
           ))}
@@ -655,7 +669,7 @@ export default function DecisionsScreen({ setViewFull }: ScreenProps) {
           )}
           <div className="search" style={{ marginLeft: 'auto', maxWidth: 280 }}>
             <span><Icon name="search" /></span>
-            <input placeholder="Search decisions…" value={query} onChange={(e) => setQuery(e.target.value)} />
+            <input aria-label="Search decisions" placeholder="Search decisions…" value={query} onChange={(e) => setQuery(e.target.value)} />
           </div>
         </div>
       )}

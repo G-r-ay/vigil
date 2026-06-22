@@ -28,9 +28,15 @@ export default function DashboardScreen({ openChat }: ScreenProps) {
   return (
     <>
       <div className="flex items-center gap-3 flex-wrap px-[22px] py-[13px] border-b border-line tabbar">
-        <div className="tabs">
+        <div className="tabs" role="tablist" aria-label="Dashboard views">
           {tabs.map(([k, label]) => (
-            <button key={k} className={`tab${tab === k ? ' active' : ''}`} onClick={() => setTab(k)}>
+            <button
+              key={k}
+              role="tab"
+              aria-selected={tab === k}
+              className={`tab${tab === k ? ' active' : ''}`}
+              onClick={() => setTab(k)}
+            >
               {label}
             </button>
           ))}
@@ -190,7 +196,7 @@ function FindingsTab({ openChat }: { openChat: (prompt?: string) => void }) {
       <div className="flex items-center gap-3 flex-wrap px-[22px] py-[13px] border-b border-line">
         <div className="search" style={{ maxWidth: 300 }}>
           <span><Icon name="search" /></span>
-          <input placeholder="Search findings, hosts, techniques…" value={query} onChange={(e) => setQuery(e.target.value)} />
+          <input aria-label="Search findings" placeholder="Search findings, hosts, techniques…" value={query} onChange={(e) => setQuery(e.target.value)} />
         </div>
         <FilterButton
           activeCount={(sev !== 'any' ? 1 : 0) + (src !== 'any' ? 1 : 0)}
@@ -279,6 +285,7 @@ function FindingsTab({ openChat }: { openChat: (prompt?: string) => void }) {
           Rows per page:
           <select
             className="pg-size"
+            aria-label="Rows per page"
             value={pageSize}
             onChange={(e) => setPageSize(Number(e.target.value))}
           >
@@ -301,7 +308,7 @@ function FindingsTab({ openChat }: { openChat: (prompt?: string) => void }) {
           ><Icon name="chevR" size={14} /></button>
         </span>
       </div>
-      <FindingPopup id={detailId} onClose={() => setDetailId(null)} />
+      <FindingPopup id={detailId} onClose={() => setDetailId(null)} onChanged={() => { reload(); reloadKpis() }} />
     </>
   )
 }
@@ -346,7 +353,7 @@ function AttackTab() {
         <div className="flex-1" />
         <div className="conf-ctrl">
           <span className="bar-cap">Min confidence</span>
-          <input type="range" min={0} max={0.99} step={0.01} value={conf} className="conf-range" onChange={(e) => setConf(parseFloat(e.target.value))} />
+          <input type="range" min={0} max={0.99} step={0.01} value={conf} className="conf-range" aria-label="Minimum confidence threshold" onChange={(e) => setConf(parseFloat(e.target.value))} />
           <span className="mono" style={{ color: 'var(--tx-2)', fontSize: '12.5px' }}>{conf.toFixed(2)}</span>
         </div>
         <button className="btn ghost icon" title="Refresh" onClick={reload}><Icon name="refresh" /></button>

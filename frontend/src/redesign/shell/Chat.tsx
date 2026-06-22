@@ -9,8 +9,17 @@ import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import { format } from 'date-fns'
 import { Markdown } from '../shared/Markdown'
 import { Icon } from '../shared/icons'
-import { basePath } from '../../config/basePath'
-import { agentsApi, claudeApi, mcpApi } from '../../services/api'
+import {
+  agentsApi,
+  aiConfigApi,
+  analyticsApi,
+  claudeApi,
+  mcpApi,
+  reasoningApi,
+  streamFetch,
+  type CostEstimate,
+} from '../../services/api'
+import { notificationService } from '../../services/notifications'
 import { Popup, Select } from '../shared/ui'
 
 interface ChatAgent {
@@ -29,6 +38,35 @@ interface ChatMsg {
   ms?: number
 }
 
+/* ---------- reasoning trace (GH #79 — chain-of-thought visibility) ---------- */
+interface SessionSummary {
+  total_interactions: number
+  total_cost_usd: number
+  total_input_tokens: number
+  total_output_tokens: number
+}
+interface TraceItem {
+  interaction_id: string
+  created_at?: string
+  has_thinking?: boolean
+  has_tools?: boolean
+  agent_id?: string
+  input_tokens?: number
+  output_tokens?: number
+  cost_usd?: number
+}
+interface TraceDetail {
+  interaction_id: string
+  model?: string
+  stop_reason?: string
+  duration_ms?: number
+  cost_usd?: number
+  thinking_content?: string
+  response_content?: string
+  tool_calls?: Array<{ name?: string; input?: unknown }>
+  tool_results?: Array<{ tool_use_id?: string; content?: unknown; is_error?: boolean }>
+}
+
 const MODEL = 'claude-sonnet-4-6'
 const CONTEXT_WINDOW = 200000
 // shown only until the live model list arrives from GET /claude/models
@@ -44,6 +82,10 @@ interface Conversation {
   title: string
   ts: number
   messages: ChatMsg[]
+  /** investigation dedup key (the seed prompt) when this thread was opened from
+   *  an "Investigate with Vigil" affordance — lets re-opening the same finding/
+   *  case restore the thread instead of starting a duplicate one */
+  key?: string
 }
 const HISTORY_KEY = 'soc.chat.history'
 const HISTORY_MAX = 30
@@ -82,6 +124,23 @@ function loadSettings(): ChatSettings {
 }
 
 
+/* format an interaction timestamp for the trace list (HH:mm:ss, guarded) */
+function traceTime(s?: string): string {
+  if (!s) return '—'
+  const d = new Date(s)
+  return isNaN(d.getTime()) ? '—' : format(d, 'HH:mm:ss')
+}
+/* render tool input/results as readable JSON without throwing on cycles */
+function safeJson(v: unknown): string {
+  if (v == null) return ''
+  if (typeof v === 'string') return v
+  try {
+    return JSON.stringify(v, null, 2)
+  } catch {
+    return String(v)
+  }
+}
+
 function VigilMessage({ text, thinking, ms }: { text: string; thinking?: string; ms?: number }) {
   const [open, setOpen] = useState(false)
   return (
@@ -119,6 +178,9 @@ export default function Chat({
   const [streamText, setStreamText] = useState('')
   const [streamThinking, setStreamThinking] = useState('')
   const [isThinking, setIsThinking] = useState(false)
+  // true between a `tool_processing` event and the next `text` chunk — the
+  // backend is executing MCP tools, mirroring the classic drawer's indicator
+  const [isProcessingTools, setIsProcessingTools] = useState(false)
   const [agents, setAgents] = useState<ChatAgent[]>([])
   const [agentId, setAgentId] = useState('')
   const [menuOpen, setMenuOpen] = useState(false)
@@ -135,6 +197,16 @@ export default function Chat({
   const [systemPrompt, setSystemPrompt] = useState(savedSettings.systemPrompt)
   const [models, setModels] = useState<{ id: string; name: string }[]>([])
   const [mcpStatus, setMcpStatus] = useState<{ available: number; total: number } | null>(null)
+  // live pre-call estimate from the backend (exact count_tokens + USD band),
+  // mirroring the classic drawer; null until the first debounced estimate lands
+  const [costEstimate, setCostEstimate] = useState<CostEstimate | null>(null)
+  const [exactTokens, setExactTokens] = useState<number | null>(null)
+  // reasoning trace — the per-interaction chain-of-thought for this session
+  const [traceOpen, setTraceOpen] = useState(false)
+  const [traceLoading, setTraceLoading] = useState(false)
+  const [traceItems, setTraceItems] = useState<TraceItem[]>([])
+  const [traceSelected, setTraceSelected] = useState<TraceDetail | null>(null)
+  const [sessionSummary, setSessionSummary] = useState<SessionSummary | null>(null)
 
   const sessionRef = useRef<string>(newSessionId())
   const bodyRef = useRef<HTMLDivElement>(null)
@@ -142,6 +214,16 @@ export default function Chat({
   const abortRef = useRef<AbortController | null>(null)
   const menuRef = useRef<HTMLDivElement>(null)
   const openerRef = useRef<HTMLElement | null>(null)
+  const panelRef = useRef<HTMLElement>(null)
+  // the investigation key (seed prompt) of the current thread, if any
+  const currentKeyRef = useRef<string | null>(null)
+  // Default the model to the configured `chat_default` assignment (Settings →
+  // AI Config) unless the user already has saved settings or picks a model
+  // this session — then their choice wins.
+  const settingsExistedRef = useRef<boolean>(
+    typeof localStorage !== 'undefined' && localStorage.getItem(SETTINGS_KEY) != null,
+  )
+  const userPickedModelRef = useRef(false)
 
   // focus the composer when the dock opens; return focus to the opener on close
   useEffect(() => {
@@ -154,17 +236,47 @@ export default function Chat({
     }
   }, [open])
 
-  // Esc closes the agent menu first, then the dock
+  // any of the dock's own dialogs (they own their Esc + focus handling)
+  const anyPopupOpen = historyOpen || settingsOpen || agentsInfoOpen || traceOpen
+
+  // Esc closes the agent menu first, then the dock — but never while one of the
+  // dock's Popups is open (those handle their own Esc; closing the dock too
+  // would dismiss both at once)
   useEffect(() => {
     if (!open) return
     const onKey = (e: globalThis.KeyboardEvent) => {
-      if (e.key !== 'Escape') return
+      if (e.key !== 'Escape' || anyPopupOpen) return
       if (menuOpen) setMenuOpen(false)
       else onClose()
     }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
-  }, [open, menuOpen, onClose])
+  }, [open, menuOpen, onClose, anyPopupOpen])
+
+  // focus trap — keep Tab within the dock while it's open (unless a Popup is
+  // up, which traps focus itself). Completes the dialog a11y: role=dialog +
+  // aria-modal + Esc + focus-return are already wired (REDESIGN_GAPS.md §10).
+  const onPanelKeyDown = (e: KeyboardEvent<HTMLElement>) => {
+    if (e.key !== 'Tab' || !open || anyPopupOpen) return
+    const root = panelRef.current
+    if (!root) return
+    const f = Array.from(
+      root.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), textarea, input, a[href], [tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter((el) => el.offsetParent !== null)
+    if (f.length === 0) return
+    const first = f[0]
+    const last = f[f.length - 1]
+    const active = document.activeElement as HTMLElement
+    if (e.shiftKey && active === first) {
+      e.preventDefault()
+      last.focus()
+    } else if (!e.shiftKey && active === last) {
+      e.preventDefault()
+      first.focus()
+    }
+  }
 
   // load the agent roster once
   useEffect(() => {
@@ -188,6 +300,15 @@ export default function Chat({
     claudeApi
       .getModels()
       .then((r) => setModels((r.data?.models || []) as { id: string; name: string }[]))
+      .catch(() => {})
+    aiConfigApi
+      .getConfig()
+      .then((r) => {
+        const configured = r.data?.assignments?.chat_default?.model_id
+        if (configured && !settingsExistedRef.current && !userPickedModelRef.current) {
+          setModel(configured)
+        }
+      })
       .catch(() => {})
     mcpApi
       .getStatuses()
@@ -234,34 +355,89 @@ export default function Chat({
 
   const agentName = agents.find((a) => a.id === agentId)?.name || 'Default agent'
 
-  // rough client-side context estimate (~chars/4) for the Status gauge — the
-  // exact server count_tokens isn't worth a round-trip in the preview dock
-  const estimatedTokens = useMemo(() => {
+  // Pre-call cost + exact-token estimate (debounced 400ms, abortable), mirroring
+  // the classic drawer: the backend runs Anthropic count_tokens and prices the
+  // call so the user sees both before sending. Best-effort — keeps the previous
+  // estimate on failure and falls back to the char heuristic until the first
+  // estimate lands.
+  useEffect(() => {
+    if (!open) return
+    const ctrl = new AbortController()
+    const t = setTimeout(() => {
+      const payloadMsgs = [
+        ...messages
+          .filter((m) => m.role !== 'error')
+          .map((m) => ({ role: m.role === 'vigil' ? 'assistant' : 'user', content: m.text })),
+        ...(draft.trim() ? [{ role: 'user', content: draft }] : []),
+      ]
+      if (payloadMsgs.length === 0 && !systemPrompt) {
+        setCostEstimate(null)
+        setExactTokens(null)
+        return
+      }
+      analyticsApi
+        .estimateCost({
+          provider_type: 'anthropic',
+          model_id: model,
+          messages: payloadMsgs,
+          system_prompt: systemPrompt || undefined,
+          max_tokens: maxTokens,
+        })
+        .then((r) => {
+          if (ctrl.signal.aborted) return
+          setCostEstimate(r.data)
+          setExactTokens(r.data.input_tokens)
+        })
+        .catch(() => {
+          /* keep the previous estimate */
+        })
+    }, 400)
+    return () => {
+      clearTimeout(t)
+      ctrl.abort()
+    }
+  }, [open, messages, draft, systemPrompt, model, maxTokens])
+
+  // char heuristic (~chars/4), used only until the first server estimate lands
+  const heuristicTokens = useMemo(() => {
     const chars =
       messages.reduce((n, m) => n + m.text.length, 0) +
-      streamText.length + streamThinking.length + systemPrompt.length
+      streamText.length + streamThinking.length + systemPrompt.length + draft.length
     return Math.round(chars / 4)
-  }, [messages, streamText, streamThinking, systemPrompt])
+  }, [messages, streamText, streamThinking, systemPrompt, draft])
+  const estimatedTokens = exactTokens ?? heuristicTokens
   const ctxPct = Math.min((estimatedTokens / CONTEXT_WINDOW) * 100, 100)
   const ctxState = estimatedTokens > 150000 ? 'danger' : estimatedTokens > 100000 ? 'warn' : 'ok'
+  const costTitle = costEstimate
+    ? `${
+        costEstimate.token_count_method === 'anthropic_count_tokens'
+          ? 'Exact token count via Anthropic count_tokens.'
+          : costEstimate.token_count_method === 'tiktoken'
+            ? 'Token count via tiktoken.'
+            : 'Approximate token count (chars ÷ 4).'
+      } Pricing: ${costEstimate.pricing_source}.`
+    : ''
 
-  const send = async (override?: string) => {
+  const send = async (override?: string, opts?: { fresh?: boolean }) => {
     const text = (override ?? draft).trim()
     if (!text || loading) return
-    const history = messages.filter((m) => m.role !== 'error')
-    const next: ChatMsg[] = [...history, { role: 'user', text }]
+    // `fresh` starts a clean thread (used when opening a new investigation) so
+    // the seed isn't appended onto an unrelated conversation
+    const base = opts?.fresh ? [] : messages.filter((m) => m.role !== 'error')
+    const next: ChatMsg[] = [...base, { role: 'user', text }]
     setMessages(next)
     setDraft('')
     setLoading(true)
     setStreamText('')
     setStreamThinking('')
     setIsThinking(false)
+    setIsProcessingTools(false)
     const start = Date.now()
 
     const ac = new AbortController()
     abortRef.current = ac
     try {
-      const res = await fetch(`${basePath}/api/claude/chat/stream`, {
+      const res = await streamFetch('/claude/chat/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
         body: JSON.stringify({
@@ -293,7 +469,13 @@ export default function Chat({
             if (!line.startsWith('data: ')) continue
             const data = line.slice(6).trim()
             if (!data) continue
-            let ev: { type?: string; content?: string; error?: string }
+            let ev: {
+              type?: string
+              content?: string
+              error?: string
+              summarized_messages?: number
+              remaining_messages?: number
+            }
             try {
               ev = JSON.parse(data)
             } catch {
@@ -308,16 +490,54 @@ export default function Chat({
               setStreamThinking(curThinking)
             } else if (ev.type === 'thinking_end') {
               setIsThinking(false)
+            } else if (ev.type === 'tool_processing') {
+              // backend is running MCP tools — show the live indicator and
+              // separate any tool output from the prose preceding it
+              setIsProcessingTools(true)
+              if (curText && !curText.endsWith('\n\n')) curText += '\n\n'
+            } else if (ev.type === 'context_summarized') {
+              curText +=
+                `_[Context auto-summarized: ${ev.summarized_messages ?? 0} older ` +
+                `messages condensed to stay within the model's limits; recent ` +
+                `messages and key details are preserved.]_\n\n`
+              setStreamText(curText)
             } else if (ev.type === 'text') {
+              setIsProcessingTools(false)
               curText += ev.content || ''
               setStreamText(curText)
             }
-            // tool_processing / context_summarized: ignored in the dock
           }
         }
       }
       const ms = Date.now() - start
       setMessages((m) => [...m, { role: 'vigil', text: curText || '_(no response)_', thinking: curThinking || undefined, ms }])
+      // Fire a desktop notification on completion, matching the classic
+      // drawer (which notifies when an investigation-seeded thread finishes).
+      // Gated inside notificationService by the `show_notifications` setting +
+      // browser permission, so it's a no-op when the user hasn't opted in.
+      if (currentKeyRef.current && curText) {
+        const summary = curText.replace(/[#*`_>[\]]/g, '').replace(/\s+/g, ' ').trim().slice(0, 140)
+        notificationService.notifyInvestigationComplete({
+          title: 'Vigil',
+          summary: summary || 'Analysis complete',
+        })
+      }
+      // refresh the reasoning-trace summary for this session (best-effort)
+      reasoningApi
+        .getSessionSummary(sessionRef.current)
+        .then((s: Partial<SessionSummary> | null) =>
+          setSessionSummary(
+            s
+              ? {
+                  total_interactions: s.total_interactions ?? 0,
+                  total_cost_usd: s.total_cost_usd ?? 0,
+                  total_input_tokens: s.total_input_tokens ?? 0,
+                  total_output_tokens: s.total_output_tokens ?? 0,
+                }
+              : null,
+          ),
+        )
+        .catch(() => {})
     } catch (e) {
       const err = e as { name?: string; message?: string }
       if (err?.name !== 'AbortError') {
@@ -328,6 +548,7 @@ export default function Chat({
       setStreamText('')
       setStreamThinking('')
       setIsThinking(false)
+      setIsProcessingTools(false)
       abortRef.current = null
     }
   }
@@ -343,6 +564,7 @@ export default function Chat({
       title: (firstUser?.text || 'Conversation').replace(/\s+/g, ' ').trim().slice(0, 70) || 'Conversation',
       ts: Date.now(),
       messages,
+      key: currentKeyRef.current || undefined,
     }
     setHistory((h) => {
       const next = [convo, ...h.filter((c) => c.id !== convo.id)].slice(0, HISTORY_MAX)
@@ -357,6 +579,10 @@ export default function Chat({
     archiveCurrent()
     setMessages([])
     sessionRef.current = newSessionId()
+    currentKeyRef.current = null
+    setSessionSummary(null)
+    setCostEstimate(null)
+    setExactTokens(null)
   }
 
   const loadConversation = (c: Conversation) => {
@@ -364,7 +590,65 @@ export default function Chat({
     archiveCurrent()
     setMessages(c.messages)
     sessionRef.current = c.id
+    currentKeyRef.current = c.key || null
+    setSessionSummary(null)
     setHistoryOpen(false)
+  }
+
+  // open an investigation thread for a seed prompt: reuse the matching thread
+  // (current or archived) if one exists, else archive the current and start a
+  // fresh one. The seed prompt is deterministic per finding/case, so it doubles
+  // as the dedup key (investigation-keyed, like the classic drawer's tabs).
+  const openInvestigation = (prompt: string) => {
+    if (loading) return
+    if (currentKeyRef.current === prompt && messages.length > 0) return // already here
+    const existing = history.find((c) => c.key === prompt)
+    if (existing) {
+      loadConversation(existing)
+      return
+    }
+    archiveCurrent()
+    sessionRef.current = newSessionId()
+    currentKeyRef.current = prompt
+    setSessionSummary(null)
+    setCostEstimate(null)
+    setExactTokens(null)
+    send(prompt, { fresh: true })
+  }
+
+  // load the per-interaction reasoning trace for the current session
+  const openReasoningTrace = () => {
+    setTraceOpen(true)
+    setTraceLoading(true)
+    setTraceSelected(null)
+    const sid = sessionRef.current
+    reasoningApi
+      .listInteractions(sid, { limit: 200 })
+      .then((r: { interactions?: TraceItem[] }) => setTraceItems(r?.interactions || []))
+      .catch(() => setTraceItems([]))
+      .finally(() => setTraceLoading(false))
+    reasoningApi
+      .getSessionSummary(sid)
+      .then((s: Partial<SessionSummary> | null) =>
+        setSessionSummary(
+          s
+            ? {
+                total_interactions: s.total_interactions ?? 0,
+                total_cost_usd: s.total_cost_usd ?? 0,
+                total_input_tokens: s.total_input_tokens ?? 0,
+                total_output_tokens: s.total_output_tokens ?? 0,
+              }
+            : null,
+        ),
+      )
+      .catch(() => {})
+  }
+
+  const loadTraceInteraction = (interactionId: string) => {
+    reasoningApi
+      .getInteraction(sessionRef.current, interactionId)
+      .then((d: TraceDetail) => setTraceSelected(d))
+      .catch(() => {})
   }
 
   const deleteConversation = (id: string) => {
@@ -388,7 +672,7 @@ export default function Chat({
     // guard against StrictMode's double-invoke firing the same seed twice
     if (open && seed !== seedRef.current && !loading) {
       seedRef.current = seed
-      send(seed)
+      openInvestigation(seed)
       onSeedConsumed?.()
     }
     // send/loading intentionally omitted: we fire once per new seed
@@ -404,16 +688,19 @@ export default function Chat({
   return (
     <>
     <aside
+      ref={panelRef}
       className={`chat${open ? ' open' : ''}`}
       role="dialog"
       aria-label="Vigil Assistant"
       aria-hidden={!open}
+      onKeyDown={onPanelKeyDown}
     >
       <div className="chat-head">
         <span className="ch-ico"><Icon name="brain" /></span>
         <h3 className="ch-title">Vigil Assistant</h3>
         <div className="hbtns">
           <button title="History" onClick={() => setHistoryOpen(true)}><Icon name="clock" /></button>
+          <button title="Reasoning trace" onClick={openReasoningTrace}><Icon name="reason" /></button>
           <button title="SOC Agents" onClick={() => setAgentsInfoOpen(true)}><Icon name="note" /></button>
           <button title="Chat settings" onClick={() => setSettingsOpen(true)}><Icon name="gear" /></button>
           <button title="Clear chat" onClick={reset} disabled={loading || messages.length === 0}><Icon name="trash" /></button>
@@ -443,9 +730,11 @@ export default function Chat({
               <span className="vs-label">
                 {isThinking
                   ? 'Vigil is reasoning'
-                  : streamText
-                    ? 'Vigil is responding'
-                    : 'Vigil is working on it'}
+                  : isProcessingTools
+                    ? 'Vigil is running tools'
+                    : streamText
+                      ? 'Vigil is responding'
+                      : 'Vigil is working on it'}
                 …
               </span>
             </div>
@@ -456,6 +745,23 @@ export default function Chat({
       </div>
 
       <div className="chat-foot">
+        <div className="chat-meta">
+          <div className="cm-line">
+            <span className={`cm-ctx ${ctxState}`} title="Estimated context usage for the next request">
+              {estimatedTokens.toLocaleString()} / {CONTEXT_WINDOW / 1000}k tokens
+              {estimatedTokens > 150000 && <span className="cm-warn"> · auto-summarizes on send</span>}
+            </span>
+            {costEstimate && (
+              <span className="cm-cost" title={costTitle}>
+                ~${costEstimate.low_usd.toFixed(4)}–${costEstimate.high_usd.toFixed(4)}
+                {costEstimate.pricing_source !== 'exact' && (
+                  <span className="cm-src"> · {costEstimate.pricing_source}</span>
+                )}
+              </span>
+            )}
+          </div>
+          <div className="cm-bar"><span className={`cm-bar-fill ${ctxState}`} style={{ width: `${ctxPct}%` }} /></div>
+        </div>
         <div className="chat-input">
           <textarea
             ref={taRef}
@@ -537,11 +843,21 @@ export default function Chat({
           </div>
           <div className="cs-ctx">
             <span className={`cs-ctx-label ${ctxState}`}>
-              Context ~{estimatedTokens.toLocaleString()} / {CONTEXT_WINDOW.toLocaleString()} tokens
+              Context {exactTokens != null ? '' : '~'}{estimatedTokens.toLocaleString()} / {CONTEXT_WINDOW.toLocaleString()} tokens
+              {estimatedTokens > 150000 && ' · auto-summarizes on next send'}
             </span>
             <div className="cs-bar"><span className={`cs-bar-fill ${ctxState}`} style={{ width: `${ctxPct}%` }} /></div>
             <span className="cs-ctx-sub">Output max {maxTokens.toLocaleString()} tokens</span>
           </div>
+          {costEstimate && (
+            <div className="cs-stat-row" title={costTitle}>
+              <span className="cs-name">Est. cost</span>
+              <span className="cs-cost-val">
+                ${costEstimate.low_usd.toFixed(4)}–${costEstimate.high_usd.toFixed(4)}
+                {costEstimate.pricing_source !== 'exact' && <span className="cs-ctx-sub"> · {costEstimate.pricing_source}</span>}
+              </span>
+            </div>
+          )}
         </section>
 
         {/* Model settings */}
@@ -551,7 +867,7 @@ export default function Chat({
             <span className="cs-name">Model</span>
             <Select
               value={model}
-              onSelect={setModel}
+              onSelect={(m) => { userPickedModelRef.current = true; setModel(m) }}
               options={(models.length ? models : MODEL_FALLBACK).map((m) => ({ value: m.id, label: m.name }))}
             />
           </div>
@@ -635,6 +951,82 @@ export default function Chat({
           ))}
         </div>
       )}
+    </Popup>
+
+    {/* Reasoning trace — per-interaction chain-of-thought for this session */}
+    <Popup open={traceOpen} onClose={() => setTraceOpen(false)} title="Reasoning trace" width={760}>
+      {sessionSummary && (
+        <div className="trace-sum">
+          {sessionSummary.total_interactions} call{sessionSummary.total_interactions === 1 ? '' : 's'}
+          {' · '}${sessionSummary.total_cost_usd.toFixed(4)}
+          {' · '}{(sessionSummary.total_input_tokens + sessionSummary.total_output_tokens).toLocaleString()} tokens
+        </div>
+      )}
+      <div className="trace">
+        <div className="trace-list">
+          {traceLoading ? (
+            <div className="muted">Loading…</div>
+          ) : traceItems.length === 0 ? (
+            <div className="muted">No reasoning recorded for this conversation yet.</div>
+          ) : (
+            traceItems.map((it) => (
+              <button
+                key={it.interaction_id}
+                className={`trace-row${traceSelected?.interaction_id === it.interaction_id ? ' sel' : ''}`}
+                onClick={() => loadTraceInteraction(it.interaction_id)}
+              >
+                <span className="trace-row-top">
+                  <span>{traceTime(it.created_at)}</span>
+                  {it.has_thinking && <span className="trace-chip" title="Has thinking">💭</span>}
+                  {it.has_tools && <span className="trace-chip" title="Used tools">🔧</span>}
+                  <span className="trace-row-agent">{it.agent_id || 'chat'}</span>
+                </span>
+                <span className="trace-row-meta">
+                  {(it.input_tokens ?? 0).toLocaleString()} in · {(it.output_tokens ?? 0).toLocaleString()} out · ${(it.cost_usd ?? 0).toFixed(4)}
+                </span>
+              </button>
+            ))
+          )}
+        </div>
+        <div className="trace-detail">
+          {!traceSelected ? (
+            <div className="muted">{traceItems.length ? 'Select an interaction to inspect its reasoning.' : ''}</div>
+          ) : (
+            <>
+              <div className="trace-meta">
+                <span>{traceSelected.model || '—'}</span>
+                {traceSelected.stop_reason && <span>· {traceSelected.stop_reason}</span>}
+                {typeof traceSelected.duration_ms === 'number' && <span>· {(traceSelected.duration_ms / 1000).toFixed(1)}s</span>}
+                {typeof traceSelected.cost_usd === 'number' && <span>· ${traceSelected.cost_usd.toFixed(4)}</span>}
+              </div>
+              {traceSelected.thinking_content && (
+                <div className="trace-block thinking">
+                  <div className="trace-block-h">💭 Thinking</div>
+                  <div className="trace-block-b">{traceSelected.thinking_content}</div>
+                </div>
+              )}
+              {traceSelected.response_content && (
+                <div className="trace-block">
+                  <div className="trace-block-h">Response</div>
+                  <div className="trace-block-b"><Markdown>{traceSelected.response_content}</Markdown></div>
+                </div>
+              )}
+              {traceSelected.tool_calls?.map((tc, i) => (
+                <div key={`c${i}`} className="trace-block tool">
+                  <div className="trace-block-h">🔧 {tc.name || 'tool'}</div>
+                  <div className="trace-block-b mono">{safeJson(tc.input)}</div>
+                </div>
+              ))}
+              {traceSelected.tool_results?.map((tr, i) => (
+                <div key={`r${i}`} className={`trace-block ${tr.is_error ? 'err' : 'ok'}`}>
+                  <div className="trace-block-h">{tr.is_error ? 'Tool error' : 'Tool result'}</div>
+                  <div className="trace-block-b mono">{typeof tr.content === 'string' ? tr.content : safeJson(tr.content)}</div>
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+      </div>
     </Popup>
     </>
   )

@@ -319,6 +319,7 @@ function CasesTable({
         <div className="search" style={{ maxWidth: 320 }}>
           <span><Icon name="search" /></span>
           <input
+            aria-label="Search cases"
             placeholder="Search cases by title, ID, owner…"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
@@ -1029,10 +1030,12 @@ function CasesDetail({
             <div className="muted" style={{ padding: '6px 0' }}>Loading case…</div>
           )}
         </div>
-        <nav className="detail-tabs">
+        <nav className="detail-tabs" role="tablist" aria-label="Case detail sections">
           {CASE_TABS.map((t) => (
             <button
               key={t}
+              role="tab"
+              aria-selected={tab === t}
               className={`tab${tab === t ? ' active' : ''}`}
               onClick={() => setTab(t)}
             >

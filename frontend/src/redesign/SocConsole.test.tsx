@@ -4,19 +4,37 @@
  * flow renders without throwing (catches runtime errors tsc can't see).
  */
 import { describe, it, expect, beforeAll, vi } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
+import { ThemeProvider } from '../contexts/ThemeContext'
 import SocConsole from './SocConsole'
+// these resolve to the mocked implementations (vi.mock below is hoisted)
+import { streamFetch, aiDecisionsApi } from '../services/api'
+
+// SocConsole reads the session from AuthContext (user menu + permission-gated
+// nav). Stub it with a full-permission user so every rail item + screen renders.
+vi.mock('../contexts/AuthContext', () => ({
+  useAuth: () => ({
+    user: { full_name: 'Test User', email: 'test@vigil.local', role_id: 'role-admin', mfa_enabled: false },
+    logout: vi.fn(),
+    hasPermission: () => true,
+  }),
+}))
 
 // SocConsole is URL-driven (each screen owns /redesign/<screen>, cases deep-link
 // to /redesign/cases?case=<caseId>), so mount it inside a router with that route.
+// SocConsole's theme provider bridges the app-wide ThemeContext (mode is
+// backend-persisted), so it must mount inside a real ThemeProvider — same as
+// production (main.tsx wraps the whole app).
 function renderConsole(path = '/redesign/dashboard') {
   return render(
-    <MemoryRouter initialEntries={[path]}>
-      <Routes>
-        <Route path="/redesign/:screen" element={<SocConsole />} />
-      </Routes>
-    </MemoryRouter>,
+    <ThemeProvider>
+      <MemoryRouter initialEntries={[path]}>
+        <Routes>
+          <Route path="/redesign/:screen" element={<SocConsole />} />
+        </Routes>
+      </MemoryRouter>
+    </ThemeProvider>,
   )
 }
 
@@ -72,6 +90,12 @@ vi.mock('../services/api', () => ({
   mcpApi: {
     getStatuses: () => Promise.resolve({ data: { statuses: [{ status: 'ok' }, { status: 'ok' }] } }),
   },
+  // chat resolves its default model from the chat_default component assignment
+  aiConfigApi: {
+    getConfig: () => Promise.resolve({ data: { components: [], assignments: {} } }),
+  },
+  // chat streaming helper — a vi.fn so the SSE test can supply a streaming body
+  streamFetch: vi.fn(() => Promise.resolve({ ok: true, status: 200, body: null })),
   workflowApi: {
     listAll: () =>
       Promise.resolve({
@@ -108,12 +132,46 @@ vi.mock('../services/api', () => ({
       Promise.resolve({
         data: { total_decisions: 128, feedback_rate: 0.74, total_with_feedback: 95, agreement_rate: 0.91, avg_accuracy_grade: 0.8, total_time_saved_hours: 42, total_time_saved_minutes: 2520, period_days: 30, outcomes: { true_positive: 15, false_positive: 3 } },
       }),
-    submitFeedback: () => Promise.resolve({}),
+    submitFeedback: vi.fn(() => Promise.resolve({})),
   },
   approvalsApi: {
     listPending: () => Promise.resolve({ data: { actions: [] } }),
-    approve: () => Promise.resolve({}),
-    reject: () => Promise.resolve({}),
+    approve: vi.fn(() => Promise.resolve({})),
+    reject: vi.fn(() => Promise.resolve({})),
+  },
+  // ThemeContext loads/saves the light/dark preference on mount + on toggle;
+  // the shell also reads integrations (nav membership) + general settings
+  // (desktop-notification gating) on mount.
+  configApi: {
+    getTheme: () => Promise.resolve({ data: { theme: 'dark' } }),
+    setTheme: () => Promise.resolve({ data: {} }),
+    getIntegrations: () => Promise.resolve({ data: { enabled_integrations: [] } }),
+    getGeneral: () => Promise.resolve({ data: { show_notifications: false } }),
+  },
+  // nav membership poll (Auto Ops gating plumbing)
+  orchestratorApi: {
+    getStatus: () => Promise.resolve({ data: { enabled: false } }),
+  },
+  // chat cost band (debounced pre-call estimate) + reasoning-trace clients
+  analyticsApi: {
+    estimateCost: () =>
+      Promise.resolve({
+        data: {
+          provider_type: 'anthropic',
+          model_id: 'claude-sonnet-4-6',
+          input_tokens: 0,
+          output_tokens_max: 4096,
+          low_usd: 0,
+          high_usd: 0,
+          pricing_source: 'exact',
+          token_count_method: 'anthropic_count_tokens',
+        },
+      }),
+  },
+  reasoningApi: {
+    getSessionSummary: () => Promise.resolve(null),
+    listInteractions: () => Promise.resolve({ interactions: [] }),
+    getInteraction: () => Promise.resolve({}),
   },
 }))
 
@@ -176,18 +234,14 @@ describe('SocConsole redesign', () => {
 
   it('switches every Dashboard tab including the interactive Timeline', async () => {
     renderConsole()
-    // ATT&CK
-    fireEvent.click(screen.getByRole('button', { name: 'ATT&CK' }))
+    // ATT&CK (the dashboard tabs carry role=tab for screen readers)
+    fireEvent.click(screen.getByRole('tab', { name: 'ATT&CK' }))
     expect(screen.getByText(/Techniques by occurrence/)).toBeInTheDocument()
     // Timeline (exercises ResizeObserver + layout math); count resolves async
-    fireEvent.click(screen.getByRole('button', { name: 'Timeline' }))
+    fireEvent.click(screen.getByRole('tab', { name: 'Timeline' }))
     expect(await screen.findByText(/events$/)).toBeInTheDocument()
-    // Entity Graph stub — "Entity Graph" is both a (inert) rail item and a
-    // dashboard tab, so target the tab button specifically.
-    const entityTab = screen
-      .getAllByRole('button', { name: 'Entity Graph' })
-      .find((b) => b.classList.contains('tab'))!
-    fireEvent.click(entityTab)
+    // Entity Graph stub
+    fireEvent.click(screen.getByRole('tab', { name: 'Entity Graph' }))
     expect(screen.getByText('Coming soon.', { exact: false })).toBeInTheDocument()
   })
 
@@ -219,24 +273,32 @@ describe('SocConsole redesign', () => {
   it('switches Workflows tabs and loads skills from the API', async () => {
     renderConsole()
     fireEvent.click(screen.getByRole('button', { name: 'Workflows & Skills' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Agents' }))
+    fireEvent.click(screen.getByRole('tab', { name: 'Agents' }))
     expect(screen.getByText('SOC Agents')).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Skills' }))
+    fireEvent.click(screen.getByRole('tab', { name: 'Skills' }))
     // skills load asynchronously from the mocked skills client
     expect(await screen.findByText('UI Demo Skill')).toBeInTheDocument()
   })
 
-  it('opens the chat dock and applies an accent tweak without error', () => {
+  it('opens the chat dock without error', () => {
     renderConsole()
     fireEvent.click(screen.getByRole('button', { name: /Ask Vigil/ }))
     // wired chat starts empty with its prompt
     expect(screen.getByText(/investigate a finding/)).toBeInTheDocument()
-    // open tweaks and pick the cyan accent
-    fireEvent.click(screen.getByRole('button', { name: 'Theme tweaks' }))
-    fireEvent.click(screen.getByRole('button', { name: 'accent cyan' }))
-    // density toggle
-    fireEvent.click(screen.getByRole('button', { name: 'Comfortable' }))
-    expect(screen.getByRole('button', { name: 'Compact' })).toBeInTheDocument()
+  })
+
+  it('applies an accent + light mode from the Appearance settings page', () => {
+    renderConsole('/redesign/settings')
+    // Settings opens on the Appearance section (first nav item)
+    fireEvent.click(screen.getByRole('button', { name: 'Appearance' }))
+    // pick the cyan accent preset
+    const cyan = screen.getByRole('button', { name: 'accent cyan' })
+    fireEvent.click(cyan)
+    expect(cyan).toHaveAttribute('aria-pressed', 'true')
+    // switch to light mode; the toggle reflects the new state
+    const light = screen.getByRole('button', { name: 'Light' })
+    fireEvent.click(light)
+    expect(light).toHaveAttribute('aria-pressed', 'true')
   })
 
   it('opens chat settings showing status, model and advanced sections', async () => {
@@ -249,5 +311,79 @@ describe('SocConsole redesign', () => {
     // extended-thinking switch + system-prompt override
     expect(screen.getByRole('switch', { name: 'Extended thinking' })).toBeInTheDocument()
     expect(screen.getByPlaceholderText(/Override default system prompt/)).toBeInTheDocument()
+  })
+
+  it('streams an assistant response through the chat SSE pipe', async () => {
+    // a Response-like object whose body yields two SSE text deltas then ends
+    const chunks = [
+      'data: {"type":"text","content":"Hello"}\n',
+      'data: {"type":"text","content":" world"}\n',
+    ].map((s) => new TextEncoder().encode(s))
+    let i = 0
+    vi.mocked(streamFetch).mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      body: {
+        getReader: () => ({
+          read: () =>
+            i < chunks.length
+              ? Promise.resolve({ done: false, value: chunks[i++] })
+              : Promise.resolve({ done: true, value: undefined }),
+        }),
+      },
+    } as unknown as Response)
+
+    renderConsole()
+    fireEvent.click(screen.getByRole('button', { name: /Ask Vigil/ }))
+    fireEvent.change(screen.getByPlaceholderText(/Ask Vigil/), { target: { value: 'hi' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    // the two text deltas are concatenated and rendered as the reply. waitFor
+    // re-queries each poll so it settles on the final message node rather than
+    // the transient streaming bubble (which detaches when the stream completes).
+    await waitFor(() => expect(screen.getByText('Hello world')).toBeInTheDocument())
+    expect(vi.mocked(streamFetch)).toHaveBeenCalledWith(
+      '/claude/chat/stream',
+      expect.objectContaining({ method: 'POST' }),
+    )
+  })
+
+  it('submits decision feedback through the inline review pane', async () => {
+    renderConsole()
+    fireEvent.click(screen.getByRole('button', { name: 'AI Decisions' }))
+    fireEvent.click(await screen.findByText('Cluster merge'))
+    // a reviewer name is required before the verdict buttons submit
+    fireEvent.change(screen.getByPlaceholderText('Your name / analyst ID'), {
+      target: { value: 'QA Analyst' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /Approve/ }))
+    expect(vi.mocked(aiDecisionsApi.submitFeedback)).toHaveBeenCalledWith(
+      'd-4471',
+      expect.objectContaining({ human_reviewer: 'QA Analyst', human_decision: 'agree' }),
+    )
+  })
+
+  it('exports the visible timeline events as CSV', async () => {
+    // jsdom has no object-URL plumbing — stub it so the export can run, and
+    // capture the Blob it's handed to assert the CSV mime type
+    let captured: Blob | undefined
+    const createUrl = vi.fn((b: Blob) => {
+      captured = b
+      return 'blob:mock'
+    })
+    ;(URL as unknown as { createObjectURL: unknown }).createObjectURL = createUrl
+    ;(URL as unknown as { revokeObjectURL: unknown }).revokeObjectURL = vi.fn()
+    const clickSpy = vi
+      .spyOn(HTMLAnchorElement.prototype, 'click')
+      .mockImplementation(() => {})
+
+    renderConsole()
+    fireEvent.click(screen.getByRole('tab', { name: 'Timeline' }))
+    await screen.findByText(/events$/)
+    fireEvent.click(screen.getByTitle('Export visible events (CSV)'))
+
+    expect(createUrl).toHaveBeenCalledTimes(1)
+    expect(captured?.type).toBe('text/csv')
+    clickSpy.mockRestore()
   })
 })

@@ -25,7 +25,7 @@ import {
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { Icon } from '../../shared/icons'
-import { Popup } from '../../shared/ui'
+import { Popup, activateOnKey } from '../../shared/ui'
 import { agentsApi, workflowApi, type WorkflowPhase } from '../../../services/api'
 
 type AgentOption = { id: string; label: string }
@@ -444,7 +444,15 @@ function PhaseEditor({ idx, total, phase, agents, tools, onChange, onMove, onDel
         </Labeled>
         <datalist id="phase-tool-names">{tools.map((t) => <option key={t} value={t} />)}</datalist>
         <label className="flex items-center gap-2.5 text-[12.5px] text-tx-2 cursor-pointer -mt-1">
-          <span className={`sk-toggle${allAccess ? ' on' : ''}`} onClick={() => onChange({ tools: allAccess ? [] : ['*'] })}><span className="kn" /></span>
+          <span
+            className={`sk-toggle${allAccess ? ' on' : ''}`}
+            role="switch"
+            aria-checked={allAccess}
+            aria-label="All tool access (grants the agent every registered tool)"
+            tabIndex={0}
+            onClick={() => onChange({ tools: allAccess ? [] : ['*'] })}
+            onKeyDown={activateOnKey(() => onChange({ tools: allAccess ? [] : ['*'] }))}
+          ><span className="kn" /></span>
           All tool access (grants the agent every registered tool)
         </label>
         <Labeled label="Steps (one per line)"><textarea className={`${inputCls} resize-y max-w-full`} rows={3} value={(phase.steps || []).join('\n')} onChange={(e) => onChange({ steps: e.target.value.split('\n') })} /></Labeled>
@@ -453,7 +461,15 @@ function PhaseEditor({ idx, total, phase, agents, tools, onChange, onMove, onDel
           <Labeled label="Timeout (s)"><input className={inputCls} type="number" value={phase.timeout_seconds ?? 300} onChange={(e) => onChange({ timeout_seconds: parseInt(e.target.value, 10) || 0 })} /></Labeled>
         </div>
         <label className="flex items-center gap-2.5 text-[12.5px] text-tx-2 cursor-pointer">
-          <span className={`sk-toggle${phase.approval_required ? ' on' : ''}`} onClick={() => onChange({ approval_required: !phase.approval_required })}><span className="kn" /></span>
+          <span
+            className={`sk-toggle${phase.approval_required ? ' on' : ''}`}
+            role="switch"
+            aria-checked={phase.approval_required}
+            aria-label="Require approval before this phase runs"
+            tabIndex={0}
+            onClick={() => onChange({ approval_required: !phase.approval_required })}
+            onKeyDown={activateOnKey(() => onChange({ approval_required: !phase.approval_required }))}
+          ><span className="kn" /></span>
           Require approval before this phase runs
         </label>
         <div className="flex justify-end gap-2.5 pt-1">

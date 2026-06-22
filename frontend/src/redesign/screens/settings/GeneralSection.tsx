@@ -54,6 +54,10 @@ export default function GeneralSection({ notify }: SectionProps) {
         return
       }
     }
+    // keep the shared service in sync so show()-gating takes effect immediately
+    // (the findings poll that fires them starts on next load — see
+    // useDesktopNotifications)
+    notificationService.setEnabled(next)
     setConfig({ ...config, show_notifications: next })
   }
 

@@ -5,9 +5,11 @@
    tab set (AI Config / Integrations / Users / Auto Investigate /
    Federation / System / General / Developer).
    ============================================================ */
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Icon, type IconName } from '../../shared/icons'
 import type { ScreenProps } from '../../shared/types'
+import { useToast } from '../../shell/toast'
+import AppearanceSection from './AppearanceSection'
 import GeneralSection from './GeneralSection'
 import SystemSection from './SystemSection'
 import FederationSection from './FederationSection'
@@ -16,14 +18,17 @@ import AutoInvestigateSection from './AutoInvestigateSection'
 import DeveloperSection from './DeveloperSection'
 import AiConfigSection from './AiConfigSection'
 import IntegrationsSection from './IntegrationsSection'
-import type { BannerKind, SectionProps } from './types'
+import SlaPoliciesSection from './SlaPoliciesSection'
+import type { SectionProps } from './types'
 
 const IS_DEV_MODE = import.meta.env.VITE_DEV_MODE === 'true'
 
 type SectionKey =
+  | 'appearance'
   | 'ai-config'
   | 'integrations'
   | 'users'
+  | 'sla'
   | 'autoinvestigate'
   | 'federation'
   | 'system'
@@ -39,9 +44,11 @@ interface SectionDef {
 }
 
 const SECTIONS: SectionDef[] = [
+  { key: 'appearance', label: 'Appearance', icon: 'palette', Component: AppearanceSection },
   { key: 'ai-config', label: 'AI Config', icon: 'sparkle', Component: AiConfigSection },
   { key: 'integrations', label: 'Integrations', icon: 'link', Component: IntegrationsSection },
   { key: 'users', label: 'Users', icon: 'lock', Component: UsersSection },
+  { key: 'sla', label: 'SLA Policies', icon: 'clock', Component: SlaPoliciesSection },
   { key: 'autoinvestigate', label: 'Auto Investigate', icon: 'bolt', Component: AutoInvestigateSection },
   { key: 'federation', label: 'Federation', icon: 'graph', Component: FederationSection },
   { key: 'system', label: 'System', icon: 'wrench', Component: SystemSection },
@@ -51,23 +58,16 @@ const SECTIONS: SectionDef[] = [
 
 export default function SettingsScreen({ setViewFull }: ScreenProps) {
   const sections = SECTIONS.filter((s) => !s.devOnly || IS_DEV_MODE)
-  // default to the first section that's actually wired up
-  const [active, setActive] = useState<SectionKey>('general')
-  const [banner, setBanner] = useState<{ kind: BannerKind; text: string } | null>(null)
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // open on the first section (Appearance)
+  const [active, setActive] = useState<SectionKey>('appearance')
+  // section save/test results surface through the shell-wide toast (§10) rather
+  // than a settings-local banner, so feedback is consistent across the console
+  const { notify } = useToast()
 
   useEffect(() => {
     setViewFull(true)
     return () => setViewFull(false)
   }, [setViewFull])
-
-  useEffect(() => () => { if (timer.current) clearTimeout(timer.current) }, [])
-
-  const notify = (kind: BannerKind, text: string) => {
-    setBanner({ kind, text })
-    if (timer.current) clearTimeout(timer.current)
-    timer.current = setTimeout(() => setBanner(null), kind === 'err' ? 7000 : 4000)
-  }
 
   const current = sections.find((s) => s.key === active) ?? sections[0]
   const Section = current.Component
@@ -79,7 +79,7 @@ export default function SettingsScreen({ setViewFull }: ScreenProps) {
           <button
             key={s.key}
             className={`settings-nav-item${s.key === active ? ' active' : ''}`}
-            onClick={() => { setActive(s.key); setBanner(null) }}
+            onClick={() => setActive(s.key)}
           >
             <Icon name={s.icon} size={16} />
             <span>{s.label}</span>
@@ -88,13 +88,6 @@ export default function SettingsScreen({ setViewFull }: ScreenProps) {
       </nav>
 
       <div className="settings-content">
-        {banner && (
-          <div className={`settings-banner ${banner.kind}`}>
-            <Icon name={banner.kind === 'err' ? 'alert' : banner.kind === 'ok' ? 'check2' : 'info'} size={14} />
-            <span>{banner.text}</span>
-          </div>
-        )}
-
         {Section ? (
           <Section notify={notify} />
         ) : (
