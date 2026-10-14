@@ -12,7 +12,16 @@ whatever its kind, so no plugin writes it again:
 - honours an operator's stop while a call is in flight, and hands the run back untouched when the lease is lost
 - ends the run with exactly one terminal
 
-`agentProjection` and `agentReplay` (`core/agent-view.ts`) read any kernel run.
+And the five things a run needs to be trusted and learned from:
+
+- **The hypothesis record** (`core/record.ts`). `propose_hypothesis`, `link_evidence` (supports or weakens) and `open_question`, offered to every plugin and journaled as `hypothesis`, `link` and `question` events. A plugin with a richer record supplies its own backend through the `record` hook, writing the same kinds in its own shape (the hunt's carry its verdict machinery). `record: required` also holds a guarded answer to the record: it stands only on a cited, served result the record links to a claim.
+- **A record that costs few calls.** `link_evidence` can propose a hypothesis by statement in the same call, and every agent that keeps a record is told to write it in the same turn as its next query: a record write in a turn of its own is a model call that looked at nothing.
+- **Declared gaps.** Every conclusion carries `declared_gaps`, computed off the ledger: the record's open questions, the answer's own `open_questions_field`, and every call the estate could not answer.
+- **Classified results.** Every call is `served`, a `visibility_gap` (timeout, unavailable, backend error) or a `defect` (refused, invalid arguments). Only gaps are gaps. A defect or a gap is refused as evidence.
+- **A frame per model call** (`core/frames.ts`). Before each call: hashes of the system prompt, task, recall block, each tool schema, each skill body, the emission ask and schema, the model, its sampling parameters, the fold policy and how much it folded, and the refs of the calls in the transcript. Each hash's bytes go on the ledger once, as a `content` event.
+- **Judges and subagents as child runs.** `runChild` runs one turn on a ledger of its own (`run_kind: subagent`), its run event naming its parent, the parent writing a `child` event when it ends. Its spend is the parent's. The kernel's reviewer, the hunt's critic and its narrator run this way. A plugin's authored steps (`runSubturn`) stay on the parent's ledger under their own role, because their approvals are the run's.
+
+`agentProjection` and `agentReplay` (`core/agent-view.ts`) read any kernel run. Replay (`core/replay.ts`) rebuilds every frame's input from the ledger alone and diffs its hash against the one sent; `trajectoryOf` hands a learner the same steps, from the ledger alone. Nothing either reads calls a tool or reads memory.
 
 ## What a plugin is
 
@@ -36,13 +45,22 @@ guard:                              # optional second look before a guarded answ
   reviewer_prompt: |
     ...
 max_turns: 24                       # optional; else the deployment's runtime.max_turns
+record: required                    # off | available (the default) | required
+min_results: 4                      # optional; see below
 ```
+
+`min_results`: a run that stops calling tools with turns left and fewer than this
+many results from the estate (playbooks and record writes do not count) is asked
+once to keep going or confirm it is done. The ask is the next call's transient
+tail, journaled on its frame, so the run still replays exactly.
+
+A required record needs a structured conclusion that names an `open_questions_field` its schema requires; the manifest is refused at load otherwise.
 
 A skill is `skills/<name>/SKILL.md` with `name` and `description` front matter and
 the playbook as its body. The system prompt carries each skill's name and one
 line; the body arrives only when the agent calls `load_skill`.
 
-The guard is how a plugin makes some answers harder to give than others. When
+The guard is how a plugin makes some answers harder to give than others. The reviewer sees every cited record, then the uncited ones newest first up to a bounded window, and never a loaded playbook: the cited records are what the answer stands on, and an unbounded window was the reviewer's whole cost. When
 the answer's `field` holds a guarded value, a reviewer with no tools is shown the
 answer and the records it cites. The answer stands only if the reviewer upholds
 it over at least one cited ref that is a real call. Otherwise the run ends on the
@@ -58,6 +76,7 @@ Every hook is optional, and the kernel calls each at a fixed point:
 | `open` | once, writing the run event itself | hunt: its state rides in the run event |
 | `tools` | each pick-up: tools that answer in this process | hunt's record, root cause's `record`/`finish`, tally's `bump` |
 | `dispatch` | wraps how a call reaches its tool | root cause trims what a search shows |
+| `record` | where the record's tools write | hunt: its board, rulings and frontier |
 | `turns` | the run's tool-turn allowance | hunt: its budget, which an operator can extend |
 | `before` | each pick-up, before the loop: park or end here | hunt directives and checkpoints, root cause's permit, compose's whole phase walk |
 | `brief` | what the run is about | hunt's board, root cause's steps so far |

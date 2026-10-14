@@ -14,6 +14,7 @@ import { buildSpec, SpecError, type RunSpec } from "../../core/spec.js";
 import { InProcessState } from "../../core/state.js";
 import { investigateKernelReplay, investigateView } from "../../plugins/investigate/view.js";
 import { parsePlugin, parseSkill, pluginFor } from "../../plugins/registry.js";
+import { quiet } from "../support/plugins.js";
 import { scriptedProvider, type ScriptedProvider, type ScriptedTurn } from "../support/scripted-provider.js";
 
 const FIXTURES = join(import.meta.dirname, "..", "fixtures");
@@ -67,7 +68,7 @@ function concluded(disposition: string, citations: string[]): ScriptedTurn {
 }
 
 describe("the kernel runs a plugin to a conclusion", () => {
-  const plugin = pluginFor("investigate");
+  const plugin = quiet(pluginFor("investigate"));
 
   it("journals each call as a numbered step, then the conclusion, review and terminal", async () => {
     const spec = specOf();
@@ -84,7 +85,8 @@ describe("the kernel runs a plugin to a conclusion", () => {
     expect(report.status).toBe("completed");
     expect(report.calls).toBe(2);
     const events = await state.read(RUN);
-    expect(events.filter((one) => !["spend"].includes(one.kind)).map((one) => one.kind)).toEqual([
+    // Spend, frames and their content are the kernel's bookkeeping, asserted on their own below.
+    expect(events.filter((one) => !["spend", "frame", "content"].includes(one.kind)).map((one) => one.kind)).toEqual([
       "run", "call", "call", "conclusion", "review", "terminal",
     ]);
     const steps = events.filter((one) => one.kind === "call").map((one) => one.payload as CallPayload);
@@ -120,6 +122,8 @@ describe("the kernel runs a plugin to a conclusion", () => {
     const state = new InProcessState<AgentKinds>();
     const provider = scriptedProvider([
       { calls: [{ tool: "get_finding", args: "{}" }] },
+      { calls: [{ tool: "propose_hypothesis", args: '{"statement":"a scheduled task locks the account"}' }] },
+      { calls: [{ tool: "link_evidence", args: '{"links":[{"evidence_id":"r1","hypothesis_id":"h1","stance":"supports"}]}' }] },
       STOP,
       concluded("benign", ["r1"]),
       { emit: { stance: "uphold", reasons: "the task owner is named", missing: [] } },
@@ -127,12 +131,28 @@ describe("the kernel runs a plugin to a conclusion", () => {
     await runAgent(harnessOf(spec, plugin, provider, state), optionsOf(spec, plugin));
 
     const review = (await state.read(RUN)).find((one) => one.kind === "review")?.payload as ReviewPayload;
-    expect(review).toMatchObject({ stance: "uphold", cited: ["r1"], unknown_refs: [], guarded: { field: "disposition", asked: "benign", final: "benign" } });
+    expect(review).toMatchObject({ stance: "uphold", cited: ["r1"], unknown_refs: [], grounded: true, guarded: { field: "disposition", asked: "benign", final: "benign" } });
     expect((await state.terminal(RUN))?.summary).toBe("the lockouts are benign");
     // The reviewer holds no tools and is shown the step it was asked about.
     const asked = provider.requests.at(-1);
     expect(asked?.tools).toEqual([]);
     expect(asked?.messages.map((one) => one.content).join("\n")).toContain('<vigil:record id="r1" cited="true">');
+  });
+
+  it("holds an upheld dismissal for review when the record links no cited result to a claim", async () => {
+    const spec = specOf();
+    const state = new InProcessState<AgentKinds>();
+    const provider = scriptedProvider([
+      { calls: [{ tool: "get_finding", args: "{}" }] },
+      STOP,
+      concluded("benign", ["r1"]),
+      { emit: { stance: "uphold", reasons: "the task owner is named", missing: [] } },
+    ]);
+    await runAgent(harnessOf(spec, plugin, provider, state), optionsOf(spec, plugin));
+
+    const review = (await state.read(RUN)).find((one) => one.kind === "review")?.payload as ReviewPayload;
+    expect(review).toMatchObject({ stance: "uphold", grounded: false, guarded: { asked: "benign", final: "needs_review" } });
+    expect((await state.terminal(RUN))?.summary).toContain("no cited result is linked to a claim on the record");
   });
 
   it("holds a guarded answer for review when the reviewer finds it unsupported", async () => {
@@ -244,7 +264,7 @@ describe("the kernel runs a plugin to a conclusion", () => {
 
 describe("the console reads a kernel run in the investigate shape", () => {
   it("answers projection and replay with the lead's fields and the kernel's beside them", async () => {
-    const plugin = pluginFor("investigate");
+    const plugin = quiet(pluginFor("investigate"));
     const spec = specOf();
     const state = new InProcessState<AgentKinds>();
     const provider = scriptedProvider([
@@ -281,7 +301,7 @@ describe("historyOf", () => {
 
 describe("plugins load from their directory", () => {
   it("loads investigate with its skill and guard", () => {
-    const plugin = pluginFor("investigate");
+    const plugin = quiet(pluginFor("investigate"));
     expect(plugin.skills.map((one) => one.name)).toEqual(["investigate-case"]);
     expect(plugin.guard).toMatchObject({ field: "disposition", fallback: "needs_review" });
     expect(pluginGrants(plugin, specOf().tools)["agent"]).toEqual(

@@ -9,10 +9,13 @@ import {
   type RunKind,
   type RunPayload,
   type CallPayload,
+  type ChildPayload,
+  type FramePayload,
   type TerminalPayload,
   type UnboundPayload,
 } from "../contracts/events.js";
 import { recalledPayloadOf, type RecallPayload } from "../contracts/memory.js";
+import { replayFrames, type FrameReplay } from "./replay.js";
 
 // What a reader outside this process is told about a kernel run and what each turn
 // was shown. One fold for every plugin, since the events are the kernel's own.
@@ -129,6 +132,11 @@ export interface AgentReplay {
   turns: AgentReplayTurn[];
   conclusion: ConclusionPayload | null;
   review: ReviewPayload | null;
+  // Every model call's input rebuilt from the ledger and diffed against the hash it
+  // was sent with. Empty on a ledger written before calls were framed.
+  frames: FrameReplay;
+  // Judges and subagents, each on a ledger of its own.
+  children: ChildPayload[];
 }
 
 // What each turn was shown is the steps before it. A resume is rebuilt from exactly
@@ -156,5 +164,30 @@ export function agentReplay(runId: string, events: readonly Envelope[]): AgentRe
     pending = 0;
     current.calls.push(step);
   }
-  return { run_id: runId, recall: recalledPayloadOf(events as never), turns, conclusion, review };
+  return {
+    run_id: runId,
+    recall: recalledPayloadOf(events as never),
+    turns,
+    conclusion,
+    review,
+    frames: replayFrames(events),
+    children: events.filter((event) => event.kind === "child").map((event) => event.payload as ChildPayload),
+  };
+}
+
+// How long each model call took, by turn: its frame is written just before the call and
+// its spend when the provider reports, so the two stamps bound it.
+export function modelMs(events: readonly Envelope[]): Map<number, number> {
+  const held = new Map<number, number>();
+  let open: { call: number; at: number } | null = null;
+  for (const event of events) {
+    if (event.kind === "frame" && (event.payload as FramePayload).role === "agent") {
+      open = { call: (event.payload as FramePayload).call, at: Date.parse(event.ts) };
+    } else if (event.kind === "spend" && open !== null && (event.payload as SpendPayload).role === "agent") {
+      const ms = Date.parse(event.ts) - open.at;
+      if (Number.isFinite(ms) && ms >= 0) held.set(open.call, ms);
+      open = null;
+    }
+  }
+  return held;
 }

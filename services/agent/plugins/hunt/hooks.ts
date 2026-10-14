@@ -1,7 +1,8 @@
 import type { NewEvent, TerminalHandoff } from "../../contracts/events.js";
 import { recalledPayloadOf } from "../../contracts/memory.js";
 import { defineTool, type RegisteredTool, type ToolResult } from "../../contracts/tool.js";
-import { callsIn, type Early, type Ending, type Parked, type PluginContext, type PluginHooks } from "../../core/agent.js";
+import { callsIn, childOrdinal, runChild, type Early, type Ending, type Parked, type PluginContext, type PluginHooks } from "../../core/agent.js";
+import { okWith, RECORD_TOOLS, refusedWith, type RecordBackend } from "../../core/record.js";
 import type { Harness } from "../../core/loop.js";
 import { errorFields, logger } from "../../core/log.js";
 import type { State } from "../../core/seams.js";
@@ -10,7 +11,7 @@ import { isVisibilityGap } from "../../core/security.js";
 import { toolsFrom } from "../../tools/remote.js";
 import { disconfirmationCritic, evidenceFrom, narrativeWriter, type AdapterOptions } from "../../workflows/hunt/adapters.js";
 import { pendingCheckpoints } from "../../workflows/hunt/checkpoints.js";
-import { suppressedEntities } from "../../workflows/hunt/digest.js";
+import { suppressedEntities } from "../../workflows/hunt/frontier.js";
 import { huntSpec } from "../../workflows/hunt/config.js";
 import { expandFrom } from "../../workflows/hunt/expand.js";
 import { citedFindings } from "../../workflows/hunt/findings.js";
@@ -20,8 +21,9 @@ import { narrativeInput, type Narrative } from "../../workflows/hunt/narrative.j
 import { startHunt } from "../../workflows/hunt/opening.js";
 import type { DirectiveQueue } from "../../workflows/hunt/ports.js";
 import { buildReport, renderReport } from "../../workflows/hunt/report.js";
+import { operatorLine } from "../../workflows/hunt/render.js";
 import { sensorAttested } from "../../workflows/hunt/strength.js";
-import type { Handoff, HuntOutcome, LinkRelation } from "../../workflows/hunt/types.js";
+import type { Handoff, HuntOutcome } from "../../workflows/hunt/types.js";
 import { HuntBook } from "./book.js";
 
 const log = logger("agent.hunt");
@@ -45,7 +47,6 @@ export interface HuntPorts {
 export const HUNT_TOOLS = [
   "hunt_status",
   "record_evidence",
-  "rule_evidence",
   "validate_hypothesis",
   "abandon_hypothesis",
   "handoff_ir",
@@ -54,7 +55,7 @@ export const HUNT_TOOLS = [
   "conclude_hunt",
 ] as const;
 
-const OWN = new Set<string>([...HUNT_TOOLS, "expand"]);
+const OWN = new Set<string>([...HUNT_TOOLS, ...RECORD_TOOLS, "expand"]);
 
 function state(ctx: PluginContext): State<HuntKinds> {
   return ctx.harness.state as unknown as State<HuntKinds>;
@@ -79,6 +80,28 @@ function adapters(ctx: PluginContext): AdapterOptions {
     actions: [],
     recall_keys: [],
     ...(ctx.options.signal === undefined ? {} : { signal: ctx.options.signal }),
+    // The critic and the narrator are judges, each run on a ledger of its own.
+    turn: async (cfg) => runChild(ctx, `${cfg.role}:${await childOrdinal(ctx, cfg.role)}`, cfg),
+  };
+}
+
+// The kernel's record tools on the hunt's record: a proposal joins the board, a link is a
+// ruling on an evidence id record_evidence returned, a question joins the frontier.
+function huntRecord(ctx: PluginContext, ports: HuntPorts): RecordBackend {
+  return {
+    stances: ["supports", "weakens", "neither"],
+    evidence: "an evidence id record_evidence returned",
+    propose: async (statement) => withBook(ctx, ports, (book) => okWith([{ hypothesis_id: book.propose(statement) }])),
+    link: async (links) =>
+      withBook(ctx, ports, (book) => {
+        const ruled = book.rule(links);
+        return ruled.ruled === 0 && ruled.skipped.length > 0 ? refusedWith(ruled.skipped.join("; ")) : okWith([ruled]);
+      }),
+    ask: async (question, hypothesisId) =>
+      withBook(ctx, ports, (book) => {
+        if (hypothesisId !== null && !book.projection.hypotheses.has(hypothesisId)) return refusedWith(`${hypothesisId} is not on the board`);
+        return okWith([{ question_id: book.raise(question, { hypothesis_id: hypothesisId }) }]);
+      }),
   };
 }
 
@@ -108,6 +131,8 @@ export function huntHooks(ports: HuntPorts): PluginHooks {
     },
 
     tools: (ctx) => [...huntTools(ctx, ports), ...expandTool(ctx)],
+
+    record: (ctx) => huntRecord(ctx, ports),
 
     turns: async (ctx) => withBook(ctx, ports, (book) => book.hunt.budgets.max_iterations),
 
@@ -143,7 +168,7 @@ export function huntHooks(ports: HuntPorts): PluginHooks {
         // A call the estate could not answer is a blind spot the verdicts count.
         const failure = seen.attempt.wrapped.failure;
         if (!OWN.has(seen.call.tool) && failure !== null && isVisibilityGap(failure)) {
-          book.appendGap(seen.call.tool, failure.kind as "timeout" | "unavailable", null);
+          book.appendGap(seen.call.tool, failure.kind as "timeout" | "unavailable" | "backend_error", null);
         }
         return { projection: book.projection, ended: book.ended(), suspended: book.hunt.status === "parked" || book.hunt.status === "pending_approval", why: book.suspendedBecause() };
       });
@@ -177,7 +202,7 @@ export function huntHooks(ports: HuntPorts): PluginHooks {
         } else if (outcome.status !== "completed") {
           book.terminate("failed", outcome.reason);
         } else if (!book.ended()) {
-          const said = typeof outcome.value === "string" ? outcome.value.trim() : "";
+          const said = summaryOfAnswer(outcome.value);
           const concluded = book.conclude(said === "" ? "the agent stopped" : `the agent stopped: ${said}`);
           if (concluded.parked !== undefined) {
             await book.ledger.flush();
@@ -311,12 +336,16 @@ export function briefOf(projection: Projection): string {
 // corrected premise), as the lead read them off its digest. Newest last, bounded.
 const OPERATOR_SHOWN = 12;
 
-function operatorOf(projection: Projection): string[] {
-  const benign = [...suppressedEntities(projection).entries()].map(([entity, why]) => `- ${entity} is known-benign${why ? ` (${why})` : ""}: its evidence stands; open no new work on it.`);
+export function operatorOf(projection: Projection): string[] {
+  // Every operator-supplied string is scrubbed, capped and kept to one line: the
+  // brief is what the agent works from, and a forged heading would read as its own.
+  const benign = [...suppressedEntities(projection).entries()].map(
+    ([entity, why]) => `- ${operatorLine(entity)} is known-benign${why ? ` (${operatorLine(why)})` : ""}: its evidence stands; open no new work on it.`,
+  );
   const said = projection.directives
     .filter((directive) => directive.kind !== "benign" && typeof directive.text === "string" && directive.text.trim() !== "")
     .slice(-OPERATOR_SHOWN)
-    .map((directive) => `- ${directive.kind === "reject" ? "rejected" : directive.kind} (${directive.actor}): ${directive.text.trim()}`);
+    .map((directive) => `- ${directive.kind === "reject" ? "rejected" : directive.kind} (${operatorLine(directive.actor)}): ${operatorLine(directive.text.trim())}`);
   return [...benign, ...said];
 }
 
@@ -366,6 +395,14 @@ function resultItem(spec: RunSpec): Record<string, unknown> {
     if (results?.items !== undefined) return results.items;
   }
   return RESULT_ITEM_FALLBACK;
+}
+
+// What the agent said when it stopped: its summary, or prose from a ledger
+// written before the hunt concluded in a shape.
+function summaryOfAnswer(value: unknown): string {
+  if (typeof value === "string") return value.trim();
+  const summary = (value as { summary?: unknown } | null)?.summary;
+  return typeof summary === "string" ? summary.trim() : "";
 }
 
 function ok(rows: readonly unknown[]): ToolResult {
@@ -418,32 +455,6 @@ function huntTools(ctx: PluginContext, ports: HuntPorts): RegisteredTool[] {
             });
           });
           return ok([{ evidence_ids: records.map((one) => one.evidence_id), questions: raised }]);
-        }),
-    ),
-
-    local(
-      "rule_evidence",
-      "Rule each new evidence record against each active hypothesis, the benign explanation included: supports, weakens or neither.",
-      {
-        type: "object",
-        additionalProperties: false,
-        required: ["relations"],
-        properties: {
-          relations: {
-            type: "array",
-            items: {
-              type: "object",
-              additionalProperties: false,
-              required: ["evidence_id", "hypothesis_id", "relation"],
-              properties: { evidence_id: { type: "string" }, hypothesis_id: { type: "string" }, relation: { type: "string", enum: ["supports", "weakens", "neither"] } },
-            },
-          },
-        },
-      },
-      async (args) =>
-        withBook(ctx, ports, (book) => {
-          const relations = (Array.isArray(args["relations"]) ? args["relations"] : []) as { evidence_id: string; hypothesis_id: string; relation: LinkRelation }[];
-          return ok([book.rule(relations)]);
         }),
     ),
 

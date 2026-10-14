@@ -66,7 +66,8 @@ describe("the conformance plugin", () => {
     // An iteration is a model call, counted by the harness that makes it.
     expect(report.iterations).toBe(2);
 
-    const kinds = (await state.read(RUN)).map((event) => event.kind);
+    // Frames and their content are the kernel's record of what each call was shown.
+    const kinds = (await state.read(RUN)).map((event) => event.kind).filter((kind) => kind !== "frame" && kind !== "content");
     expect(kinds).toEqual(["run", "spend", "call", "tally", "spend", "call", "tally", "terminal"]);
     expect(await state.terminal(RUN)).toEqual({ outcome: "completed", reason: "the count reached 3", summary: "the count reached 3" });
   });
@@ -147,9 +148,20 @@ describe("swapping a seam", () => {
   });
 });
 
+// Frames are left out: the swapped memory recalls other rows, which a frame records. What
+// the run did with them is everything else, and is the same.
 async function bare(state: State<TallyKinds>): Promise<unknown[]> {
   const events = await state.read(RUN);
-  return events.map(({ ts, ...rest }: AgentEvent<TallyKinds>) => rest);
+  return events
+    .filter((event) => event.kind !== "frame" && event.kind !== "content")
+    .map(({ ts, seq, ...rest }: AgentEvent<TallyKinds>) => ({ ...rest, payload: unclocked(rest.payload) }));
+}
+
+// A call's duration is the clock's, like ts, so two runs of the same thing differ in it.
+function unclocked(payload: unknown): unknown {
+  if (typeof payload !== "object" || payload === null || !("duration_ms" in payload)) return payload;
+  const { duration_ms, ...rest } = payload as Record<string, unknown>;
+  return rest;
 }
 
 async function approve(state: State<TallyKinds>, checkpoint_id: string): Promise<void> {

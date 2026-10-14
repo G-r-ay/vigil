@@ -18,7 +18,8 @@ import {
   type TurnConfig,
 } from "./loop.js";
 import { ProviderError, type Message, type ToolCall, type ToolSchema, type Turn, type TurnRequest } from "./provider.js";
-import { assemble, DEFAULT_FOLD, prefixOf, windowCeiling, type FoldPolicy, type Prefix } from "./context.js";
+import { assemble, canonical, DEFAULT_FOLD, prefixOf, windowCeiling, type FoldPolicy, type Prefix } from "./context.js";
+import { createHash } from "node:crypto";
 import { scannerFor, wrap } from "./security.js";
 import type { State } from "./seams.js";
 
@@ -34,11 +35,44 @@ export type StreamEvent<T = unknown> =
   | { type: "tool_call"; call: ToolCall }
   | { type: "tool_result"; call: ToolCall; attempt: Attempt; ref?: string }
   | { type: "folded"; folded: number; remaining: number }
+  // Before every model call: what it is about to be shown. The caller journals it.
+  | { type: "frame"; frame: FrameSeen }
   | { type: "approval_required"; pending: Pending }
   | { type: "done"; outcome: Outcome<T> }
   | { type: "failed"; outcome: Outcome<T> };
 
 export type TurnStream<T> = AsyncGenerator<StreamEvent<T>, Outcome<T>>;
+
+// One model call's input, in its parts. The transcript is the caller's history then this
+// stream's calls; a caller holding the ledger names those calls and hashes the rest.
+export interface FrameSeen {
+  role: string;
+  model_id: string;
+  provider_type: string;
+  sampling: Record<string, unknown>;
+  system: string;
+  task: string;
+  recall: string;
+  tools: readonly ToolSchema[];
+  // The caller's history: how many messages, and the messages themselves.
+  history: readonly Message[];
+  // Tool results this stream has added to the transcript since it started.
+  results: number;
+  fold: { policy: FoldPolicy | null; folded: number; ceiling?: number };
+  tail: string | null;
+  emit: Record<string, unknown> | null;
+  input: string;
+}
+
+// The one hash every reader of a frame agrees on: messages, tools and the
+// emission schema, key-sorted.
+export function inputHash(messages: readonly Message[], tools: readonly ToolSchema[], emit: Record<string, unknown> | null): string {
+  return contentHash(JSON.stringify(canonical({ messages, tools, emit })));
+}
+
+export function contentHash(text: string): string {
+  return `sha256:${createHash("sha256").update(text).digest("hex")}`;
+}
 
 // Generic over the workflow's kinds only so any workflow fits. The loop appends
 // none of them and reads only the domain-free set.
@@ -73,6 +107,10 @@ class Run<T, Kinds extends Record<string, unknown>> {
   private capped = false;
   private spent = 0;
   private prose = "";
+  private results = 0;
+  // Set once the model has been asked to keep going, and the ask it is carrying.
+  private nudged = false;
+  private nudge: string | null = null;
   private readonly folder: Folder<Kinds>;
 
   constructor(
@@ -179,13 +217,22 @@ class Run<T, Kinds extends Record<string, unknown>> {
       const refusal = await this.harness.budget.beginCall();
       if (refusal !== null) return this.exhausted(refusal);
 
-      const messages = this.assembled();
+      const tail = this.nudge;
+      this.nudge = null;
+      const messages = this.assembled(tail ?? "");
       if (this.lastFold > 0) yield { type: "folded", folded: this.lastFold, remaining: messages.length };
 
-      const turn = yield* this.burn({ messages, tools: this.prefix.tools });
+      const turn = yield* this.burn({ messages, tools: this.prefix.tools }, tail);
       this.turns += 1;
       this.prose = turn.content;
-      if (turn.tool_calls.length === 0) return null;
+      if (turn.tool_calls.length === 0) {
+        if (this.stoppedEarly()) {
+          this.nudged = true;
+          this.nudge = persistAsk(turn.content, this.gathered(), this.cfg.max_turns - this.turns);
+          continue;
+        }
+        return null;
+      }
 
       this.transcript.push({ role: "assistant", content: turn.content, tool_calls: turn.tool_calls });
       for (const call of turn.tool_calls) {
@@ -215,6 +262,21 @@ class Run<T, Kinds extends Record<string, unknown>> {
     // still answers over what it gathered, and says the set was truncated.
     this.capped = true;
     return null;
+  }
+
+  // Stopped with turns in hand and next to nothing gathered, and not yet asked.
+  private stoppedEarly(): boolean {
+    const persist = this.cfg.persist;
+    if (persist === undefined || this.nudged || this.turns >= this.cfg.max_turns) return false;
+    return this.gathered() < persist.min_results;
+  }
+
+  // Results from tools outside this process: what the run has looked at. A playbook or a
+  // record write is not looking; a resumed run's history counts whole.
+  private gathered(): number {
+    const local = new Set(this.tools.filter((tool) => tool.local).map((tool) => tool.id));
+    const prior = (this.cfg.history ?? []).filter((message) => message.role === "tool").length;
+    return prior + this.calls.filter((attempt) => !local.has(attempt.tool)).length;
   }
 
   // The store is the authority on whether the run is still going, so one
@@ -275,6 +337,7 @@ class Run<T, Kinds extends Record<string, unknown>> {
     };
     this.calls.push(attempt);
     this.transcript.push({ role: "tool", call_id: call.id, content: wrapped.text });
+    this.results += 1;
     if (gated !== undefined) await this.journalExecuted(gated, call.tool, result);
     else if (call.tool === CANDIDATE_CHECK) await this.journalExecuted(`dsp-${call.id}`, call.tool, result);
     yield { type: "tool_result", call, attempt, ...(ref === undefined ? {} : { ref }) };
@@ -308,7 +371,7 @@ class Run<T, Kinds extends Record<string, unknown>> {
       // worth changing before asking again is how much it is asked over.
       let turn;
       try {
-        turn = yield* this.burn({ messages: this.assembled(tail), tools: [], emit: schema });
+        turn = yield* this.burn({ messages: this.assembled(tail), tools: [], emit: schema }, tail);
       } catch (error) {
         const tighter = FOLD_LADDER[this.folds];
         if (tighter === undefined || this.cfg.signal?.aborted === true) throw error;
@@ -379,7 +442,8 @@ class Run<T, Kinds extends Record<string, unknown>> {
 
   // One model call, journaled as the provider reports it rather than after it
   // returns: a call that dies mid-turn has still put its spend on the ledger.
-  private async *burn(request: Omit<TurnRequest, "signal">): AsyncGenerator<StreamEvent<T>, Omit<Turn, "tokens">> {
+  private async *burn(request: Omit<TurnRequest, "signal">, tail: string | null): AsyncGenerator<StreamEvent<T>, Omit<Turn, "tokens">> {
+    yield { type: "frame", frame: this.frame(request, tail) };
     const signal = this.cfg.signal ? { signal: this.cfg.signal } : {};
     const tool_calls: ToolCall[] = [];
     let content = "";
@@ -423,6 +487,30 @@ class Run<T, Kinds extends Record<string, unknown>> {
     return { content, tool_calls };
   }
 
+  private frame(request: Omit<TurnRequest, "signal">, tail: string | null): FrameSeen {
+    const emit = request.emit ?? null;
+    return {
+      role: this.cfg.role,
+      model_id: this.harness.provider.model,
+      provider_type: this.harness.provider.provider_type,
+      sampling: { ...(this.harness.provider.sampling ?? {}) },
+      system: this.prefix.system,
+      task: this.cfg.task,
+      recall: this.prefix.recall,
+      tools: request.tools,
+      history: this.cfg.history ?? [],
+      results: this.results,
+      fold: {
+        policy: this.tightened,
+        folded: this.lastFold,
+        ...(this.cfg.context_window === undefined ? {} : { ceiling: windowCeiling(this.cfg.context_window) }),
+      },
+      tail,
+      emit,
+      input: inputHash(request.messages, request.tools, emit),
+    };
+  }
+
   // Priced before recorded, so the spend fold is in dollars and the pool has something
   // to hold. Null when nothing priced it: an unpriced call is not a free one.
   private async priced(tokens: TokenCounts): Promise<SpendPayload> {
@@ -447,7 +535,13 @@ class Run<T, Kinds extends Record<string, unknown>> {
   // Split from the pricing above so the reservation is handed back in one place and
   // journalled in another: the caller marks the call settled between them.
   private async journal(payload: SpendPayload): Promise<void> {
-    await this.write({ run_id: this.cfg.run_id, run_kind: this.cfg.run_kind, kind: "spend", payload });
+    const to = this.cfg.spend_to;
+    if (to === undefined) {
+      await this.write({ run_id: this.cfg.run_id, run_kind: this.cfg.run_kind, kind: "spend", payload });
+      return;
+    }
+    const event = { run_id: to.run_id, run_kind: to.run_kind, kind: "spend", payload } as unknown as NewEvent<Kinds>;
+    await this.harness.state.append(to.run_id, [event]);
   }
 
   private async park(checkpoint_id: string, tool: string, args: string): Promise<Outcome<T>> {
@@ -573,6 +667,46 @@ const FOLD_LADDER: readonly FoldPolicy[] = [
   { head: 1, tail: 1, max_messages: 4, max_chars: 40_000 },
 ];
 
+// What a run that stopped early is asked, quoting its own words; its next answer stands.
+// When the answer comes by tool (`by`), the ask is that tool's refusal instead.
+export function persistAsk(said: string, gathered: number, left: number | null, by?: string): string {
+  return [
+    said.trim() === "" ? "You stopped without saying anything." : `You stopped here, saying:\n\n${said.trim()}`,
+    `You have ${gathered} tool result(s)${left === null ? "" : ` and ${left} turn(s) left`}. Your answer will be final and acted on.`,
+    by === undefined
+      ? "If a question you raised is still open and a tool you hold could answer it, keep investigating. Otherwise reply without calling a tool, and your answer will be asked for."
+      : `If a question you raised is still open and a tool you hold could answer it, keep investigating. Otherwise call ${by} again with your answer, and it stands.`,
+  ].join("\n\n");
+}
+
+// A model call's input rebuilt from its parts, as assembled() built it: what a
+// replay compares against the frame's input hash.
+export interface InputParts {
+  system: string;
+  tools: readonly ToolSchema[];
+  recall: string;
+  task: string;
+  transcript: readonly Message[];
+  tail: string | null;
+  emit: Record<string, unknown> | null;
+  policy: FoldPolicy | null;
+  ceiling?: number;
+}
+
+export function rebuiltInput(parts: InputParts): { messages: Message[]; input: string; folded: number } {
+  const prefix: Prefix = { system: parts.system, tools: parts.tools, recall: parts.recall };
+  const { messages, folded } = assemble(
+    prefix,
+    parts.task,
+    parts.transcript,
+    parts.tail ?? "",
+    summariseFolded,
+    parts.policy ?? DEFAULT_FOLD,
+    parts.ceiling ?? (parts.policy ?? DEFAULT_FOLD).max_chars,
+  );
+  return { messages, input: inputHash(messages, parts.tools, parts.emit), folded };
+}
+
 // Names what was dropped rather than reproducing it: a summary that quotes the
 // middle back is the middle, and folds nothing.
 function summariseFolded(folded: readonly Message[]): string {
@@ -641,6 +775,13 @@ function compile(schema: Record<string, unknown>): ValidateFunction {
   const validate = ajv.compile(schema);
   compiled.set(key, validate);
   return validate;
+}
+
+// Why a value does not match a schema, or null when it does: for a caller that
+// takes an answer some other way than the emission, and holds it to the same shape.
+export function schemaErrors(schema: Record<string, unknown>, value: unknown): string | null {
+  const validate = compile(schema);
+  return validate(value) ? null : errorsOf(validate);
 }
 
 function errorsOf(validate: ValidateFunction): string {

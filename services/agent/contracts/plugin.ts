@@ -21,6 +21,9 @@ export interface StructuredConclusion {
   // Which field holds the result refs the answer rests on. Absent means the run
   // cites nothing, and its results are not numbered.
   citations_field?: string;
+  // Which field holds what the run could not settle, in its own words: its
+  // declared gaps. Required of a plugin whose record is required.
+  open_questions_field?: string;
 }
 
 // The run ends on prose: whatever the agent said last, once it stopped calling tools.
@@ -58,4 +61,20 @@ export interface PluginManifest {
   // Tool turns across the whole run, resumes included. Absent takes the
   // deployment's runtime.max_turns.
   max_turns?: number;
+  // The hypothesis record (core/record.ts): available offers its tools, required also
+  // holds a guarded answer to it and its gaps, off offers nothing. Absent is available.
+  record?: RecordMode;
+  // The results a run should gather before it may stop unasked. A run that stops
+  // with fewer, and turns left, is asked once to keep going or confirm it is done.
+  min_results?: number;
+  // How a structured answer is given: ask (the default) stops and is asked, a model call of
+  // its own; tool has the agent call conclude in the turn it decides, ending the run.
+  finish_with?: "ask" | "tool";
+}
+
+export const RECORD_MODES = ["off", "available", "required"] as const;
+export type RecordMode = (typeof RECORD_MODES)[number];
+
+export function recordModeOf(plugin: PluginManifest): RecordMode {
+  return plugin.record ?? "available";
 }
