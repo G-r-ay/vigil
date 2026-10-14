@@ -5,10 +5,10 @@ import { join } from "node:path";
 import { LedgerRepository } from "../../ledger/repository.js";
 import { LeaseRepository } from "../../ledger/leases.js";
 import { advance, resolveSpec, spentOn } from "../../worker.js";
-import { runHunt } from "../../workflows/hunt/workflow.js";
-import { steer } from "../../workflows/hunt/inbox.js";
-import { archFor } from "../../arch/registry.js";
-import { InProcessDirectiveQueue } from "../../workflows/hunt/directives.js";
+import { runHunt } from "../../plugins/hunt/workflow.js";
+import { steer } from "../../plugins/hunt/inbox.js";
+import { archFor } from "../../plugins/kinds.js";
+import { InProcessDirectiveQueue } from "../../plugins/hunt/directives.js";
 import type { RunJob } from "../../contracts/job.js";
 import { isLead, respondingProvider } from "../support/responding-provider.js";
 import { ZERO_TOKENS } from "../../contracts/budget.js";
@@ -100,7 +100,7 @@ describe("a hunt started through the queue", () => {
     // Both halves: the contract's spec, which resume reads, and the hunt state
     // its projection folds. A run event with only one of them breaks the other.
     expect(first?.payload).toMatchObject({
-      spec: { arch: "threathunt" },
+      spec: { arch: "hunt" },
       started_by: "test",
       hunt: { name: expect.any(String), status: expect.any(String) },
     });

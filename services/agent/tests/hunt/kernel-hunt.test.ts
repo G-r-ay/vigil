@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { archFor } from "../../arch/registry.js";
+import { archFor } from "../../plugins/kinds.js";
 import type { TerminalHandoff } from "../../contracts/events.js";
 import { InProcessState } from "../../core/state.js";
-import { InProcessDirectiveQueue } from "../../workflows/hunt/directives.js";
-import { huntDistil } from "../../workflows/hunt/distil.js";
-import type { HuntEvent, HuntKinds } from "../../workflows/hunt/ledger.js";
-import { fold } from "../../workflows/hunt/ledger.js";
-import { huntProjection } from "../../workflows/hunt/projection.js";
-import { runHunt } from "../../workflows/hunt/workflow.js";
+import { InProcessDirectiveQueue } from "../../plugins/hunt/directives.js";
+import { huntDistil } from "../../plugins/hunt/distil.js";
+import type { HuntEvent, HuntKinds } from "../../plugins/hunt/ledger.js";
+import { fold } from "../../plugins/hunt/ledger.js";
+import { huntProjection } from "../../plugins/hunt/projection.js";
+import { runHunt } from "../../plugins/hunt/workflow.js";
 import { huntKernelReplay, huntView } from "../../plugins/hunt/view.js";
 
 import { RUN, specOf, hypothesisIn, modelOf, estate, harnessOf, finding, shown, type Step } from "../support/kernel-hunt.js";
@@ -174,6 +174,15 @@ describe("what a kernel hunt tells the console as it goes", () => {
 });
 
 describe("a failed query the agent records (#2207)", () => {
+  it.each(["hunt", "adjudicate"] as const)("can be flagged as one: %s's record_evidence offers query_failed", async (kind) => {
+    const provider = modelOf([() => ({ say: "nothing to do" })]);
+    await runHunt(harnessOf(specOf(kind), provider, new InProcessState<HuntKinds>()), { run_id: RUN, run_kind: kind, spec: specOf(kind), actions: [], queue: new InProcessDirectiveQueue() });
+
+    const record = provider.requests[0]?.tools.find((tool) => tool.id === "record_evidence");
+    const item = ((record?.parameters["properties"] as Record<string, { items?: { properties?: Record<string, unknown> } }>)["results"])?.items;
+    expect(item?.properties).toHaveProperty("query_failed");
+  });
+
   it("is filed as a blind spot, never linked, and a ruling on it is refused", async () => {
     const state = new InProcessState<HuntKinds>();
     const timedOut = (hypothesis: string) => ({

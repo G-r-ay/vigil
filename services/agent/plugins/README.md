@@ -25,7 +25,13 @@ And the five things a run needs to be trusted and learned from:
 
 ## What a plugin is
 
-A directory: `<id>/plugin.yaml`, a `skills/` folder, and optionally `hooks.ts`.
+A directory, `plugins/<id>/`, holding everything about one kind of run:
+
+- `plugin.yaml`: what the agent is, what it may use, how it ends (below), and the run's roles: what each may use, and for the hunt its critic and result shape. This is the arch layer of the arch · playbook · config spec; `plugins/kinds.ts` maps each run kind to its plugin and to the views below
+- `hooks.ts`, optionally: code the kernel calls at its seams
+- the plugin's own domain: its ledger vocabulary, the console view (`view.ts`), memory distil and recall, and readers for ledgers an earlier engine wrote (`investigate/legacy/`, `hunt/projection.ts`)
+
+Skills are not in the plugin. They live in the repo's one library, `core/skills/library/<name>/SKILL.md`, shared with the Python agents and the console; a plugin names the ones it uses.
 
 ```yaml
 id: investigate
@@ -33,7 +39,7 @@ description: Work one open case to a conclusion a reader can act on.
 needs: [case_records, get_finding, telemetry_search]   # capabilities, bound by each tool's `provides`
 system: |
   Who the agent is and how it works.
-skills: [investigate-case]          # skills/<name>/SKILL.md, loaded on demand
+skills: [investigate-case]          # core/skills/library/<name>/SKILL.md, loaded on demand
 conclusion:                         # or `conclusion: prose`
   summary_field: summary
   citations_field: citations        # optional; numbers results so the answer can cite them
@@ -98,7 +104,7 @@ authored sequence rather than one agent's judgement. Compose's phases use it.
 | `investigate` | investigate | Files only. The dismissal guard holds `benign`/`false_positive` for review. |
 | `hunt` | hunt | One agent keeps the hunt's record through its tools, in `book.ts`. The record is the controller's, unchanged, so the projection, the distil episodic memory reads and the report fold it as before. |
 | `adjudicate` | adjudicate | Same hooks as hunt, without escalation. |
-| `rootcause` | root_cause | The proof is code (`workflows/rootcause/proof.ts`); the model never says a link is proved. |
+| `rootcause` | root_cause | The proof is code (`plugins/rootcause/proof.ts`); the model never says a link is proved. |
 | `compose` | compose | Walks the playbook's authored phases in order, each a subturn under its own agent and grants. |
 | `chat` | chat | A conversation: the caller holds the transcript and nothing writes a terminal. |
 | `tally` | tally | The conformance plugin. If a plugin this small needs the kernel to know anything about it, the boundary is in the wrong place. |
@@ -107,5 +113,5 @@ authored sequence rather than one agent's judgement. Compose's phases use it.
 
 1. Write `<id>/plugin.yaml` and its skills.
 2. If it needs code, write `<id>/hooks.ts` and register it in `index.ts`.
-3. Give its run kind an entry in `arch/registry.ts`, and a projection if the console reads it in a shape of its own.
+3. Give its run kind an entry in `plugins/kinds.ts`, and a projection if the console reads it in a shape of its own.
 4. Test it with a scripted model that answers what it is shown. See `tests/hunt/kernel-hunt.test.ts`.

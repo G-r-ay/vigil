@@ -1,12 +1,12 @@
 import { gzipSync } from "node:zlib";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { archFor } from "../arch/registry.js";
+import { archFor } from "../plugins/kinds.js";
 import type { ChildPayload } from "../contracts/events.js";
 import { InProcessState } from "../core/state.js";
-import { InProcessDirectiveQueue } from "../workflows/hunt/directives.js";
-import type { HuntKinds } from "../workflows/hunt/ledger.js";
-import { runHunt } from "../workflows/hunt/workflow.js";
+import { InProcessDirectiveQueue } from "../plugins/hunt/directives.js";
+import type { HuntKinds } from "../plugins/hunt/ledger.js";
+import { runHunt } from "../plugins/hunt/workflow.js";
 import type { ToolResult } from "../contracts/tool.js";
 import type { Memory, ToolDispatch } from "../core/seams.js";
 import { harnessOf, hypothesisIn, modelOf, specOf, type Step } from "../tests/support/kernel-hunt.js";

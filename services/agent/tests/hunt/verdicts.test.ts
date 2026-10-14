@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { archFor } from "../../arch/registry.js";
+import { archFor } from "../../plugins/kinds.js";
 import { ZERO_TOKENS } from "../../contracts/budget.js";
 import type { ToolResult } from "../../contracts/tool.js";
 import { budgetOf, unmeteredQuota } from "../../core/budget.js";
@@ -14,13 +14,13 @@ import {
   DEFAULT_VERDICTS,
   validateThresholds,
   verdictsOf,
-} from "../../workflows/hunt/config.js";
-import { InProcessDirectiveQueue } from "../../workflows/hunt/directives.js";
-import { fold, type HuntEvent, type HuntKinds } from "../../workflows/hunt/ledger.js";
-import { newId } from "../../workflows/hunt/ids.js";
-import { startHunt } from "../../workflows/hunt/opening.js";
-import { evidenceStrength, isGap } from "../../workflows/hunt/strength.js";
-import { runHunt } from "../../workflows/hunt/workflow.js";
+} from "../../plugins/hunt/config.js";
+import { InProcessDirectiveQueue } from "../../plugins/hunt/directives.js";
+import { fold, type HuntEvent, type HuntKinds } from "../../plugins/hunt/ledger.js";
+import { newId } from "../../plugins/hunt/ids.js";
+import { startHunt } from "../../plugins/hunt/opening.js";
+import { evidenceStrength, isGap } from "../../plugins/hunt/strength.js";
+import { runHunt } from "../../plugins/hunt/workflow.js";
 import {
   bookOf,
   evidenceOn,
@@ -410,15 +410,3 @@ describe("verdict thresholds are config", () => {
     expect(ledger.projection.hypotheses.get(hypothesisId)!.status).toBe("proven");
   });
 });
-
-// Every optional field on the decision schema is nullable except one. A verb that
-// carries no query — VALIDATE, ABANDON, CONCLUDE — emitted null for query_intent
-// and was refused for a field it was right to leave empty, costing an attempt and
-// a re-ask on the turn the hunt was trying to reach a verdict.
-describe('a verb that carries no query', () => {
-  it('declares query_intent nullable, like its siblings', async () => {
-    const { readFileSync } = await import('node:fs')
-    const arch = readFileSync(join(import.meta.dirname, '..', '..', 'arch', 'threathunt.yaml'), 'utf8')
-    expect(arch).toContain('query_intent: { type: [string, "null"] }')
-  })
-})
