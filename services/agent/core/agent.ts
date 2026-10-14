@@ -8,11 +8,14 @@ import type {
   ReviewPayload,
   RunKind,
   RunOutcome,
+  RunPayload,
+  TerminalHandoff,
   TerminalPayload,
   UnboundPayload,
 } from "../contracts/events.js";
 import { isStructured, type GuardSpec, type PluginManifest } from "../contracts/plugin.js";
 import { journalAnswers, noAnswers, type Answers } from "./answers.js";
+import { GatewayExhausted } from "./limiter.js";
 import { announceOpen, noAnnounce, type Announce } from "./checkpoints.js";
 import type { Harness, Outcome, TurnConfig } from "./loop.js";
 import type { Message } from "./provider.js";
@@ -46,8 +49,8 @@ export interface PluginContext {
 
 // Before the loop: park on a question of the plugin's own, or end the run here.
 export type Early =
-  | { kind: "park"; checkpoint_id: string; reason: string; tool?: string | null; args?: string | null }
-  | { kind: "end"; outcome: RunOutcome; reason: string; summary?: string | null };
+  | { kind: "park"; checkpoint_id?: string; reason: string; tool?: string | null; args?: string | null }
+  | { kind: "end"; outcome: RunOutcome; reason: string; summary?: string | null; handoffs?: TerminalHandoff[] };
 
 export interface Ending {
   outcome: RunOutcome;
@@ -55,6 +58,20 @@ export interface Ending {
   // What the run delivers. Null delivers nothing even on success; absent delivers
   // the reason, unless the run failed.
   summary?: string | null;
+  // Work the run finished by giving away, carried out on the terminal.
+  handoffs?: TerminalHandoff[];
+}
+
+// Not an ending: the run stops here and waits, on a question it has raised or on
+// an operator's say-so. Nothing is written; the plugin's own record says why.
+export interface Parked {
+  parked: string;
+  // The question it waits on, when there is one, so it can be announced.
+  checkpoint_id?: string;
+}
+
+function isParked(value: Ending | Parked): value is Parked {
+  return "parked" in value;
 }
 
 // Code a plugin ships beside its manifest, every hook optional. A hook holds the plugin's
@@ -65,17 +82,26 @@ export interface PluginHooks {
   tools?(ctx: PluginContext): readonly RegisteredTool[];
   // Wraps how a call reaches its tool, to shape what comes back.
   dispatch?(ctx: PluginContext, inner: ToolDispatch): ToolDispatch;
+  // Once, when the run starts: writes the run event and whatever opens it, from `base`,
+  // for a plugin whose record rides beside the run event. Absent writes the kernel's own.
+  open?(ctx: PluginContext, base: RunPayload): Promise<void>;
   // Each time the run is picked up, before the loop.
   before?(ctx: PluginContext): Promise<Early | null>;
   // What the run is about, rendered each time it is picked up. Absent renders the playbook.
   brief?(ctx: PluginContext): Promise<string>;
+  // The run's tool-turn allowance, read each time it is picked up, for a plugin
+  // whose allowance lives in its own record and an operator can extend.
+  turns?(ctx: PluginContext): Promise<number>;
   // Every event the loop yields, after the kernel journals its own. "halt" ends the loop
-  // between two calls, on the plugin's terms rather than the model's; `halted` says how.
-  observe?(ctx: PluginContext, seen: StreamEvent<unknown>): Promise<void | "halt">;
-  halted?(ctx: PluginContext): Promise<Ending>;
+  // between two calls on the plugin's terms (`halted` says how); a Parked waits there.
+  observe?(ctx: PluginContext, seen: StreamEvent<unknown>): Promise<void | "halt" | Parked>;
+  halted?(ctx: PluginContext): Promise<Ending | Parked>;
+  // The gateway's own allowance refused a call: not this run failing, and nothing
+  // a retry can change. Absent leaves it to the worker, which records the budget.
+  exhausted?(ctx: PluginContext, reason: string): Promise<Ending>;
   // How the run ends once the loop has answered or been refused. Null takes the
   // kernel's own ending: review, then a summary off the answer.
-  finish?(ctx: PluginContext, outcome: Outcome<unknown>): Promise<Ending | null>;
+  finish?(ctx: PluginContext, outcome: Outcome<unknown>): Promise<Ending | Parked | null>;
   // What a run an operator stopped leaves behind.
   stopped?(ctx: PluginContext, directive: DirectivePayload): Promise<string | undefined>;
   // Once the terminal is on the ledger, for a plugin that reports it elsewhere too.
@@ -99,6 +125,9 @@ export interface AgentOptions {
   answers?: Answers;
   announce?: Announce;
   stop?: StopSource;
+  // The entity keys the run's opening recall reads, when the caller knows them
+  // better than the spec does. Absent reads the spec's recall_keys.
+  recall_keys?: readonly string[];
   // One turn of an open-ended exchange: the caller sends the whole transcript, and no
   // terminal is written, because the person may always say something else.
   conversation?: Conversation;
@@ -122,6 +151,8 @@ export interface AgentReport {
   // What the agent answered, when it answered. A conversation reads it from here.
   value?: unknown;
 }
+
+const LOST_LEASE = "the worker lost its lease";
 
 // How often an operator's stop is looked for while a call is in flight.
 const STOP_POLL_MS = 500;
@@ -200,6 +231,9 @@ export async function* streamAgent(harness: Harness<Kinds>, options: AgentOption
   await journalAnswers(harness.state, run_id, options.run_kind, options.answers ?? noAnswers);
 
   const ctx: PluginContext = { harness: equipped(harness, options), options };
+  // The lease went to another worker, which is driving the run now: hand it back
+  // untouched. A terminal written here would end the run it is in the middle of.
+  if (options.signal?.aborted === true) return report(ctx, "aborted", LOST_LEASE, null);
   const ended = await terminalOf(harness, run_id);
   if (ended !== null) return report(ctx, ended.outcome, ended.reason, null);
 
@@ -207,8 +241,9 @@ export async function* streamAgent(harness: Harness<Kinds>, options: AgentOption
   if (queued !== null) return stopped(ctx, queued);
 
   const early = (await options.hooks?.before?.(ctx)) ?? null;
-  if (early?.kind === "end") return end(ctx, early.outcome, early.reason, early.summary);
+  if (early?.kind === "end") return end(ctx, early.outcome, early.reason, early.summary, early.handoffs);
   if (early?.kind === "park") {
+    if (early.checkpoint_id === undefined) return report(ctx, "waiting_approval", early.reason, null);
     await announceOpen(harness.state, run_id, options.run_kind, early.checkpoint_id, options.announce ?? noAnnounce);
     return report(ctx, "waiting_approval", early.reason, { checkpoint_id: early.checkpoint_id, tool: early.tool ?? null, args: early.args ?? null });
   }
@@ -217,6 +252,9 @@ export async function* streamAgent(harness: Harness<Kinds>, options: AgentOption
     const loop = yield* work(ctx, await harness.state.read(run_id));
     if (loop.kind === "parked") return loop.report;
     if (loop.kind === "stopped") return stopped(ctx, loop.directive);
+    if (loop.kind === "waiting") return wait(ctx, loop.parked);
+    if (loop.kind === "exhausted") return report(ctx, "budget_exhausted", loop.reason, null);
+    if (loop.kind === "lost") return report(ctx, "aborted", LOST_LEASE, null);
     if (loop.kind === "halted") return report(ctx, "completed", "the plugin ended the turn", null);
     const status = loop.outcome.status === "completed" ? "completed" : "failed";
     return { ...(await report(ctx, status, loop.outcome.reason, null)), value: loop.outcome.value };
@@ -228,12 +266,20 @@ export async function* streamAgent(harness: Harness<Kinds>, options: AgentOption
     const loop = yield* work(ctx, held);
     if (loop.kind === "parked") return loop.report;
     if (loop.kind === "stopped") return stopped(ctx, loop.directive);
+    if (loop.kind === "waiting") return wait(ctx, loop.parked);
+    if (loop.kind === "lost") return report(ctx, "aborted", LOST_LEASE, null);
+    if (loop.kind === "exhausted") {
+      const ending = await (options.hooks?.exhausted as NonNullable<PluginHooks["exhausted"]>)(ctx, loop.reason);
+      return end(ctx, ending.outcome, ending.reason, ending.summary, ending.handoffs);
+    }
     if (loop.kind === "halted") {
       const ending = (await options.hooks?.halted?.(ctx)) ?? { outcome: "completed" as const, reason: "the plugin ended the run" };
-      return end(ctx, ending.outcome, ending.reason, ending.summary);
+      return isParked(ending) ? wait(ctx, ending) : end(ctx, ending.outcome, ending.reason, ending.summary, ending.handoffs);
     }
     const ending = (await options.hooks?.finish?.(ctx, loop.outcome)) ?? null;
-    if (ending !== null) return end(ctx, ending.outcome, ending.reason, ending.summary);
+    if (ending !== null && isParked(ending)) return wait(ctx, ending);
+    if (loop.conclusion !== null) await harness.state.append(run_id, [event(options, "conclusion", loop.conclusion)]);
+    if (ending !== null) return end(ctx, ending.outcome, ending.reason, ending.summary, ending.handoffs);
     if (loop.outcome.status !== "completed" || loop.outcome.value === null) {
       return end(ctx, loop.outcome.refusal === null ? "failed" : "budget_exhausted", loop.outcome.reason);
     }
@@ -279,6 +325,9 @@ type Loop =
   | { kind: "parked"; report: AgentReport }
   | { kind: "stopped"; directive: DirectivePayload }
   | { kind: "halted" }
+  | { kind: "waiting"; parked: Parked }
+  | { kind: "exhausted"; reason: string }
+  | { kind: "lost" }
   | { kind: "answered"; outcome: Outcome<unknown>; conclusion: ConclusionPayload | null };
 
 // The agent's own loop, picked up wherever the ledger left it. Every result is
@@ -295,7 +344,8 @@ async function* work(ctx: PluginContext, held: Ledger): AsyncGenerator<StreamEve
   let halted = false;
   const linked = link(options.signal, watch.signal, halt.signal);
   const task = options.conversation?.task ?? (await (options.hooks?.brief?.(ctx) ?? Promise.resolve(briefOf(options.spec))));
-  const cfg = turnFor(options, calls, used, task, linked.signal);
+  const allowance = await options.hooks?.turns?.(ctx);
+  const cfg = turnFor(options, calls, used, task, linked.signal, allowance);
   const stream = streamTurn<unknown, Kinds>(cfg, harness);
 
   let turn = used;
@@ -339,6 +389,12 @@ async function* work(ctx: PluginContext, held: Ledger): AsyncGenerator<StreamEve
       }
       const said = await options.hooks?.observe?.(ctx, seen);
       yield seen;
+      if (typeof said === "object") {
+        halted = true;
+        halt.abort(new Error("the plugin parked the run"));
+        await stream.return(undefined as never).catch(() => undefined);
+        return { kind: "waiting", parked: said };
+      }
       if (said === "halt") {
         halted = true;
         halt.abort(new Error("the plugin ended the run"));
@@ -350,12 +406,15 @@ async function* work(ctx: PluginContext, held: Ledger): AsyncGenerator<StreamEve
     if (halted) return { kind: "halted" };
     const directive = watch.directive();
     if (directive !== null) return { kind: "stopped", directive };
+    if (error instanceof GatewayExhausted && options.hooks?.exhausted !== undefined) return { kind: "exhausted", reason: error.message };
+    if (options.signal?.aborted === true) return { kind: "lost" };
     throw error;
   } finally {
     watch.stop();
     linked.release();
   }
 
+  if (options.signal?.aborted === true) return { kind: "lost" };
   if (outcome.status === "waiting_approval") {
     if (outcome.pending !== null) {
       await announceOpen(harness.state, options.run_id, options.run_kind, outcome.pending.checkpoint_id, options.announce ?? noAnnounce);
@@ -366,6 +425,8 @@ async function* work(ctx: PluginContext, held: Ledger): AsyncGenerator<StreamEve
     return { kind: "answered", outcome, conclusion: null };
   }
 
+  // Not journaled yet: whether the run ends on this answer is the plugin's to say,
+  // and a conclusion on the ledger is what a resume reads as "this run is done".
   const conclusion: ConclusionPayload = {
     plugin: options.plugin.id,
     // Prose is carried as text, so every conclusion is an object a reader can open.
@@ -374,14 +435,20 @@ async function* work(ctx: PluginContext, held: Ledger): AsyncGenerator<StreamEve
     turns: used + outcome.turns,
     cost_usd: outcome.cost_usd,
   };
-  await harness.state.append(options.run_id, [event(options, "conclusion", conclusion)]);
   return { kind: "answered", outcome, conclusion };
 }
 
-function turnFor(options: AgentOptions, calls: readonly CallPayload[], used: number, task: string, signal: AbortSignal | undefined): TurnConfig {
+function turnFor(
+  options: AgentOptions,
+  calls: readonly CallPayload[],
+  used: number,
+  task: string,
+  signal: AbortSignal | undefined,
+  allowance?: number,
+): TurnConfig {
   const { spec, plugin } = options;
   const structured = isStructured(plugin.conclusion) ? plugin.conclusion : null;
-  const limit = plugin.max_turns ?? spec.runtime.max_turns;
+  const limit = allowance ?? plugin.max_turns ?? spec.runtime.max_turns;
   return {
     run_id: options.run_id,
     run_kind: options.run_kind,
@@ -397,7 +464,7 @@ function turnFor(options: AgentOptions, calls: readonly CallPayload[], used: num
     verbs: [],
     result_cap: spec.runtime.result_cap,
     recall_limit: spec.runtime.recall_limit,
-    recall_keys: openingKeys(spec),
+    recall_keys: options.recall_keys ?? openingKeys(spec),
     // Only a conversation sizes its fold to the model's window (#2125): it only lowers
     // Ask's ceiling, and every other kind keeps the flat one.
     ...(options.conversation === undefined || spec.context_window === undefined ? {} : { context_window: spec.context_window }),
@@ -743,10 +810,26 @@ async function terminalOf(harness: Harness<Kinds>, runId: string): Promise<Termi
   return harness.state.terminal(runId);
 }
 
+// The spec as journaled: stamped, so a resume and every reader know which engine
+// wrote this ledger whatever the deployment's setting is by then.
+export function stamped(options: AgentOptions): RunSpec {
+  return { ...options.spec, sections: { ...options.spec.sections, engine: "plugin", plugin: options.plugin.id } };
+}
+
 async function open(harness: Harness<Kinds>, options: AgentOptions): Promise<void> {
-  // Stamped onto the journaled spec, so a resume and every reader know which engine
-  // wrote this ledger whatever the deployment's setting is by then.
-  const spec: RunSpec = { ...options.spec, sections: { ...options.spec.sections, engine: "plugin", plugin: options.plugin.id } };
+  const spec = stamped(options);
+  if (options.hooks?.open !== undefined) {
+    const base: RunPayload = {
+      run_kind: options.run_kind,
+      spec,
+      budgets: harness.budget.limits,
+      seed: options.run_id,
+      tenant_id: null,
+      started_by: options.started_by ?? "worker",
+    };
+    await options.hooks.open({ harness, options }, base);
+    return;
+  }
   const unbound = unboundNeeds(options.plugin, options.spec.tools).map((capability) =>
     event(options, "unbound", { capability, reason: `no tool in this deployment answers ${capability}` }),
   );
@@ -763,7 +846,23 @@ async function open(harness: Harness<Kinds>, options: AgentOptions): Promise<voi
   ]);
 }
 
-async function end(ctx: PluginContext, outcome: RunOutcome, reason: string, summary?: string | null): Promise<AgentReport> {
+// A run waiting on its own account: announced when it names a question, and
+// reported parked. The worker releases the lease and looks again later.
+async function wait(ctx: PluginContext, parked: Parked): Promise<AgentReport> {
+  const { options } = ctx;
+  if (parked.checkpoint_id !== undefined) {
+    await announceOpen(ctx.harness.state, options.run_id, options.run_kind, parked.checkpoint_id, options.announce ?? noAnnounce);
+  }
+  return report(ctx, "waiting_approval", parked.parked, parked.checkpoint_id === undefined ? null : { checkpoint_id: parked.checkpoint_id, tool: null, args: null });
+}
+
+async function end(
+  ctx: PluginContext,
+  outcome: RunOutcome,
+  reason: string,
+  summary?: string | null,
+  handoffs?: readonly TerminalHandoff[],
+): Promise<AgentReport> {
   // Something outside the run may have ended it while a call was in flight. Its
   // terminal stands; a second would give the run two endings.
   const ended = await terminalOf(ctx.harness, ctx.options.run_id);
@@ -771,7 +870,12 @@ async function end(ctx: PluginContext, outcome: RunOutcome, reason: string, summ
   // As every workflow does: a failure with nothing to deliver leaves the summary
   // unset, since its reason is already the error column.
   const deliver = summary === null ? undefined : (summary ?? (outcome === "failed" ? undefined : reason));
-  const payload: TerminalPayload = deliver === undefined ? { outcome, reason } : { outcome, reason, summary: deliver };
+  const payload: TerminalPayload = {
+    outcome,
+    reason,
+    ...(deliver === undefined ? {} : { summary: deliver }),
+    ...(handoffs === undefined ? {} : { handoffs: [...handoffs] }),
+  };
   await ctx.harness.state.append(ctx.options.run_id, [event(ctx.options, "terminal", payload)]);
   await ctx.options.hooks?.ended?.(ctx, payload);
   return report(ctx, outcome, reason, null);
