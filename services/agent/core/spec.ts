@@ -132,6 +132,9 @@ export interface RunSpec extends Config, Omit<Playbook, "directives"> {
   // The job's, not a file's: the playbook says what this kind of run does and
   // this says which one. Journalled with the spec, so a resume still knows.
   prompt: string;
+  // The playbook's per-role prose, as written: folded into an arch role's prompt, read
+  // here by a plugin's agent. Optional, as a ledger journaled before it has none.
+  directives?: Record<string, string>;
 }
 
 // Reserved directive key: prose every worker needs, such as what the data is.
@@ -680,6 +683,7 @@ export function assembleSpec(sources: SpecSources): RunSpec {
     phases: playbook.phases,
     narrative: playbook.narrative,
     prompt: sources.prompt ?? "",
+    ...(Object.keys(playbook.directives).length === 0 ? {} : { directives: playbook.directives }),
   };
 }
 

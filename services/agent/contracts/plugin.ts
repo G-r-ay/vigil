@@ -1,5 +1,8 @@
-// What a plugin is: what the agent is, what it may need, which playbooks it loads and
-// the shape it finishes in. No control flow: loop, ledger, recall and parking are the kernel's.
+// What a plugin is: what the agent is, what it may need, the playbooks it loads and the
+// shape it finishes in. Loop, ledger, recall and parking are the kernel's (core/agent.ts).
+
+// A plugin that needs code (its own record's tools, a gate before it starts, its own
+// ending) ships hooks beside the manifest: PluginHooks in core/agent.ts.
 
 export interface SkillSpec {
   // What the agent names when it loads one, and the one line it reads to choose.
@@ -10,17 +13,29 @@ export interface SkillSpec {
   body: string;
 }
 
-export interface ConclusionSpec {
-  // JSON schema for the answer the run ends on. Validated by the loop's emission.
+// A structured answer: validated against `schema` by the loop's emission.
+export interface StructuredConclusion {
   schema: Record<string, unknown>;
   // Which field is the one-paragraph summary a reader sees first.
   summary_field: string;
-  // Which field holds the step refs the answer rests on.
-  citations_field: string;
+  // Which field holds the result refs the answer rests on. Absent means the run
+  // cites nothing, and its results are not numbered.
+  citations_field?: string;
+}
+
+// The run ends on prose: whatever the agent said last, once it stopped calling tools.
+export interface ProseConclusion {
+  schema: null;
+}
+
+export type ConclusionSpec = StructuredConclusion | ProseConclusion;
+
+export function isStructured(conclusion: ConclusionSpec): conclusion is StructuredConclusion {
+  return conclusion.schema !== null;
 }
 
 // A second look: a `guarded` value in `field` stands only if the reviewer upholds it over
-// a cited real step, else the run ends on `fallback`. Some answers are costly to give wrongly.
+// a cited real result, else the run ends on `fallback`. Some answers are costly to give wrongly.
 export interface GuardSpec {
   field: string;
   guarded: string[];
@@ -40,6 +55,7 @@ export interface PluginManifest {
   skills: SkillSpec[];
   conclusion: ConclusionSpec;
   guard?: GuardSpec;
-  // Tool turns across the whole run, resumes included.
-  max_turns: number;
+  // Tool turns across the whole run, resumes included. Absent takes the
+  // deployment's runtime.max_turns.
+  max_turns?: number;
 }

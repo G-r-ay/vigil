@@ -33,7 +33,7 @@ export const RUN_EVENT_KINDS = [
   "terminal",
   // The kernel's own: a tool call and its result, the answer a run ends on and its
   // second look. Every plugin writes them, so one projection, replay and distil read all.
-  "step",
+  "call",
   "conclusion",
   "review",
 ] as const;
@@ -167,7 +167,7 @@ export interface TerminalHandoff {
 
 // One tool call, journaled the moment its result is in: what a resume rebuilds the
 // transcript from and what a reader cites. ref is the id the model was shown.
-export interface StepPayload {
+export interface CallPayload {
   ref: string;
   // The model turn that asked for it, counted from 1 across resumes.
   turn: number;
@@ -181,6 +181,9 @@ export interface StepPayload {
   // What the model said before asking, on the first call of its turn only.
   thought?: string;
   duration_ms?: number;
+  // The role that made the call, when it was not the run's one agent: a step a
+  // plugin ran under its own prompt and grants.
+  role?: string;
 }
 
 // The answer the run ends on, in the shape its plugin declared.
@@ -222,7 +225,7 @@ export interface RunEventPayloads {
   patch: PatchPayload;
   resumed: ResumedPayload;
   terminal: TerminalPayload;
-  step: StepPayload;
+  call: CallPayload;
   conclusion: ConclusionPayload;
   review: ReviewPayload;
 }
