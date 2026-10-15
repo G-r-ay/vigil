@@ -621,6 +621,49 @@ services:
     networks:
       - deeptempo-network
 
+  # MCP runner (#2303): starts catalog MCP servers, each under its own uid, and
+  # serves them over MCP streamable HTTP on :6991. Nothing talks to it yet, so it
+  # sits behind a profile; `docker compose up mcp-runner` starts it by name.
+  # Holds no app secret, no ~/.vigil and no POSTGRES_*, and is on mcp-network
+  # only, so it cannot resolve postgres or redis.
+  mcp-runner:
+    profiles: [mcp-runner]
+    image: vigil-mcp-runner:local
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.mcp-runner
+      args:
+        PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
+    container_name: deeptempo-mcp-runner
+    environment:
+      # Its own bearer, not AGENT_INTERNAL_TOKEN. Empty means every route 503s.
+      MCP_RUNNER_TOKEN: ${MCP_RUNNER_TOKEN:-}
+      PYTHONUNBUFFERED: "1"
+      # Inspecting-proxy CA. Pass-through; bind-mount the PEM (see x-agent-env).
+      SSL_CERT_FILE:
+      REQUESTS_CA_BUNDLE:
+      NODE_EXTRA_CA_CERTS:
+    # Root with only what setpriv and the supervisor need: SETUID/SETGID to drop
+    # each child to its uid, KILL to stop a child running under another uid
+    # (stdio_client kills the process group). No CHOWN: the per-server HOME dirs
+    # are created and chowned at image build (Dockerfile.mcp-runner).
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID, KILL]
+    # A stop kills the server's process group; grandchildren (npx -> node) are
+    # re-parented to PID 1, which must reap them.
+    init: true
+    # uvicorn gives open MCP streams 5 s, then each server up to ~6 s to stop
+    # (stdin grace, SIGTERM, SIGKILL); Docker's default 10 s would cut that.
+    stop_grace_period: 20s
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      # The backend's detection rules, read-only (see the backend's mount).
+      - detection_rules:/home/vigil/security-detections:ro
+    restart: unless-stopped
+    networks:
+      - mcp-network
+
   # PgAdmin for database management (optional, can be commented out in production)
   pgadmin:
     image: dpage/pgadmin4:latest
@@ -952,5 +995,8 @@ volumes:
 
 networks:
   deeptempo-network:
+    driver: bridge
+  # MCP runners only; no database or cache on it.
+  mcp-network:
     driver: bridge
 
