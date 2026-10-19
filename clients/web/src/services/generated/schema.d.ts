@@ -10807,6 +10807,8 @@ export interface components {
              * @default
              */
             reason: string;
+            /** Severity */
+            severity?: string | null;
             /**
              * Summary
              * @default
