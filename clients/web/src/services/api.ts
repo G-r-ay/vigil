@@ -126,7 +126,6 @@ export const aiDecisionsApi = {
   }) => api.get('/ai/decisions', { params }),
   
   submitFeedback: (decisionId: string, data: {
-    human_reviewer: string
     human_decision: string
     feedback_comment?: string
     accuracy_grade?: number
