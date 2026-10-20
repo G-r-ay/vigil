@@ -2607,6 +2607,54 @@ describe('a case with several runs', () => {
     vi.mocked(workflowApi.getRun).mockImplementation((runId: string) => Promise.resolve({ data: { run_id: runId, ...(testState.runs[runId] as object) } } as never))
   })
 
+  it('says how many runs are unpriced beside the total, on the Checked door and header, never as $0', async () => {
+    threeRuns('case-unpriced')
+    testState.runs['run-inv'] = { status: 'completed', projection: { findings: [{ agent_id: 'triage', answer: 'benign login' }] } }
+    renderCase('case-unpriced')
+    const door = within(await screen.findByRole('region', { name: 'Audit doors' })).getByRole('button', { name: /^Checked/ })
+    await waitFor(() => expect(door).toHaveTextContent('$0.60 · 1 run unpriced'))
+    fireEvent.click(screen.getByRole('tab', { name: /Checked/ }))
+    const card = (await screen.findByText(/What Vigil checked/)).closest('section') as HTMLElement
+    expect(card.querySelector('h3')).toHaveTextContent('What Vigil checked · 2 queries · $0.60 · 1 run unpriced')
+  })
+
+  it('counts a run it could not read as unpriced, on the Checked door and header', async () => {
+    threeRuns('case-unread')
+    vi.mocked(workflowApi.getRun).mockImplementation((runId: string) =>
+      runId === 'run-inv' ? Promise.reject(new Error('down')) : Promise.resolve({ data: { run_id: runId, ...(testState.runs[runId] as object) } } as never),
+    )
+    renderCase('case-unread')
+    const door = within(await screen.findByRole('region', { name: 'Audit doors' })).getByRole('button', { name: /^Checked/ })
+    await waitFor(() => expect(door).toHaveTextContent('$0.60 · 1 run unpriced'))
+    fireEvent.click(screen.getByRole('tab', { name: /Checked/ }))
+    const card = (await screen.findByText(/What Vigil checked/)).closest('section') as HTMLElement
+    expect(card.querySelector('h3')).toHaveTextContent('What Vigil checked · 2 queries · $0.60 · 1 run unpriced')
+    vi.mocked(workflowApi.getRun).mockImplementation((runId: string) => Promise.resolve({ data: { run_id: runId, ...(testState.runs[runId] as object) } } as never))
+  })
+
+  it('still counts the unpriced runs when none is priced', async () => {
+    threeRuns('case-none-priced')
+    testState.runs['run-inv'] = { status: 'completed', projection: { findings: [{ agent_id: 'triage', answer: 'benign login' }] } }
+    testState.runs['run-rca'] = { status: 'completed', projection: { ...ROOT_CAUSE, cost_usd: null } }
+    testState.runs['run-hunt'] = { status: 'running', hunt: { ...HUNT, status: 'running', cost_usd: null } }
+    renderCase('case-none-priced')
+    const door = within(await screen.findByRole('region', { name: 'Audit doors' })).getByRole('button', { name: /^Checked/ })
+    await waitFor(() => expect(door).toHaveTextContent('3 runs unpriced'))
+    expect(door).not.toHaveTextContent('$')
+  })
+
+  it('adds no unpriced note when every run is priced', async () => {
+    threeRuns('case-all-priced')
+    renderCase('case-all-priced')
+    const door = within(await screen.findByRole('region', { name: 'Audit doors' })).getByRole('button', { name: /^Checked/ })
+    await waitFor(() => expect(door).toHaveTextContent('$0.70'))
+    expect(door).not.toHaveTextContent('unpriced')
+    fireEvent.click(screen.getByRole('tab', { name: /Checked/ }))
+    const card = (await screen.findByText(/What Vigil checked/)).closest('section') as HTMLElement
+    expect(card.querySelector('h3')).toHaveTextContent('What Vigil checked · 2 queries · $0.70')
+    expect(card.querySelector('h3')).not.toHaveTextContent('unpriced')
+  })
+
   it('offers "Show older" again across runs when the hunt\'s larger read fails, and reads again on the next press', async () => {
     twoRuns('case-older-fail-many')
     const many = Array.from({ length: 50 }, (_, i) => evidence(`n${i}`, `row ${i}`, new Date(Date.UTC(2026, 5, 15, 9, 0, 0) - i * 1000).toISOString()))
