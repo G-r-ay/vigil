@@ -10870,6 +10870,8 @@ export interface components {
         TerminalUpdate: {
             /** Cost Usd */
             cost_usd?: number | null;
+            /** Disposition */
+            disposition?: string | null;
             /** Handoffs */
             handoffs?: components["schemas"]["TerminalHandoff"][];
             /** Outcome */
