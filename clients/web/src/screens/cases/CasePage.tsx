@@ -20,6 +20,7 @@ import { EmptyState } from '../../shared/ui'
 import type { CaseRow } from '../../data/data'
 import Chat from '../../shell/Chat'
 import { EvidenceTrail } from './EvidenceTrail'
+import { BlindSpots, CheckedList, blindSpotsOf } from './RunChecks'
 import { EvidenceCard, IOCsCard } from './CaseSections'
 import { CaseSide } from './CaseSide'
 import { caseCitations, evidenceInNote } from './caseCitations'
@@ -105,24 +106,6 @@ function closedLine(closure: CaseClosureView | null): string {
 
 function clock(value: string | null | undefined): string {
   return utcClock(value) ?? '—'
-}
-
-const NOT_RECORDED = 'not recorded'
-
-/** A call's measured time; a figure the ledger lacks is not recorded, never a zero. */
-function latency(ms: number | undefined): string {
-  if (ms == null) return NOT_RECORDED
-  return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`
-}
-
-/** A turn's model spend, to the digit that shows it: a tenth of a cent is not $0.00. */
-function callCost(usd: number | null): string {
-  if (usd == null) return NOT_RECORDED
-  return fmtCost(usd, undefined, usd > 0 && usd < 0.01 ? 4 : 2)
-}
-
-function Figure({ text }: { text: string }) {
-  return <span className={text === NOT_RECORDED ? 'num unrecorded' : 'num'}>{text}</span>
 }
 
 function detailOf(error: unknown, fallback: string): string {
@@ -1562,13 +1545,13 @@ export function CasePage({
 
           {tab === 'Checked' && (
             <PerRun runs={runs} names={workflowNames} single={single}>
-              {(one, onePhase) => <Checked fold={one} phase={onePhase} />}
+              {(one, onePhase, run) => <Checked fold={one} phase={onePhase} runId={run?.ref.run_id ?? runId} />}
             </PerRun>
           )}
 
           {tab === 'Memory and blind spots' && (
             <PerRun runs={runs} names={workflowNames} single={single}>
-              {(one, onePhase) => <Memory fold={one} phase={onePhase} />}
+              {(one, onePhase, run) => <Memory fold={one} phase={onePhase} runId={run?.ref.run_id ?? runId} />}
             </PerRun>
           )}
 
@@ -1738,7 +1721,7 @@ function Explanations({ fold, phase, rootCauseRunId, cites, onCite }: {
 }
 
 /** What one run asked, at what cost, and where it had no source. */
-function Checked({ fold, phase }: { fold: RunFold | null; phase: Phase }) {
+function Checked({ fold, phase, runId }: { fold: RunFold | null; phase: Phase; runId: string | null }) {
   const gaps = visibilityGaps(fold)
   if (phase === 'loading') return <EmptyState loading compact icon="search" title="Loading the run…" />
   if (phase === 'error') return <EmptyState error compact icon="search" title="The run could not be read." />
@@ -1754,40 +1737,21 @@ function Checked({ fold, phase }: { fold: RunFold | null; phase: Phase }) {
         />
         {gaps.length > 0 && ` · ${gaps.length} with no source`}
       </h3>
-      <ul className="case-stack">
-        {fold.calls.map((call, i) => (
-          <li key={`${call.tool}-${i}`}>
-            <span className="clamp2" title={call.question}>{call.question || '—'}</span>
-            <span className="src">{call.tool || '—'}</span>
-            <span className="num">{`${call.result_length.toLocaleString()} ${call.result_length === 1 ? 'char' : 'chars'}`}</span>
-            <Figure text={callCost(call.cost_usd)} />
-            <Figure text={latency(call.duration_ms)} />
-          </li>
-        ))}
-        {gaps.map((gap) => (
-          <li key={gap.id} className="gap">
-            <span className="clamp2" title={gap.text}>{gap.text}</span>
-            <span className="src">No source</span>
-            <span className="num">—</span>
-            <span className="num">—</span>
-            <span className="num">—</span>
-          </li>
-        ))}
-      </ul>
+      <CheckedList runId={runId} calls={fold.calls} />
     </section>
   )
 }
 
 /** One run's recall and blind spots. */
-function Memory({ fold, phase }: { fold: RunFold | null; phase: Phase }) {
+function Memory({ fold, phase, runId }: { fold: RunFold | null; phase: Phase; runId: string | null }) {
   const gaps = visibilityGaps(fold)
   const recalled = recallEntityCalls(fold)
   if (phase === 'loading') return <EmptyState loading compact icon="brain" title="Loading the run…" />
   if (phase === 'error') return <EmptyState error compact icon="alert" title="The run could not be read" />
-  if (!fold?.recall && recalled.length === 0 && gaps.length === 0 && leftOpen(fold).length === 0) {
+  if (!fold?.recall && recalled.length === 0 && gaps.length === 0 && leftOpen(fold).length === 0 && blindSpotsOf(fold).groups.length === 0) {
     return <EmptyState compact icon="brain" title="No memory recorded" body="Recall is what the run journaled, not a fresh read." />
   }
-  return <MemoryCards fold={fold} recalled={recalled} gaps={gaps} />
+  return <MemoryCards fold={fold} recalled={recalled} gaps={gaps} runId={runId} />
 }
 
 const KIND_LABEL: Record<string, string> = { hunt: 'Hunt', case: 'Case', analyst: 'Analyst' }
@@ -1808,7 +1772,7 @@ function MemoryRow({ text, meta, tone, tag, action }: { text: string; meta?: str
 }
 
 /** Recalled and Blind spots. Withdraw and Record a blind spot wait on Written back, so they are shown disabled. */
-function MemoryCards({ fold, recalled, gaps }: { fold: RunFold | null; recalled: CallRow[]; gaps: { id: string; text: string }[] }) {
+function MemoryCards({ fold, recalled, gaps, runId }: { fold: RunFold | null; recalled: CallRow[]; gaps: { id: string; text: string }[]; runId: string | null }) {
   const recall = fold?.recall
   const opened = recall && !recall.unavailable ? recall : null
   const open = leftOpen(fold)
@@ -1853,7 +1817,7 @@ function MemoryCards({ fold, recalled, gaps }: { fold: RunFold | null; recalled:
         </div>
         {gaps.length === 0 && !recall?.gaps.length && open.length === 0 ? (
           <p className="muted">None recorded.</p>
-        ) : (
+        ) : !recall?.gaps.length && open.length === 0 ? null : (
           <div className="case-mem-rows">
             {recall?.gaps.map((gap, i) => (
               <MemoryRow
@@ -1864,8 +1828,15 @@ function MemoryCards({ fold, recalled, gaps }: { fold: RunFold | null; recalled:
                 meta={provenance(gap)}
               />
             ))}
-            {gaps.map((gap) => <MemoryRow key={gap.id} tone="poor" tag="Visibility" text={gap.text} />)}
             {open.map((q) => <MemoryRow key={q.question_id} tone="poor" tag="Open question" text={q.question} />)}
+          </div>
+        )}
+        {blindSpotsOf(fold).groups.length > 0 ? (
+          <BlindSpots fold={fold} runId={runId} />
+        ) : gaps.length > 0 && (
+          // A run whose calls do not say which failed: its gaps as it wrote them.
+          <div className="case-mem-rows">
+            {gaps.map((gap) => <MemoryRow key={gap.id} tone="poor" tag="Visibility" text={gap.text} />)}
           </div>
         )}
       </section>
