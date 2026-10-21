@@ -1,8 +1,9 @@
-// Model calls (spec §5.2). A move is one kernel turn: the model searches up to the move's cap through the evidence
-// tool, then emits the move's submission against its schema. The kernel journals every search as a `call` event
+// Model calls (spec §5.2). A move is one kernel turn: the model may search up to the move's cap
+// (maxToolCallsPerTurn, counted in searches, not rounds) through the evidence tool, which refuses any search past it,
+// then emits the move's submission against its schema. The kernel journals every search as a `call` event
 // with a ref, bills the model, delimits the results and resumes; what is left here is the move's own check, once.
 import { runSubturn, type PluginContext, type PluginHooks, type Subturn, type AgentKinds, type AgentOptions } from "../../../../core/agent.js";
-import { schemaErrors, schemaIssues } from "../../../../core/stream.js";
+import { schemaErrors, schemaIssues, SUBMIT_TOOL } from "../../../../core/stream.js";
 import type { CallPayload, RunKind } from "../../../../contracts/events.js";
 import { defineTool, type RegisteredTool, type ToolResult } from "../../../../contracts/tool.js";
 import type { Harness, Outcome } from "../../../../core/loop.js";
@@ -29,6 +30,7 @@ export interface TurnRequest {
   beforeMs?: number; // look-back of the default window
   maxSearches?: number; // this move's search cap, below cfg.maxToolCallsPerTurn (strengthen needs few)
   minCount?: number; // mapping mode for the search tool
+  maxPerBatch?: number; // searches run per model response; the rest wait for the results
   trace: TurnTrace;
 }
 
@@ -239,8 +241,10 @@ export class KernelTurns {
   // The tools hooks grant: set once the run has a source to search.
   local: readonly RegisteredTool[] = [];
   private ctx: PluginContext;
+  // The model round the subturn in hand is on: a search can tell which response asked for it.
+  round: () => number = () => 0;
   constructor(harness: Harness<AgentKinds>, run: { run_id: string; run_kind: RunKind; spec: RunSpec; plugin: PluginManifest; tools: readonly RegisteredTool[]; started_by?: string; signal?: AbortSignal }) {
-    const hooks: PluginHooks = { tools: () => this.local };
+    const hooks: PluginHooks = { tools: (c) => { this.round = c.turn; return this.local; } };
     const options: AgentOptions = { ...run, hooks };
     // No outer model loop here: runSubturn hands hooks its own turn counter.
     this.ctx = { harness, options, turn: () => 0 };
@@ -265,6 +269,9 @@ export class KernelModelClient implements ModelClient {
   private cur: TurnRequest | undefined;
   // What the evidence tool answered this move, in order: the raw output the kernel's own result text is cut from.
   private answered: { key: string; ok: boolean; output: string }[] = [];
+  // The searches this move has run, and how many of them the model's current response asked for.
+  private searched = 0;
+  private batch = { round: -1, n: 0 };
 
   constructor(private d: ClientDeps & { tools: Registry }, private turns: KernelTurns) {
     this.system = [SYSTEM_PROMPT, d.survey];
@@ -286,15 +293,23 @@ export class KernelModelClient implements ModelClient {
         execute: async (args): Promise<ToolResult> => {
           const req = this.cur;
           if (req === undefined) return { ok: false, failure: { kind: "refused", detail: "no move is running" } };
+          const cap = req.maxSearches ?? cfg.maxToolCallsPerTurn;
+          if (this.searched >= cap) return { ok: false, failure: { kind: "refused", detail: `Not run: no searches left this turn. Submit now with ${SUBMIT_TOOL}.` } };
+          const round = this.turns.round();
+          if (this.batch.round !== round) this.batch = { round, n: 0 };
+          if (req.maxPerBatch && this.batch.n >= req.maxPerBatch) return { ok: false, failure: { kind: "refused", detail: `Not run: at most ${req.maxPerBatch} searches per batch. Read these results first, then send the next batch (fix any search that returned nothing).` } };
+          this.batch.n++;
+          this.searched++;
+          const last = this.searched >= cap ? `\nNo searches left this turn. Submit now with ${SUBMIT_TOOL}.` : "";
           const r = await this.d.tools.run(t.name, args, { allowedDomains: req.allowedDomains, allDomains: domains, timeoutMs: cfg.toolTimeoutMs, range, focusTime: req.focusTime, beforeMs: req.beforeMs, minCount: req.minCount });
           this.answered.push({ key: JSON.stringify(args), ok: r.ok, output: r.ok ? r.data ?? "" : r.error ?? "" });
           if (!r.ok) {
             const detail = r.error ?? "";
-            return { ok: false, failure: /^timed out/.test(detail) ? { kind: "timeout", timeoutMs: cfg.toolTimeoutMs } : /^bad input/.test(detail) ? { kind: "invalid_args", detail } : { kind: "backend_error", detail } };
+            return { ok: false, failure: /^timed out/.test(detail) ? { kind: "timeout", timeoutMs: cfg.toolTimeoutMs } : /^bad input/.test(detail) ? { kind: "invalid_args", detail: detail + last } : { kind: "backend_error", detail: detail + last } };
           }
           const max = cfg.rawOutputMaxChars;
           const data = r.data ?? "";
-          return { ok: true, rows: [{ output: data.length > max ? `${data.slice(0, max)}\n…[cut at ${max} chars: aggregate or narrow the search]` : data }], rowCount: 1, capped: false, sourceSystem: t.name };
+          return { ok: true, rows: [{ output: (data.length > max ? `${data.slice(0, max)}\n…[cut at ${max} chars: aggregate or narrow the search]` : data) + last }], rowCount: 1, capped: false, sourceSystem: t.name };
         },
       },
       { maxRows: 1, timeoutMs: cfg.toolTimeoutMs + 60_000 },
@@ -308,6 +323,8 @@ export class KernelModelClient implements ModelClient {
     const before = (await this.turns.calls()).length;
     this.cur = req;
     this.answered = [];
+    this.searched = 0;
+    this.batch = { round: -1, n: 0 };
     let outcome: Outcome<unknown> | undefined;
     let failure: unknown;
     try {
@@ -317,7 +334,9 @@ export class KernelModelClient implements ModelClient {
         task: req.userContent,
         schema: wire(req.submitTool),
         tools: searches > 0 ? this.turns.local.map((t) => t.id) : [],
-        max_turns: searches,
+        // The cap is on searches, which the evidence tool counts and refuses past it. Rounds are only bounded: one
+        // per search at most, and the answer's.
+        max_turns: searches + 1,
         cite: true,
       });
     } catch (error) {
@@ -360,8 +379,9 @@ export class KernelModelClient implements ModelClient {
     let at = 0;
     for (const call of (await this.turns.calls()).slice(before)) {
       const input = argsOf(call.arguments);
-      // The kernel journals a search it refused before the tool ran too, which the tool never answered.
-      const mine = this.answered[at]?.key === JSON.stringify(input) ? this.answered[at++] : undefined;
+      // The kernel journals a search refused before the tool ran too (by the kernel or past the cap), which the tool
+      // never answered.
+      const mine = !neverRan(call) && this.answered[at]?.key === JSON.stringify(input) ? this.answered[at++] : undefined;
       const text = mine?.output ?? call.result;
       this.d.tools.note(call.ref, input, mine?.ok ? mine.output : "", !neverRan(call));
       req.trace.write("query", { toolCallId: call.ref, tool: call.tool, input });

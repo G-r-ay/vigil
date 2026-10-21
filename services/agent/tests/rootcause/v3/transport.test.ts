@@ -12,6 +12,9 @@ import { MemoryTrace } from "../../../plugins/rootcause/v3/trace.js";
 import { toolsFrom } from "../../../tools/remote.js";
 import { SUBMIT_TOOL } from "../../../core/stream.js";
 import { harnessOf, modelOf, specOf, splunk } from "../../support/v3-run.js";
+import { strengthen } from "../../../plugins/rootcause/v3/handlers/strengthen.js";
+import { scope, SCOPE_BATCH, SCOPE_SEARCHES } from "../../../plugins/rootcause/v3/scope.js";
+import type { LoopContext } from "../../../plugins/rootcause/v3/types.js";
 import { apply, node, seeded } from "./helpers.js";
 
 const cfg = { ...defaultConfig };
@@ -83,17 +86,19 @@ describe("a move as a kernel turn", () => {
     expect(t.trace.chronological().some((e) => e.type === "rejected-submission" && JSON.stringify(e.payload).includes("r9"))).toBe(true);
   });
 
-  // A move that searches to its cap made one call per round and then one more for the emission.
-  it("takes a move's answer on the round its search cap makes the last, with no further call", async () => {
+  // A move that searches to its cap one search a round gets every search, then answers on the forced round.
+  it("takes a move's answer on the round after its last search, with no further call", async () => {
     const t = setup(
       (request) => (request.force === SUBMIT_TOOL ? { emit: { candidates: [cand("curl wrote /tmp/x", ["r1"])], reasoning: "r" } } : { calls: [{ tool: "splunk_query", args: SEARCH }] }),
       { [SEARCH.spl]: "3 events matched\ncurl wrote /tmp/x" },
     );
     const out = await t.client.runTurn(t.request({ maxSearches: 2 }));
 
-    expect(t.provider.requests.map((r) => r.force)).toEqual([undefined, SUBMIT_TOOL]);
+    expect(t.provider.requests.map((r) => r.force)).toEqual([undefined, undefined, SUBMIT_TOOL]);
     expect(t.provider.requests.some((r) => r.emit !== undefined)).toBe(false);
-    expect(out.toolCalls).toMatchObject([{ id: "r1", ok: true }]);
+    expect(out.toolCalls).toMatchObject([{ id: "r1", ok: true }, { id: "r2", ok: true }]);
+    expect(out.toolCalls[1]!.text).toBe("3 events matched\ncurl wrote /tmp/x");
+    expect(t.provider.requests[2]!.messages.filter((m) => m.role === "tool").at(-1)!.content).toContain(`No searches left this turn. Submit now with ${SUBMIT_TOOL}.`);
     expect((out.submission as { candidates: { label: string }[] }).candidates.map((c) => c.label)).toEqual(["curl wrote /tmp/x"]);
   });
 
@@ -249,8 +254,8 @@ describe("a move as a kernel turn", () => {
     });
   });
 
-  it("tells the model the cap is rounds of searches, which may hold several", () => {
-    expect(constraints(cfg, range, ["edr"], ["edr"])).toContain(`search rounds this turn: at most ${cfg.maxToolCallsPerTurn} (a round may hold several searches)`);
+  it("tells the model the cap is on searches", () => {
+    expect(constraints(cfg, range, ["edr"], ["edr"])).toContain(`searches this turn: at most ${cfg.maxToolCallsPerTurn}\n`);
   });
 
   it("drops a citation of a refused call, live and as a resume rebuilds it", () => {
@@ -293,6 +298,74 @@ describe("a move as a kernel turn", () => {
     const spec = specOf({ budgets: { max_calls: 0, max_cost_usd: 10, max_wall_ms: 600_000, max_park_ms: 60_000 } });
     const t = setup(() => ({}), {}, spec);
     await expect(t.client.runTurn(t.request())).rejects.toBeInstanceOf(Refused);
+  });
+});
+
+describe("a turn's search cap counts searches, not rounds", () => {
+  const search = (i: number) => ({ purpose: `search ${i}`, spl: `index=lab sourcetype=edr q=${i}` });
+  const table = (n: number) => Object.fromEntries(Array.from({ length: n }, (_, i) => [search(i + 1).spl, `${i + 1} events matched`]));
+  const refusedCalls = (calls: CallPayload[]) => calls.filter((c) => c.failure === "refused");
+  const NO_MORE = `Not run: no searches left this turn. Submit now with ${SUBMIT_TOOL}.`;
+
+  it("runs the first 3 of 5 searches one response asks for under a cap of 3 and refuses the other 2, uncitable", async () => {
+    const t = setup(
+      (request) => (request.emit !== undefined ? { emit: { candidates: [], reasoning: "r" } } : request.messages.some((m) => m.role === "tool") ? { content: "done" } : { calls: [1, 2, 3, 4, 5].map((i) => ({ tool: "splunk_query", args: search(i) })) }),
+      table(5),
+    );
+    const out = await t.client.runTurn(t.request({ maxSearches: 3 }));
+
+    const calls = await t.calls();
+    expect(calls.map((c) => [c.ref, c.ok])).toEqual([["r1", true], ["r2", true], ["r3", true], ["r4", false], ["r5", false]]);
+    expect(refusedCalls(calls).map((c) => c.ref)).toEqual(["r4", "r5"]);
+    for (const c of refusedCalls(calls)) expect(c.result).toContain(NO_MORE);
+    expect(t.tools.inputOf("r3")).toEqual(search(3));
+    expect(["r1", "r2", "r3", "r4", "r5"].map((id) => issued(t.tools, id))).toEqual([true, true, true, false, false]);
+    expect(out.toolCalls.map((c) => c.text)).toEqual(["1 events matched", "2 events matched", "3 events matched", expect.stringContaining(NO_MORE), expect.stringContaining(NO_MORE)]);
+    // The search that spent the cap says so, as the refusals do.
+    const shown = t.provider.requests[1]!.messages.filter((m) => m.role === "tool").map((m) => m.content);
+    expect(shown[2]).toContain(JSON.stringify(`3 events matched\nNo searches left this turn. Submit now with ${SUBMIT_TOOL}.`));
+    expect(shown[1]).not.toContain("No searches left");
+  });
+
+  it("caps strengthen at 3 searches, however the model spreads them over rounds", async () => {
+    const t = setup(
+      (request, n) => (request.emit !== undefined || request.force === SUBMIT_TOOL ? { emit: { evidence: [], reasoning: "r" } } : n === 1 ? { calls: [1, 2].map((i) => ({ tool: "splunk_query", args: search(i) })) } : n === 2 ? { calls: [3, 4, 5].map((i) => ({ tool: "splunk_query", args: search(i) })) } : { content: "done" }),
+      table(5),
+    );
+    const g = seeded();
+    const symptom = Object.keys(g.nodes)[0]!;
+    const ctx = { runId: "r1", turn: 1, cfg, model: t.client, tools: t.tools, trace: t.trace.forTurn(1, "strengthen", symptom), domains: ["edr"], range, index: "lab", signal: new AbortController().signal } as unknown as LoopContext;
+    await strengthen({ move: "strengthen", targetId: symptom, why: "check it" } as never, g, ctx);
+
+    expect(cfg.strengthenSearches).toBe(3);
+    expect(t.provider.requests[0]!.messages.map((m) => m.content).join("\n")).toContain("searches this turn: at most 3\n");
+    const calls = await t.calls();
+    expect(calls.map((c) => [c.ref, c.ok])).toEqual([["r1", true], ["r2", true], ["r3", true], ["r4", false], ["r5", false]]);
+    expect(refusedCalls(calls).map((c) => c.ref)).toEqual(["r4", "r5"]);
+  });
+
+  it("runs scope's 14 searches in batches of 7: the rest of a response waits for the results", async () => {
+    const BATCH = `Not run: at most ${SCOPE_BATCH} searches per batch. Read these results first, then send the next batch (fix any search that returned nothing).`;
+    const t = setup(
+      (request, n) => (request.emit !== undefined || request.force === SUBMIT_TOOL ? { emit: { map: `**Systems**\n- ws-7 seen 12 times\n${"- host seen 10 times\n".repeat(12)}`, reasoning: "r" } }
+        : n === 1 ? { calls: Array.from({ length: 9 }, (_, i) => ({ tool: "splunk_query", args: search(i + 1) })) }
+        : n === 2 ? { calls: Array.from({ length: 8 }, (_, i) => ({ tool: "splunk_query", args: search(i + 8) })) }
+        : n === 3 ? { calls: [{ tool: "splunk_query", args: search(16) }] }
+        : { content: "done" }),
+      table(16),
+    );
+    const deps = { model: t.client, tools: t.tools, trace: t.trace, domains: ["edr"], sizes: { edr: 10 } } as never;
+    const map = await scope(deps, cfg, range);
+
+    expect([SCOPE_SEARCHES, SCOPE_BATCH]).toEqual([14, 7]);
+    expect(map).toContain("ws-7 seen 12 times");
+    const calls = await t.calls();
+    const ran = calls.filter((c) => c.failure !== "refused").map((c) => JSON.parse(c.arguments).purpose);
+    expect(ran).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14].map((i) => `search ${i}`));
+    // First response: 7 run, 2 wait. Second: 7 run (the cap), the 8th is past the cap. Third: past the cap.
+    expect(refusedCalls(calls).map((c) => [JSON.parse(c.arguments).purpose, c.result.includes(BATCH), c.result.includes(NO_MORE)])).toEqual([
+      ["search 8", true, false], ["search 9", true, false], ["search 15", false, true], ["search 16", false, true],
+    ]);
   });
 });
 
