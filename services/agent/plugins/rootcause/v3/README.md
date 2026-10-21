@@ -15,8 +15,10 @@ How a run goes (`engine.ts`):
 - Every model call is a kernel turn: `runSubturn` through `model/client.ts`, the one
   place the loop touches the kernel. A move's role is the move, its system prompt the
   loop's prompt plus the survey, the environment map and the rare sweep, its task the
-  move's prompt, its schema the move's submit schema, and its `max_turns` the move's search
-  cap. Framing the brief (`frame.ts`) is a turn with the frame schema and no tools. The
+  move's prompt and its schema the move's submit schema. The move's search cap counts
+  searches, not rounds: the evidence tool refuses any search past it (and, for scope, any
+  past the batch of 7 a response may hold), and `max_turns` only bounds the rounds.
+  Framing the brief (`frame.ts`) is a turn with the frame schema and no tools. The
   kernel bills each call to the run's pool, journals `spend`, `frame` and `call` events,
   and delimits search results; v3 keeps none of that of its own.
 - The model searches through one evidence tool (`tools/`), granted as a local tool whose
