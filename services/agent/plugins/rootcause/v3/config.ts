@@ -14,6 +14,13 @@ export interface AgentConfig {
   lookbackDays: number;
   stitchWindowMinutes: number;
   linkNeedsSharedValue: boolean;
+  // The loop's behaviour switches, each on as the reference run had it; off is the reference loop's other path.
+  roleArnHandOff: boolean; // role ARNs join different accounts only as a hand-off
+  inheritLegit: boolean; // a step causing its own account's legitimate step is legitimate
+  lead: boolean; // the model names each next move (lead.ts); off: the frontier's priority ladder picks every move
+  loose: boolean; // record freely: findings that fail a check are tagged (unverified / inferred link), not refused; the report is strict
+  theorizeEvery: number; // lead off: turns of other moves between rounds of stories, once a round's tests are done
+  branchEvery: number; // lead off: once the stories run, a branch from a chain event at least this often
   wrapUpAt: number; // share of maxUsd left when the model is told to wrap up
   concludeAt: number; // share left when the run stops for the closing conclude turn
   thresholds: { confirm: number; settled: number; ruleOut: number; expandMin: number; altPathMin: number; competitorMax: number };
@@ -37,6 +44,12 @@ export const defaultConfig: AgentConfig = {
   lookbackDays: 14,
   stitchWindowMinutes: 30,
   linkNeedsSharedValue: true, // a new cause/effect link needs a value both events carry
+  roleArnHandOff: true,
+  inheritLegit: true,
+  lead: true,
+  loose: true,
+  theorizeEvery: 4,
+  branchEvery: 6,
   wrapUpAt: 0.10,
   concludeAt: 0.03, // at least $0.50: one conclude turn costs about that
   thresholds: { confirm: 0.85, settled: 0.95, ruleOut: 0.1, expandMin: 0.6, altPathMin: 0.3, competitorMax: 0.15 },

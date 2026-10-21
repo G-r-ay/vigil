@@ -1,5 +1,6 @@
-// The loop (spec §8): the model names each move, router dispatches, the handler returns a patch, the graph applies
-// and rescores it, the trace records it. Handed to the caller after every turn so a run can resume.
+// The loop (spec §8): the model names each move (with cfg.lead off, the frontier's ladder picks it), router
+// dispatches, the handler returns a patch, the graph applies and rescores it, the trace records it. Handed to the
+// caller after every turn so a run can resume.
 import type { AgentConfig } from "./config.js";
 import { applyPatch, bestPathFromSymptom, createGraph, getParents, emptyPatch, type Graph, type GraphPatch } from "./graph.js";
 import { renderReport } from "./report.js";
@@ -8,7 +9,7 @@ import { rareSweep } from "./rare.js";
 import { route } from "./router.js";
 import { fallback, options, optionsText, resolveNext, type LeadState, type NextIn } from "./lead.js";
 import type { ModelClient } from "./model/client.js";
-import type { FrontierDecision } from "./frontier.js";
+import { selectFrontier, type FrontierDecision } from "./frontier.js";
 import type { Alert, Deps, ExitReason, LoopContext, RunResult, Spent } from "./types.js";
 
 // onTurn gets the graph after the rare sweep (turn 0) and after every turn: what a resume starts from.
@@ -63,6 +64,8 @@ export async function run(alert: Alert, cfg: AgentConfig, deps: Deps, o: RunOpts
   let exit: ExitReason | null = null;
   // The model names every move: each submission's `next`, checked against the graph, is the next turn's move.
   // With none (turn 1, a resume, a missing or refused `next`) a choose turn asks for it.
+  // Lead off: the frontier picks every move, and the prompts carry no list of moves to choose from.
+  const lead = cfg.lead !== false;
   const st: LeadState = {};
   let pending: FrontierDecision | undefined;
   // Every prompt says how much budget is left; under wrapUpAt the model is told to wrap up, and under concludeAt
@@ -84,8 +87,8 @@ export async function run(alert: Alert, cfg: AgentConfig, deps: Deps, o: RunOpts
     runTurn: async (req) => {
       if (req.move === "scope" || req.move === "conclude") return deps.model.runTurn(req);
       const choosing = req.move === "choose";
-      const chose = curSource ? `\n\n<lead_note>You chose to look in ${curSource} first for this move.</lead_note>` : "";
-      const r = await deps.model.runTurn({ ...req, userContent: `${req.userContent}${chose}\n\n${budgetText()}\n\n${optionsText(graph, cfg, st, cur, choosing)}` });
+      const chose = lead && curSource ? `\n\n<lead_note>You chose to look in ${curSource} first for this move.</lead_note>` : "";
+      const r = await deps.model.runTurn({ ...req, userContent: `${req.userContent}${chose}\n\n${budgetText()}${lead ? `\n\n${optionsText(graph, cfg, st, cur, choosing)}` : ""}` });
       // A choose answer is the choice itself; any other submission carries it under `next`.
       const nx = choosing ? (r.submission as NextIn | null) : (r.submission as { next?: NextIn } | null)?.next;
       if (nx) st.next = nx;
@@ -105,11 +108,13 @@ export async function run(alert: Alert, cfg: AgentConfig, deps: Deps, o: RunOpts
     exit = checkExit(graph, cfg, deps.budget);
     if (exit === "budget-exhausted" && chainSolid(graph, cfg)) exit = "root-cause-found";
     // Nothing open on the graph ends the run; otherwise the model's last choice runs, or it is asked to choose.
-    if (!exit && !pending && !Object.keys(options(graph, cfg)).length) exit = chainSolid(graph, cfg) ? "root-cause-found" : "inconclusive";
+    if (lead && !exit && !pending && !Object.keys(options(graph, cfg)).length) exit = chainSolid(graph, cfg) ? "root-cause-found" : "inconclusive";
     const symptomId = Object.values(graph.nodes).find((n) => n.isSymptom)!.id;
-    let decision: FrontierDecision | null = exit ? null : pending ? { ...pending, turn } : { move: "choose", targetId: symptomId, turn, reason: st.refused ?? st.failed ?? "no next move named" };
+    let decision: FrontierDecision | null = exit ? null : !lead ? selectFrontier(graph, cfg, turn, deps.tools.coverage) : pending ? { ...pending, turn } : { move: "choose", targetId: symptomId, turn, reason: st.refused ?? st.failed ?? "no next move named" };
     pending = undefined;
     st.next = undefined;
+    // Lead off: the frontier with nothing left ends the run.
+    if (!exit && !decision) exit = chainSolid(graph, cfg) ? "root-cause-found" : "inconclusive";
     if (!exit && cfg.concludeAt > 0 && lowOn(cfg.concludeAt)) exit = chainSolid(graph, cfg) ? "root-cause-found" : "budget-exhausted";
     if (exit) {
       if (concluding || graph.conclusion || cfg.concludeAt <= 0) break;
@@ -122,7 +127,7 @@ export async function run(alert: Alert, cfg: AgentConfig, deps: Deps, o: RunOpts
 
     const tt = deps.trace.forTurn(turn, decision.move, decision.targetId);
     tt.write("decision", decision);
-    log(`turn ${turn} · ${decision.move} ${decision.targetId} · $${deps.budget.usd.toFixed(2)} · ${decision.reason}`);
+    log(`turn ${turn} · ${decision.priority === undefined ? "" : `P${decision.priority} `}${decision.move} ${decision.targetId} · $${deps.budget.usd.toFixed(2)} · ${decision.reason}`);
     const ctx: LoopContext = { runId: graph.runId, turn, cfg, model, tools: deps.tools, trace: tt, budget: deps.budget, domains: deps.domains, sizes: deps.sizes, range: o.range, index: o.index, signal: o.signal ?? new AbortController().signal };
 
     const patch: GraphPatch = await route(decision, graph, ctx);
@@ -135,6 +140,7 @@ export async function run(alert: Alert, cfg: AgentConfig, deps: Deps, o: RunOpts
     for (const m of result.resolvedMarkers) log(`  boundary ${m} resolved`);
     for (const c of result.changes) log(`  ${c.id} ${c.from.toFixed(2)} -> ${c.to.toFixed(2)} ${c.status}`);
     tt.relate([...new Set([...result.touched, ...Object.values(result.idMap)])]);
+    if (!lead) { await o.onTurn?.(graph, turn); continue; }
     const r = resolveNext(st.next, graph, cfg, turn, created, { index: o.index, range: o.range });
     if (r.probe) {
       const probe = { ...emptyPatch(), addProbe: r.probe };

@@ -107,7 +107,10 @@ describe("runRootCauseV3", () => {
     const events = await state.read("r1");
     expect(await state.terminal("r1")).toMatchObject({ outcome: "aborted", summary: expect.any(String) });
     expect(kinds(events)).toEqual(expect.arrayContaining(["rootcause_setup", "rootcause_turn", "rootcause_exit", "directive", "terminal"]));
-    const exit = events.find((e) => e.kind === "rootcause_exit")!.payload as { exit: unknown; report: string };
+    // The run's settings are on its ledger, the loop's switches with them.
+    const setup = events.find((e) => e.kind === "rootcause_setup")!.payload as { cfg: object };
+    expect(setup.cfg).toMatchObject({ maxUsd: spec.budgets.max_cost_usd, loose: true, lead: true, roleArnHandOff: true, inheritLegit: true, theorizeEvery: 4, branchEvery: 6 });
+    const exit =events.find((e) => e.kind === "rootcause_exit")!.payload as { exit: unknown; report: string };
     expect(exit.exit).toBeNull();
     expect(exit.report).toContain("# RCA report");
 

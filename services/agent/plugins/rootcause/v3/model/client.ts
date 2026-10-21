@@ -104,7 +104,8 @@ const takeoverProblem = (c: { label: string; takeover?: { summary: string; toolC
 const STORY_TAKEOVER = /\b(insider|rogue (?:employee|admin|developer|user))\b/i;
 const TAKEOVER_TEST = /\b(sign-?in|login|logon|token|key|password|mfa|credential|session (?:creat|issu)|assume-?role|federat)/i;
 export const UNSEEN = /\b(outside (?:the )?(?:captured |available |collected )?(?:telemetry|logs?|logging|data|visibility)|(?:not|never|un) ?(?:captured|logged|recorded|observed|visible) (?:in|by) (?:the )?(?:telemetry|logs?|data|any source)|unlogged|unobserved|out[- ]of[- ]band (?:mint|issu)\w*|no visible (?:mint|issu|origin|source)\w*)\b/i;
-export interface CheckCtx { inputOf?: InputOf; range?: [string, string] }
+// loose: unless false, a check that fails on an accusing label or a baseline tags the item unverified instead of refusing it.
+export interface CheckCtx { inputOf?: InputOf; range?: [string, string]; loose?: boolean }
 type Path = (string | number)[];
 // drop: the paths of the list items a failure rests on (["effects", "0", "artifacts", "1"]), so a last salvage can keep the rest of the submission.
 export type CheckResult = { success: true; data: unknown } | { success: false; msg: string; drop: Path[] };
@@ -141,15 +142,24 @@ export function check(name: SubmitName, input: unknown, calls: number | Citable,
     if (bad.length) return { success: false, drop: [], msg: `${bad.map((t) => t.id).join(", ")}: the story says an account was taken over or that a person is the attacker, but no prediction looks for the record of that takeover. Add a prediction that would find it (the sign-in from a new address or device, the token, key or password created, the credential read), or tell the story without naming whose account was taken.` };
   }
   const accusing = items.filter(({ c }) => ACCUSE.test(c.label) && !(c.baseline?.unusual && c.baseline.toolCallIds.length));
-  // An accusing label without a baseline, or a baseline that fails the checks, is kept and tagged unverified
-  // (the report never accuses from it; a failed baseline proves nothing either way, so it is dropped).
-  for (const { c } of accusing) (c as Cand & { unverified?: boolean }).unverified = true;
-  for (const { c } of items) if (baselineProblem(c as never, cx.inputOf, cx.range)) { (c as Cand & { unverified?: boolean }).unverified = true; delete c.baseline; }
+  // Loose: an accusing label without a baseline, or a baseline that fails the checks, is kept and tagged
+  // unverified (the report never accuses from it; a failed baseline proves nothing either way, so it is dropped).
+  const lenient = cx.loose !== false;
+  if (lenient) {
+    for (const { c } of accusing) (c as Cand & { unverified?: boolean }).unverified = true;
+    for (const { c } of items) if (baselineProblem(c as never, cx.inputOf, cx.range)) { (c as Cand & { unverified?: boolean }).unverified = true; delete c.baseline; }
+  }
+  if (accusing.length && !lenient) return { success: false, drop: accusing.map((x) => x.at), msg: `${accusing.map(({ c }) => `"${c.label.slice(0, 80)}"`).join("; ")}: the label calls this activity malicious or the attacker's but there is no baseline showing it is not that account's or address's normal work. Add a baseline (a cited search of the same account/address over the whole range, unusual: true), or relabel it neutrally (what happened, by which account, from which address).` };
   // An event is a record the searches returned. "Happened outside the logs" is not one: it ends the chain on an
   // absence and stops the search for the real step ("credential minted outside captured
   // telemetry" was once confirmed and became the chain top; the token theft upstream was never looked for).
   const unseen = items.filter(({ c }) => UNSEEN.test(c.label));
   if (unseen.length) return { success: false, drop: unseen.map((x) => x.at), msg: `${unseen.map(({ c }) => `"${c.label.slice(0, 80)}"`).join("; ")}: an event must be a record your searches returned, not something inferred from records that are missing. Leave it out and report the records that do exist: earlier records naming the same credential, key, token, session, file, host or pod (where it was read, written, copied or used first). If nothing in the data shows the cause, report no candidate for it (or a boundary to the source that would record it).` };
+  // Strict: every baseline, accusing or clearing, must be the event's own account/host over the whole range.
+  if (!lenient) {
+    const weak = items.map((x) => ({ ...x, why: baselineProblem(x.c as never, cx.inputOf, cx.range) })).filter((x) => x.why);
+    if (weak.length) return { success: false, drop: weak.map((x) => x.at), msg: weak.map((x) => x.why).join(" ") };
+  }
   return { success: true, data: v.data };
 }
 
@@ -340,7 +350,7 @@ export class KernelModelClient implements ModelClient {
     if (failed !== undefined) req.trace.write("provider-failure", { reason: failed });
     else if (kept === undefined || kept === null || typeof kept !== "object") req.trace.write("rejected-submission", { reason: outcome!.reason });
     else {
-      const cx: CheckCtx = { inputOf: tools.inputOf?.bind(tools), range: this.d.range };
+      const cx: CheckCtx = { inputOf: tools.inputOf?.bind(tools), range: this.d.range, loose: cfg.loose !== false };
       const bad = outcome!.value === null ? schemaProblem(req.submitTool, clip(kept)) : null;
       const v: CheckResult = bad ? { success: false, ...bad } : check(req.submitTool, kept, tools, cx);
       if (v.success) submission = v.data;
