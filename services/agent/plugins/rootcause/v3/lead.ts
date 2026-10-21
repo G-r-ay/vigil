@@ -77,11 +77,21 @@ available now: ${avail.join("; ") || "none"}${rare.length ? `; probe (${rare.len
 </next_move>`;
 }
 
+// The node a label names: exact first, else one whose label starts with the first 60 characters given.
+function labelled(nodes: (GraphNode | undefined)[], text: string): GraphNode | undefined {
+  const want = text.toLowerCase();
+  if (!want) return undefined;
+  const all = nodes.filter((n): n is GraphNode => !!n);
+  return all.find((n) => n.label.toLowerCase() === want) ?? all.find((n) => n.label.toLowerCase().startsWith(want.slice(0, 60)));
+}
+
 // A refused choose turn runs an available move rather than ask again: one on the target the model named
 // (`branch N1` on the symptom becomes expand N1), else the first available, in the move-list order of options().
 export function fallback(g: Graph, cfg: AgentConfig, named: NextIn | undefined, turn: number): FrontierDecision | undefined {
   const o = Object.entries(options(g, cfg)) as [Move, string[]][];
-  const want = named?.target?.trim();
+  const raw = named?.target?.trim();
+  // A target named by label means the node it names, as the choice itself would read it.
+  const want = raw && !g.nodes[raw] && !g.edges[raw] ? (labelled(Object.values(g.nodes), raw)?.id ?? raw) : raw;
   const [move, ids] = o.find(([, ids]) => want && ids.includes(want)) ?? o[0] ?? [];
   if (!move || !ids) return undefined;
   return { move, targetId: want && ids.includes(want) ? want : ids[0]!, turn, reason: "fallback after a refused choice", ...(named?.source?.trim() ? { source: named.source.trim() } : {}) };
