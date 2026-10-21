@@ -1,6 +1,6 @@
 // Model-led moves: each submission may name the next move (`next`); code only checks it is one of the moves
-// available on the graph now. Unavailable or missing, a submission's turn is followed by one choose turn; a choose
-// turn that is refused runs a fallback move (below) instead of asking again (orchestrator.ts).
+// available on the graph now. Unavailable or missing, the frontier picks (orchestrator.ts). With cfg.chooseTurn a
+// choose turn asks instead, and a choose turn that is refused runs a fallback move (below) rather than ask again.
 import type { AgentConfig } from "./config.js";
 import { isStalled, pivotExhausted, toConnect, type FrontierDecision, type Move } from "./frontier.js";
 import { bestPathFromSymptom, getParents, type Graph, type GraphNode, type Prediction } from "./graph.js";
@@ -68,7 +68,7 @@ export function optionsText(g: Graph, cfg: AgentConfig, st: LeadState, turn = 0,
   const lead = choosing
     ? "You lead this investigation. Name the next move (move, target, optional source, why): the strongest lead the evidence opened, not a checklist. Follow a thread while it is producing; switch when it goes cold."
     : "You lead this investigation. In your submission, name the next move in `next` (move, target, optional source, why): the strongest lead your searches opened, not a checklist. Follow a thread while it is producing; switch when it goes cold.";
-  const tail = choosing ? "" : " Leave `next` out and you will be asked to choose before the next move.";
+  const tail = choosing ? "" : cfg.chooseTurn ? " Leave `next` out and you will be asked to choose before the next move." : " Leave `next` out and the system picks.";
   return `<next_move>
 ${lead}
 Moves: expand <event> = find what caused it; strengthen <event|link> = check it happened / holds; fork <event> = a competing cause; branch <event> = what else it led to; test <prediction> = run a story's prediction; theorize = write or revise competing stories of the incident; pivot <boundary> = follow into a source that holds the cause (set source to the sourcetype to search; any sourcetype); connect = link unlinked findings to the chain; probe <rare value> = read a rare record over the whole range and what came after it. source on any move says where to look first.
@@ -85,7 +85,7 @@ function labelled(nodes: (GraphNode | undefined)[], text: string): GraphNode | u
   return all.find((n) => n.label.toLowerCase() === want) ?? all.find((n) => n.label.toLowerCase().startsWith(want.slice(0, 60)));
 }
 
-// A refused choose turn runs an available move rather than ask again: one on the target the model named
+// With cfg.chooseTurn, a refused choose turn runs an available move rather than ask again: one on the target the model named
 // (`branch N1` on the symptom becomes expand N1), else the first available, in the move-list order of options().
 export function fallback(g: Graph, cfg: AgentConfig, named: NextIn | undefined, turn: number): FrontierDecision | undefined {
   const o = Object.entries(options(g, cfg)) as [Move, string[]][];

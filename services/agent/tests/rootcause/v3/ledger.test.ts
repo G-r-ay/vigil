@@ -114,9 +114,8 @@ describe("rootcause v3 ledger", () => {
     const folded = fold(events);
     expect(folded.lastTurn).toBe(3);
     const used = (first.model as unknown as { used: Set<number> }).used;
-    // The choice the first worker carried is not in the ledger: the resumed run's first turn is a choose turn.
-    const carried = { move: "choose", correlationId: "N1", toolCalls: [], submission: { move: "strengthen", target: "E1", why: "the link to the cause is suspected" } };
-    const rest = [carried, ...entries.filter((_, i) => !used.has(i))];
+    // The choice the first worker carried is not in the ledger: the resumed run's first turn is the frontier's pick.
+    const rest = entries.filter((_, i) => !used.has(i));
     const trace = new MemoryTrace("r1", () => new Date(), folded.entries);
     const tools = new Registry();
     const second = deps(cfg, rest, trace, tools);

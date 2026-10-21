@@ -1,4 +1,4 @@
-// What a move is and when it is spent, pure. The model names every move; which moves are open on which targets
+// What a move is and when it is spent, pure. The model names moves; which moves are open on which targets
 // is lead.ts's options(). These are the rules it reads.
 // selectFrontier (spec §6) is the code's own pick: which move to make next, against which target. Priority
 // buckets are tried in order on the best path, then on alternative paths; the first bucket with a candidate wins.
@@ -205,7 +205,7 @@ function branching(g: Graph, cfg: AgentConfig, turn: number, path: string[], edg
   return stories(g, cfg, turn, true);
 }
 
-// Nothing calls this yet: the model names every move (lead.ts). It is the code's own pick, for when it does not.
+// The code's own pick, for a turn the model named no move it can run on (orchestrator.ts).
 export function selectFrontier(g: Graph, cfg: AgentConfig, turn: number, coverage: Record<string, number> = {}): FrontierDecision | null {
   const paths = allPaths(g);
   const first = paths[0];

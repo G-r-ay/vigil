@@ -147,7 +147,6 @@ describe("coverage gaps", () => {
     const refuted = (calls: string[]) => [{ summary: "no Sysmon record of the stager", strength: "direct", polarity: "refutes", toolCallIds: calls }];
     const budget = { usd: 0 };
     const script = new SpendingScript({ cfg: runCfg, tools, domains, survey: "", range }, [
-      { move: "choose", correlationId: "N1", toolCalls: [], submission: { move: "strengthen", target: "N1", why: "unconfirmed" } },
       { move: "strengthen", correlationId: "N1", toolCalls: [{ tool: "splunk_query", input: input("sysmon") }, { tool: "splunk_query", input: input("sysmon") }],
         submission: { evidence: [...refuted(["$0"]), ...refuted(["$1"])], reasoning: "nothing in Sysmon" } },
       { move: "conclude", correlationId: "N1", toolCalls: [], submission: { conclusion: "open", chain: ["N1"], openQuestions: ["is Sysmon deployed on the host"] } },
