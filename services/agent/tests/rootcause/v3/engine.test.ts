@@ -91,8 +91,7 @@ describe("runRootCauseV3", () => {
     const model = modelOf((request) => {
       if (properties(request).includes("observed_at")) return { emit: framed() };
       if (properties(request).includes("map")) return { emit: { map: "One source, edr.", reasoning: "mapped" } };
-      // The first turn names the move; the move then runs one search and answers. The stop arrives while the model writes it.
-      if (properties(request).includes("why")) return { emit: { move: "strengthen", target: "N1", why: "the alert is unconfirmed" } };
+      // The frontier names the first move; the move runs one search and answers. The stop arrives while the model writes it.
       if (request.emit !== undefined) { searched = true; return { emit: { evidence: [], reasoning: "nothing found" }, wait: 1_500 }; }
       const moving = request.messages.some((m) => m.content.includes("<graph_snapshot>"));
       const searchedAlready = request.messages.some((m) => m.role === "tool");
@@ -111,10 +110,9 @@ describe("runRootCauseV3", () => {
     expect(exit.exit).toBeNull();
     expect(exit.report).toContain("# RCA report");
 
-    // The first turn is a choose turn: journaled as a decision, its answer a call-free kernel turn.
+    // With no move named, the first turn is the frontier's pick, journaled as a decision with its rung: no choose turn.
     const decisions = events.filter((e) => e.kind === "rootcause_turn").flatMap((e) => (e.payload as { entries: { type: string; payload: unknown }[] }).entries).filter((x) => x.type === "decision").map((x) => x.payload);
-    expect(decisions[0]).toMatchObject({ move: "choose" });
-    expect(decisions[1]).toMatchObject({ move: "strengthen", targetId: "N1" });
+    expect(decisions[0]).toMatchObject({ move: "strengthen", targetId: "N1", priority: 0, reason: expect.stringMatching(/^frontier P0: /) });
 
     // The model's search is a call on the run's ledger, under the move's role, with the kernel's ref.
     const calls = events.filter((e) => e.kind === "call").map((e) => e.payload as CallPayload);
@@ -136,12 +134,11 @@ describe("runRootCauseV3", () => {
 describe("a run the pool cuts off mid-move", () => {
   it("records budget-exhausted, not null, in the ledger, the report and the projection", async () => {
     const state = new InProcessState<V3Kinds>();
-    // Framing, mapping and the choose turn fit; the move's own call is refused.
+    // Setup and the first move fit; a later move's own call is refused.
     const spec = specOf({ budgets: { max_calls: 4, max_cost_usd: 10, max_wall_ms: 600_000, max_park_ms: 60_000 } });
     const model = modelOf((request) => {
       if (properties(request).includes("observed_at")) return { emit: framed() };
       if (properties(request).includes("map")) return { emit: { map: "One source, edr.", reasoning: "mapped" } };
-      if (properties(request).includes("why")) return { emit: { move: "strengthen", target: "N1", why: "the alert is unconfirmed" } };
       return { emit: { evidence: [], reasoning: "nothing found" } };
     });
     const done = await runRootCauseV3(harnessOf(spec, model, splunk(), state), { run_id: "r1", spec });

@@ -1,5 +1,6 @@
-// The loop (spec §8): the model names each move, router dispatches, the handler returns a patch, the graph applies
-// and rescores it, the trace records it. Handed to the caller after every turn so a run can resume.
+// The loop (spec §8): the model names each move (the frontier picks when it names none that can run), router
+// dispatches, the handler returns a patch, the graph applies and rescores it, the trace records it. Handed to the
+// caller after every turn so a run can resume.
 import type { AgentConfig } from "./config.js";
 import { applyPatch, bestPathFromSymptom, createGraph, getParents, emptyPatch, type Graph, type GraphPatch } from "./graph.js";
 import { renderReport } from "./report.js";
@@ -8,7 +9,7 @@ import { rareSweep } from "./rare.js";
 import { route } from "./router.js";
 import { fallback, options, optionsText, resolveNext, type LeadState, type NextIn } from "./lead.js";
 import type { ModelClient } from "./model/client.js";
-import type { FrontierDecision } from "./frontier.js";
+import { selectFrontier, type FrontierDecision } from "./frontier.js";
 import type { Alert, Deps, ExitReason, LoopContext, RunResult, Spent } from "./types.js";
 
 // onTurn gets the graph after the rare sweep (turn 0) and after every turn: what a resume starts from.
@@ -46,6 +47,12 @@ export function checkExit(g: Graph, cfg: AgentConfig, spent: Spent): ExitReason 
   return null;
 }
 
+// The frontier's pick, its reason led by the rung that made it ("frontier P3: ..."; a model-named move's is "model: ...").
+function frontier(g: Graph, cfg: AgentConfig, turn: number, coverage?: Record<string, number>): FrontierDecision | null {
+  const d = selectFrontier(g, cfg, turn, coverage);
+  return d && { ...d, reason: `frontier P${d.priority}: ${d.reason}` };
+}
+
 // The least kept back for the closing turn, before the run has a move's cost to go by.
 const FLOOR_USD = 0.5;
 
@@ -61,8 +68,9 @@ export async function run(alert: Alert, cfg: AgentConfig, deps: Deps, o: RunOpts
   o.signal?.throwIfAborted(); // a sweep cut short by a stop or a lost lease is not kept
   await o.onTurn?.(graph, 0);
   let exit: ExitReason | null = null;
-  // The model names every move: each submission's `next`, checked against the graph, is the next turn's move.
-  // With none (turn 1, a resume, a missing or refused `next`) a choose turn asks for it.
+  // The model leads: each submission's `next`, checked against the graph, is the next turn's move. With none
+  // (turn 1, a resume, a missing or refused `next`) the frontier picks, at no model cost; with cfg.chooseTurn a
+  // choose turn asks the model instead.
   const st: LeadState = {};
   let pending: FrontierDecision | undefined;
   // Every prompt says how much budget is left; under wrapUpAt the model is told to wrap up, and under concludeAt
@@ -104,12 +112,16 @@ export async function run(alert: Alert, cfg: AgentConfig, deps: Deps, o: RunOpts
     if (concluding && graph.conclusion) { exit = concluding; break; }
     exit = checkExit(graph, cfg, deps.budget);
     if (exit === "budget-exhausted" && chainSolid(graph, cfg)) exit = "root-cause-found";
-    // Nothing open on the graph ends the run; otherwise the model's last choice runs, or it is asked to choose.
-    if (!exit && !pending && !Object.keys(options(graph, cfg)).length) exit = chainSolid(graph, cfg) ? "root-cause-found" : "inconclusive";
+    // With choose turns, nothing open on the graph ends the run; otherwise the model's last choice runs, or it is asked to choose.
+    if (!exit && !pending && cfg.chooseTurn && !Object.keys(options(graph, cfg)).length) exit = chainSolid(graph, cfg) ? "root-cause-found" : "inconclusive";
     const symptomId = Object.values(graph.nodes).find((n) => n.isSymptom)!.id;
-    let decision: FrontierDecision | null = exit ? null : pending ? { ...pending, turn } : { move: "choose", targetId: symptomId, turn, reason: st.refused ?? st.failed ?? "no next move named" };
+    let decision: FrontierDecision | null = exit ? null : pending ? { ...pending, turn }
+      : cfg.chooseTurn ? { move: "choose", targetId: symptomId, turn, reason: st.refused ?? st.failed ?? "no next move named" }
+      : frontier(graph, cfg, turn, deps.tools.coverage);
     pending = undefined;
     st.next = undefined;
+    // The frontier has nothing left: the run ends.
+    if (!exit && !decision) exit = chainSolid(graph, cfg) ? "root-cause-found" : "inconclusive";
     if (!exit && cfg.concludeAt > 0 && lowOn(cfg.concludeAt)) exit = chainSolid(graph, cfg) ? "root-cause-found" : "budget-exhausted";
     if (exit) {
       if (concluding || graph.conclusion || cfg.concludeAt <= 0) break;

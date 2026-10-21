@@ -16,6 +16,7 @@ export interface AgentConfig {
   lookbackDays: number;
   stitchWindowMinutes: number;
   linkNeedsSharedValue: boolean;
+  chooseTurn: boolean; // with no runnable `next`, ask the model in a choose turn instead of taking the frontier's pick
   wrapUpAt: number; // share of maxUsd left when the model is told to wrap up
   concludeAt: number; // share left when the run stops for the closing conclude turn
   thresholds: { confirm: number; settled: number; ruleOut: number; expandMin: number; altPathMin: number; competitorMax: number };
@@ -41,6 +42,7 @@ export const defaultConfig: AgentConfig = {
   lookbackDays: 14,
   stitchWindowMinutes: 30,
   linkNeedsSharedValue: true, // a new cause/effect link needs a value both events carry
+  chooseTurn: false, // the frontier picks, at no model cost (the reference loop); true restores the paid choose turn
   wrapUpAt: 0.10,
   concludeAt: 0.03, // at least $0.50: one conclude turn costs about that
   thresholds: { confirm: 0.85, settled: 0.95, ruleOut: 0.1, expandMin: 0.6, altPathMin: 0.3, competitorMax: 0.15 },
