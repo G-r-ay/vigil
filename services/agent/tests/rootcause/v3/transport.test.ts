@@ -10,6 +10,7 @@ import { constraints, instructions, SYSTEM_PROMPT } from "../../../plugins/rootc
 import { issued, neverRan, Registry, type EvidenceTool } from "../../../plugins/rootcause/v3/tools/registry.js";
 import { MemoryTrace } from "../../../plugins/rootcause/v3/trace.js";
 import { toolsFrom } from "../../../tools/remote.js";
+import { SUBMIT_TOOL } from "../../../core/stream.js";
 import { harnessOf, modelOf, specOf, splunk } from "../../support/v3-run.js";
 import { apply, node, seeded } from "./helpers.js";
 
@@ -60,7 +61,7 @@ describe("a move as a kernel turn", () => {
     expect(first!.messages[0]!.content).toContain("- edr: 10 events");
     expect(first!.messages[0]!.content).toContain("## Environment");
     expect(first!.messages.some((m) => m.content.includes("Find the cause."))).toBe(true);
-    expect(first!.tools.map((x) => x.id)).toEqual(["splunk_query"]);
+    expect(first!.tools.map((x) => x.id)).toEqual(["splunk_query", SUBMIT_TOOL]);
     expect(Object.keys((emission!.emit!["properties"] ?? {}) as object)).toContain("candidates");
     expect(JSON.stringify(emission!.emit)).not.toContain("maxLength");
 
@@ -80,6 +81,20 @@ describe("a move as a kernel turn", () => {
     // The emitted value is checked once: the item citing a ref the kernel never journaled is dropped, the rest kept.
     expect((out.submission as { candidates: { label: string }[] }).candidates.map((c) => c.label)).toEqual(["curl wrote /tmp/x"]);
     expect(t.trace.chronological().some((e) => e.type === "rejected-submission" && JSON.stringify(e.payload).includes("r9"))).toBe(true);
+  });
+
+  // A move that searches to its cap made one call per round and then one more for the emission.
+  it("takes a move's answer on the round its search cap makes the last, with no further call", async () => {
+    const t = setup(
+      (request) => (request.force === SUBMIT_TOOL ? { emit: { candidates: [cand("curl wrote /tmp/x", ["r1"])], reasoning: "r" } } : { calls: [{ tool: "splunk_query", args: SEARCH }] }),
+      { [SEARCH.spl]: "3 events matched\ncurl wrote /tmp/x" },
+    );
+    const out = await t.client.runTurn(t.request({ maxSearches: 2 }));
+
+    expect(t.provider.requests.map((r) => r.force)).toEqual([undefined, SUBMIT_TOOL]);
+    expect(t.provider.requests.some((r) => r.emit !== undefined)).toBe(false);
+    expect(out.toolCalls).toMatchObject([{ id: "r1", ok: true }]);
+    expect((out.submission as { candidates: { label: string }[] }).candidates.map((c) => c.label)).toEqual(["curl wrote /tmp/x"]);
   });
 
   it("a move with no searches asks nothing of the tool, and a failed search comes back as a failed call", async () => {
@@ -308,7 +323,7 @@ describe("what a move's prompt tells the model to call", () => {
       const sent = t.provider.requests[i]!;
       const text = sent.messages.map((m) => m.content).join("\n");
       expect(text).not.toMatch(/submit_/);
-      expect(sent.tools.map((x) => x.id)).toEqual(searches ? ["splunk_query"] : []);
+      expect(sent.tools.map((x) => x.id)).toEqual(searches ? ["splunk_query", SUBMIT_TOOL] : [SUBMIT_TOOL]);
     }
     expect(all.conclude).not.toContain("splunk_query");
   });

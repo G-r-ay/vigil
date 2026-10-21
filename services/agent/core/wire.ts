@@ -239,8 +239,38 @@ class OpenAiSurface implements Provider {
   }
 
   private async ask(request: TurnRequest): Promise<Turn> {
-    const tools = request.tools.length === 0 ? {} : { tools: wireTools(request.tools) };
-    return turnOf(await this.call({ model: this.wire_model, messages: wire(request.messages), ...tools }, request.signal));
+    const body = (tools: readonly ToolSchema[]) => ({ model: this.wire_model, messages: wire(request.messages), ...(tools.length === 0 ? {} : { tools: wireTools(tools) }) });
+    const forced = request.tools.find((tool) => tool.id === request.force);
+    if (forced === undefined) return turnOf(await this.call(body(request.tools), request.signal));
+    // Remembered per model like emitModes: "tool" means the gateway refuses a forced choice,
+    // "prompt" that it refuses tools at all. Each is remembered once the next rung has gone
+    // through: a 400 about something else is not a refusal.
+    const mode = `force\n${this.model}`;
+    const known = emitModes.get(mode);
+    const refusal = (error: unknown) => request.signal?.aborted !== true && REFUSED.has(statusOf(error) ?? 0);
+    if (known === undefined) {
+      try {
+        const tool_choice = { type: "function" as const, function: { name: forced.id } };
+        return turnOf(await this.call({ ...body(request.tools), tool_choice }, request.signal));
+      } catch (error) {
+        if (!refusal(error)) throw error;
+      }
+    }
+    // Where the choice cannot be forced, offering only the named tool is the next best thing to it.
+    if (known !== "prompt") {
+      try {
+        const turn = turnOf(await this.call(body([forced]), request.signal));
+        rememberMode(mode, "tool");
+        return turn;
+      } catch (error) {
+        if (!refusal(error)) throw error;
+      }
+    }
+    // No tool goes through here, so the answer is asked for as an emission is, and handed back
+    // as the call it stands in for. Every later forced round goes straight here.
+    const emitted = await this.emit(request, forced.parameters);
+    rememberMode(mode, "prompt");
+    return { ...emitted, content: "", tool_calls: [{ id: "emitted", tool: forced.id, args: emitted.content }] };
   }
 
   private async emit(request: TurnRequest, schema: Record<string, unknown>): Promise<Turn> {

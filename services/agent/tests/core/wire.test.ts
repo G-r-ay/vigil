@@ -184,6 +184,65 @@ describe("the OpenAI surface", () => {
     expect(bodies.at(-1)!.tool_choice).toEqual({ type: "function", function: { name: EMIT_TOOL } });
   });
 
+  it("forces the named tool when asked, and offers only that tool once the gateway has refused that", async () => {
+    const bodies: Body[] = [];
+    const surface = surfaceOf(async (body) => {
+      bodies.push(body);
+      if (body.tool_choice !== undefined) throw Object.assign(new Error("tool_choice is not supported"), { status: 400 });
+      return completion({ role: "assistant", content: "", tool_calls: [{ id: "1", function: { name: "submit_answer", arguments: '{"verb":"HALT"}' } }] });
+    });
+    const request: TurnRequest = {
+      messages: [{ role: "user", content: "go" }],
+      tools: [{ id: "search", description: "search", parameters: {} }, { id: "submit_answer", description: "answer", parameters: SCHEMA }],
+      force: "submit_answer",
+    };
+
+    expect((await turn(surface, request)).tool_calls.map((call) => call.tool)).toEqual(["submit_answer"]);
+    expect(bodies.map((body) => body.tool_choice)).toEqual([{ type: "function", function: { name: "submit_answer" } }, undefined]);
+
+    expect(bodies.map((body) => body.tools?.length)).toEqual([2, 1]);
+
+    // Remembered: the next forced call does not spend a refusal to find that out again.
+    await turn(surface, request);
+    expect(bodies).toHaveLength(3);
+    expect(bodies[2]!.tool_choice).toBeUndefined();
+    expect(bodies[2]!.tools).toHaveLength(1);
+  });
+
+  // A gateway that takes no tools still answers a zero-search turn in one call, as the emission did.
+  it("asks a gateway that refuses tools at all for the forced tool's arguments as an emission, once found out", async () => {
+    const bodies: Body[] = [];
+    const surface = surfaceOf(async (body) => {
+      bodies.push(body);
+      if (body.tools !== undefined) throw Object.assign(new Error("tools are not supported"), { status: 400 });
+      return completion({ role: "assistant", content: '{"verb":"HALT"}' });
+    });
+    const request: TurnRequest = {
+      messages: [{ role: "user", content: "go" }],
+      tools: [{ id: "submit_answer", description: "answer", parameters: SCHEMA }],
+      force: "submit_answer",
+    };
+
+    const first = await turn(surface, request);
+    expect(first.tool_calls).toEqual([expect.objectContaining({ tool: "submit_answer", args: '{"verb":"HALT"}' })]);
+    expect(first.content).toBe("");
+    expect(bodies.map((body) => body.response_format !== undefined)).toEqual([false, false, true]);
+
+    // Remembered: the next forced call spends no refusals finding that out again.
+    await turn(surface, request);
+    expect(bodies).toHaveLength(4);
+    expect(bodies[3]!.tools).toBeUndefined();
+    expect(bodies[3]!.response_format).toBeDefined();
+  });
+
+  it("does not read a gateway's ceiling as a refusal of the forced tool", async () => {
+    const surface = surfaceOf(async () => {
+      throw Object.assign(new Error("request timed out"), { status: 504 });
+    });
+    const request: TurnRequest = { messages: [{ role: "user", content: "go" }], tools: [{ id: "t", description: "t", parameters: {} }], force: "t" };
+    await expect(turn(surface, request)).rejects.toThrow("request timed out");
+  });
+
   // The reasoning families 400 on max_tokens and take max_completion_tokens. The tool
   // loop has no 400 handler, so every turn failed on a field the caller never chose.
   it("moves the output ceiling to the field the model takes it under, once", async () => {
