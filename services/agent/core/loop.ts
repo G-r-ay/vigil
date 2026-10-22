@@ -86,6 +86,14 @@ export interface TurnConfig {
   // Numbers each result so the model can cite it: the nth call is `${prefix}${offset + n}`.
   // Absent leaves results unnumbered, as the workflows written before the kernel expect.
   refs?: { prefix: string; offset: number };
+  // Holds a submitted answer that met the schema to the caller's own test: null accepts it,
+  // a string is what is wrong with it. A rejected answer's submit call is answered with that
+  // string and the model goes another round, `corrections` times at most (default 0); then the
+  // run fails with the last answer handed on as rejected_value. Rounds that only answered do
+  // not count against max_turns. An answer that came by emission instead is checked once, with
+  // no corrections. Absent, the schema is the only test, as before.
+  check?: (answer: unknown) => string | null | Promise<string | null>;
+  corrections?: number;
   // Asked once more when the model stops with turns left and fewer than min_results
   // results: keep going or say it is done. The ask is the next frame's transient tail.
   persist?: { min_results: number };
@@ -129,12 +137,15 @@ export interface Outcome<T> {
   // Set only when parked: the call the harness stopped at, and the checkpoint a
   // resolution must answer for it to go through.
   pending: Pending | null;
-  // Set only when the role answered but never in a shape the schema accepts: a defect
+  // Set only when the role answered but never in a shape the schema, or the caller's check, accepts: a defect
   // in the emission, structured so a workflow never parses the reason to see it.
   emission_rejected?: true;
   // With emission_rejected: the last emission, parsed whole, when it was JSON that missed the schema (unset when it
   // did not parse or was cut off), so a caller can keep the part that is sound.
   rejected_value?: unknown;
+  // With emission_rejected: set when the answer met the schema but failed the caller's check, to
+  // what the check said of the last one.
+  check_failed?: string;
   // True when the tool loop was stopped by the cap rather than by the model, so
   // a workflow knows the answer was reached over a truncated set of calls.
   capped: boolean;

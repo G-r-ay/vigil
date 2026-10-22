@@ -597,6 +597,93 @@ describe("the answer as a tool call", () => {
   });
 });
 
+describe("the caller's check of a submitted answer", () => {
+  const submit = (verb: string): ScriptedTurn => ({ calls: [{ tool: SUBMIT_TOOL, args: JSON.stringify({ verb }) }] });
+  const requests = (harness: Harness) => (harness.provider as ScriptedProvider).requests;
+  const halts = (answer: unknown) => ((answer as { verb: string }).verb === "HALT" ? null : "the count is not done; HALT when it is");
+  const fix = "Invalid submission: the count is not done; HALT when it is. Fix it and call submit_answer again.";
+
+  it("answers a failed submit with what the check said, and takes the fixed answer from the next round", async () => {
+    const harness = harnessOf([submit("TALLY"), submit("HALT")]);
+    const outcome = await outcomeOf<{ verb: string }>(config({ check: halts, corrections: 2 }), harness);
+
+    expect(outcome.status).toBe("completed");
+    expect(outcome.value).toEqual({ verb: "HALT" });
+    expect(requests(harness)).toHaveLength(2);
+    expect(requests(harness).some((request) => request.emit !== undefined)).toBe(false);
+    // The model sees its own call, answered by the check, as it sees any refused call.
+    const [said, answered] = requests(harness)[1]!.messages.slice(-2);
+    expect(said).toMatchObject({ role: "assistant", tool_calls: [{ id: "c1-0", tool: SUBMIT_TOOL, args: '{"verb":"TALLY"}' }] });
+    expect(answered).toMatchObject({ role: "tool", call_id: "c1-0" });
+    expect(answered!.content).toContain(`failed: invalid_args -- ${fix}`);
+    expect(outcome.calls.map((call) => [call.tool, call.result.ok])).toEqual([[SUBMIT_TOOL, false]]);
+    expect(outcome.rejected).toEqual(["the answer failed its check: the count is not done; HALT when it is"]);
+  });
+
+  it("hands on the last answer as failing its check once the corrections are spent", async () => {
+    const harness = harnessOf([submit("TALLY"), submit("TALLY"), submit("TALLY"), HALT]);
+    const outcome = await outcomeOf<{ verb: string }>(config({ check: halts, corrections: 2 }), harness);
+
+    expect(requests(harness)).toHaveLength(3);
+    expect(requests(harness).some((request) => request.emit !== undefined)).toBe(false);
+    expect(outcome.status).toBe("failed");
+    expect(outcome.value).toBeNull();
+    expect(outcome).toMatchObject({ emission_rejected: true, rejected_value: { verb: "TALLY" }, check_failed: "the count is not done; HALT when it is" });
+    expect(outcome.reason).toBe("the answer failed its check after 2 correction(s): the count is not done; HALT when it is");
+    // Two answered back; the third is the caller's to salvage, not the model's to see.
+    expect(outcome.calls).toHaveLength(2);
+    expect(requests(harness)[2]!.messages.filter((message) => message.role === "tool").map((message) => message.content.includes(fix))).toEqual([true, true]);
+  });
+
+  it("sends nothing back with no corrections: the first failed answer is handed on", async () => {
+    const harness = harnessOf([submit("TALLY")]);
+    const outcome = await outcomeOf<{ verb: string }>(config({ check: halts }), harness);
+
+    expect(requests(harness)).toHaveLength(1);
+    expect(outcome).toMatchObject({ status: "failed", emission_rejected: true, rejected_value: { verb: "TALLY" }, check_failed: "the count is not done; HALT when it is" });
+    expect(outcome.reason).toBe("the answer failed its check: the count is not done; HALT when it is");
+    expect(outcome.calls).toEqual([]);
+  });
+
+  // The answer round is forced and the cap is spent, so its correction is a forced round too.
+  it("forces the correction when the failed answer came on the forced round", async () => {
+    const harness = harnessOf([submit("TALLY"), submit("HALT")]);
+    const outcome = await outcomeOf<{ verb: string }>(config({ max_turns: 1, answer_within_cap: true, check: halts, corrections: 1 }), harness);
+
+    expect(outcome.value).toEqual({ verb: "HALT" });
+    expect(requests(harness).map((request) => request.force)).toEqual([SUBMIT_TOOL, SUBMIT_TOOL]);
+  });
+
+  // A round that only answered is not a search round: the role keeps every search round it had.
+  it("lets the role search in its correction while it has search rounds left, at no cost to them", async () => {
+    const harness = harnessOf([submit("TALLY"), { calls: [{ tool: "bump", args: "{}" }] }, submit("HALT")]);
+    const outcome = await outcomeOf<{ verb: string }>(config({ max_turns: 2, answer_within_cap: true, check: halts, corrections: 1 }), harness);
+
+    expect(outcome.value).toEqual({ verb: "HALT" });
+    expect(outcome.calls.map((call) => call.tool)).toEqual([SUBMIT_TOOL, "bump"]);
+    expect(requests(harness).map((request) => request.force)).toEqual([undefined, undefined, SUBMIT_TOOL]);
+  });
+
+  it("holds an emitted answer to the check too, once", async () => {
+    const harness = harnessOf([submit("SHOUT"), { emit: { verb: "TALLY" } }]);
+    const outcome = await outcomeOf<{ verb: string }>(config({ check: halts, corrections: 2 }), harness);
+
+    expect(requests(harness).at(-1)!.emit).toBeDefined();
+    expect(outcome).toMatchObject({ status: "failed", emission_rejected: true, rejected_value: { verb: "TALLY" }, check_failed: "the count is not done; HALT when it is" });
+  });
+
+  it("asks nothing more of a run whose answer passes than one with no check at all", async () => {
+    const script = [{ calls: [{ tool: "bump", args: "{}" }] }, submit("HALT")];
+    const plain = harnessOf(script);
+    const checked = harnessOf(script);
+    const without = await outcomeOf(config(), plain);
+    const passing = await outcomeOf(config({ check: halts, corrections: 2 }), checked);
+
+    expect(requests(checked)).toEqual(requests(plain));
+    expect({ ...passing, cost_usd: 0 }).toEqual({ ...without, cost_usd: 0 });
+  });
+});
+
 describe("what the stream reports", () => {
   it("relays every text delta and hands the model the text it accumulated", async () => {
     const harness = harnessOf([{ deltas: ["think", "ing about it"], calls: [{ tool: "bump", args: "{}" }] }, { calls: [] }, HALT]);
