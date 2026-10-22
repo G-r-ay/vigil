@@ -237,6 +237,41 @@ describe("the run's range", () => {
   }, 20_000);
 });
 
+describe("the alert's title", () => {
+  // Framed and mapped, then stopped, as above.
+  const setupOf = async (frames: Record<string, unknown>[]): Promise<SetupPayload> => {
+    const state = new InProcessState<V3Kinds>();
+    const spec = specOf();
+    let mapped = false;
+    const model = modelOf((request) => {
+      if (properties(request).includes("observed_at")) return { emit: frames.length > 1 ? frames.shift() : frames[0] };
+      if (properties(request).includes("map")) { mapped = true; return { emit: { map: "One source, edr.", reasoning: "mapped" } }; }
+      return { content: "done" };
+    });
+    const stop = async () => (mapped ? { directive_id: "d1", actor: "ana", kind: "abort", text: "", created_at: "2026-01-05T00:00:00Z" } : null);
+    await runRootCauseV3(harnessOf(spec, model, splunk(), state), { run_id: "r1", spec, stop });
+    return (await state.read("r1")).find((e) => e.kind === "rootcause_setup")!.payload as SetupPayload;
+  };
+
+  it("one that judges the event is asked again, and the setup says so", async () => {
+    const setup = await setupOf([framed({ title: "Malicious beacon from ws-7" }), framed({ title: "beacon from ws-7" })]);
+    expect(setup.alert.title).toBe("beacon from ws-7");
+    expect(setup.frame_note).toMatch(/"Malicious beacon from ws-7" judged the event \("malicious"\); asked again with the rule, it named it neutrally/);
+  }, 20_000);
+
+  it("one that still does is named in code, and the setup says so", async () => {
+    const setup = await setupOf([framed({ title: "Attacker beacon", action: "beacon", target: "ws-7" })]);
+    expect(setup.alert.title).toBe("beacon on ws-7");
+    expect(setup.frame_note).toMatch(/still did \("attacker"\), so the title was named in code from the framed parts: "beacon on ws-7"/);
+  }, 20_000);
+
+  it("a neutral one leaves no note", async () => {
+    const setup = await setupOf([framed()]);
+    expect(setup.alert.title).toBe("beacon");
+    expect(setup).not.toHaveProperty("frame_note");
+  }, 20_000);
+});
+
 describe("rangeOf", () => {
   const span = { query: "q", first: "2026-08-11T03:12:00.000Z", last: "2026-08-13T21:40:00.000Z" };
 

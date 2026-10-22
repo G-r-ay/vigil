@@ -18,8 +18,10 @@ How a run goes (`engine.ts`):
   move's prompt and its schema the move's submit schema. The move's search cap counts
   searches, not rounds: the evidence tool refuses any search past it (and, for scope, any
   past the batch of 7 a response may hold), and `max_turns` only bounds the rounds.
-  Framing the brief (`frame.ts`) is a turn with the frame schema and no tools. The
-  kernel bills each call to the run's pool, journals `spend`, `frame` and `call` events,
+  Framing the brief (`frame.ts`) is a turn with the frame schema and no tools. Its title
+  is the symptom's label, held to the labels' ACCUSE and TAKEOVER rules: one that fires is
+  asked once more with the rule, then named in code ("<action> on <target> by <principal>
+  from <address>"), and `rootcause_setup.frame_note` says which. The kernel bills each call to the run's pool, journals `spend`, `frame` and `call` events,
   and delimits search results; v3 keeps none of that of its own.
 - The model searches through one evidence tool (`tools/`), granted as a local tool whose
   handler is the `Registry`'s `run`. The kernel shows each result with its ref (`r12`) and
