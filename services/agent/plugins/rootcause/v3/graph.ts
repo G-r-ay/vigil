@@ -2,7 +2,7 @@
 // applies one. applyPatch validates, merges, rescores and reports what changed. No I/O except load/save.
 import type { AgentConfig } from "./config.js";
 import { confidence, status as deriveStatus, clampPrior, type Status } from "./scoring.js";
-import { STRONG_KINDS, type Artifact, type Domain, type Evidence } from "./types.js";
+import { ACCOUNT_KINDS, STRONG_KINDS, type Artifact, type Domain, type Evidence } from "./types.js";
 import { sameEvent } from "./stitch.js";
 
 export type NodeId = string;
@@ -544,7 +544,7 @@ export function linkedPrincipals(a: GraphNode, b: GraphNode): boolean {
 // for one account, and an account only when both ran as it: same host and nearby time is how unrelated work gets
 // chained in (an attacker's logon to a server, then an admin's remote job there a minute later; a pod created, then
 // a container start on that node seconds later, across sources; both blamed a legitimate user).
-const LOOSE_KINDS = new Set(["host", "user"]);
+const LOOSE_KINDS: ReadonlySet<string> = new Set(["host", ...ACCOUNT_KINDS]);
 const ACCUSE_WORDS = /\b(attacker|malicious|stolen|compromised|hijacked|backdoor|exfiltrat\w*|rogue|implant)\b/i;
 function topAccount(g: Graph, n: GraphNode): string | undefined {
   return getParents(g, n.id, "attributed-to").filter((e) => !e.retired && e.status !== "ruled-out").sort((a, b) => b.confidence - a.confidence)[0]?.source;
