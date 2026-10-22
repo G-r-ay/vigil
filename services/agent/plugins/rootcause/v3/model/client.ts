@@ -272,6 +272,10 @@ const argsOf = (raw: string): unknown => { try { return JSON.parse(raw); } catch
 // How many times an answer that fails its check or its schema goes back to the model before it is salvaged: every move's.
 export const CORRECTIONS = 2;
 
+// What every model call of a move may answer in, thinking included: the reference's max_tokens, on free and forced
+// rounds alike, and on scope and the refusal fallback too. The kernel's AGENT_MAX_OUTPUT_TOKENS is the other run kinds'.
+export const OUTPUT_TOKENS = 16_000;
+
 export class KernelModelClient implements ModelClient {
   private system: string[];
   private cur: TurnRequest | undefined;
@@ -388,6 +392,7 @@ export class KernelModelClient implements ModelClient {
         // adaptive thinking on every round that is not forced to the submit.
         cache_conversation: true,
         think: true,
+        max_output_tokens: OUTPUT_TOKENS,
         ...(req.model === undefined ? {} : { model: req.model }),
       });
     } catch (error) {

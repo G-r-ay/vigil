@@ -258,7 +258,7 @@ class Run<T, Kinds extends Record<string, unknown>> {
 
       let turn;
       try {
-        turn = yield* this.burn({ messages, tools: this.prefix.tools, ...(closing ? { force: SUBMIT_TOOL } : {}), ...this.claudeWire() }, tail);
+        turn = yield* this.burn({ messages, tools: this.prefix.tools, ...(closing ? { force: SUBMIT_TOOL } : {}), ...this.optIns() }, tail);
       } catch (error) {
         // The answer round stands in for the emission, so it gets the emission's recourse:
         // a failed one is asked again by emit() over a folded transcript.
@@ -515,7 +515,7 @@ class Run<T, Kinds extends Record<string, unknown>> {
       // worth changing before asking again is how much it is asked over.
       let turn;
       try {
-        turn = yield* this.burn({ messages: this.assembled(tail), tools: [], emit: schema, ...this.claudeWire() }, tail);
+        turn = yield* this.burn({ messages: this.assembled(tail), tools: [], emit: schema, ...this.optIns() }, tail);
       } catch (error) {
         // A silent model is a gateway fault, not a transcript too big to answer: asking
         // again over less would only spend the empty replies again. Nor does folding
@@ -631,12 +631,13 @@ class Run<T, Kinds extends Record<string, unknown>> {
     return { content, tool_calls, ...(reasoning === undefined ? {} : { reasoning }) };
   }
 
-  // The turn's opt-ins to Claude's cache and thinking, as the request carries them. Unset, the
-  // request is what it always was.
-  private claudeWire(): Pick<TurnRequest, "cache_conversation" | "think"> {
+  // The turn's opt-ins to Claude's cache and thinking, and its own output ceiling, as the request
+  // carries them. Unset, the request is what it always was.
+  private optIns(): Pick<TurnRequest, "cache_conversation" | "think" | "max_output_tokens"> {
     return {
       ...(this.cfg.cache_conversation === true ? { cache_conversation: true } : {}),
       ...(this.cfg.think === true ? { think: true } : {}),
+      ...(this.cfg.max_output_tokens === undefined ? {} : { max_output_tokens: this.cfg.max_output_tokens }),
     };
   }
 
@@ -652,6 +653,8 @@ class Run<T, Kinds extends Record<string, unknown>> {
         ...(this.harness.provider.sampling ?? {}),
         ...(request.cache_conversation === true ? { cache_conversation: true } : {}),
         ...(request.think === true && request.force === undefined && request.emit === undefined ? { think: "adaptive" } : {}),
+        // The ceiling sent, where the turn set its own in place of the surface's.
+        ...(request.max_output_tokens === undefined ? {} : { max_output_tokens: request.max_output_tokens }),
       },
       system: this.prefix.system,
       task: this.cfg.task,

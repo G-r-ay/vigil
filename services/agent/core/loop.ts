@@ -119,6 +119,9 @@ export interface TurnConfig {
   // and carries each round's thinking back with its calls.
   cache_conversation?: boolean;
   think?: boolean;
+  // Every call this turn makes, its emission's included, may answer in up to this many tokens,
+  // thinking included, in place of AGENT_MAX_OUTPUT_TOKENS. Unset, the surface's ceiling applies.
+  max_output_tokens?: number;
   // Lets this turn run against a ledger that already holds a terminal. Only for a turn
   // that describes a run rather than continues one -- never one that can reach a tool.
   after_terminal?: boolean;

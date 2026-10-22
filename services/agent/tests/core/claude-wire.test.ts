@@ -16,7 +16,7 @@ import type { Message, Provider } from "../../core/provider.js";
 import { registryOf } from "../../core/registry.js";
 import { InProcessState } from "../../core/state.js";
 import { inputHash, SUBMIT_TOOL } from "../../core/stream.js";
-import { openAiSurface } from "../../core/wire.js";
+import { maxOutputTokens, openAiSurface } from "../../core/wire.js";
 
 type Body = OpenAI.Chat.ChatCompletionCreateParams;
 type Chunk = OpenAI.Chat.ChatCompletionChunk;
@@ -200,6 +200,48 @@ describe("a turn that does not opt in, or a model that is not Claude", () => {
     const { bodies } = await bodiesOf("claude-sonnet-4-5", ON);
     expect(bodies.every((body) => !("reasoning" in body))).toBe(true);
     expect(markers(bodies[1]!)).toEqual([0, bodies[1]!.messages.length - 1]);
+  });
+});
+
+// Root cause's moves answer in up to the reference's max_tokens, 16000, in place of AGENT_MAX_OUTPUT_TOKENS. The wire
+// sends it where it sends the surface's own ceiling, on every call of the turn; thinking draws on it, as on Anthropic's.
+describe("a turn with its own output cap", () => {
+  const CAP = { ...ON, max_output_tokens: 16_000 };
+  const caps = (bodies: readonly Body[]) => bodies.map((body) => [body.max_tokens, "max_completion_tokens" in body]);
+
+  it.each([
+    ["claude-opus-4-8", {}],
+    ["claude-sonnet-5", { model: "claude-sonnet-5" }],
+  ])("sends it to %s as max_tokens on every round, free to think or forced", async (model, over) => {
+    const { bodies, state } = await bodiesOf("claude-opus-4-8", { ...CAP, ...over });
+    expect(new Set(bodies.map((body) => body.model))).toEqual(new Set([`vertex/${model}`]));
+    expect(caps(bodies)).toEqual([[16_000, false], [16_000, false], [16_000, false]]);
+    expect(bodies.map((body) => "reasoning" in body)).toEqual([true, true, false]);
+    const frames = (await state.read(RUN)).filter((one) => one.kind === "frame").map((one) => (one.payload as FramePayload).sampling["max_output_tokens"]);
+    expect(frames).toEqual([16_000, 16_000, 16_000]);
+  });
+
+  it("sends it on an emission too, each rung of it", async () => {
+    const schema = { type: "object", required: ["cap"], properties: { cap: { type: "string" } } };
+    const { client, bodies } = gateway([
+      { tool: "emit", args: JSON.stringify({ cap: "own" }) },
+      { tool: "emit", args: JSON.stringify({ cap: "own" }) },
+    ]);
+    const surface = openAiSurface(client, "claude-opus-4-8", new Limiter({ rpm: 10_000, tpm: 10_000_000 }, 4, 1), "vertex", "vertex/claude-opus-4-8");
+    const said: string[] = [];
+    for await (const event of surface.stream({ messages: [{ role: "user", content: "answer" }], tools: [], emit: schema, max_output_tokens: 16_000 })) if (event.type === "text_delta") said.push(event.text);
+    expect(said).toEqual([JSON.stringify({ cap: "own" })]);
+    expect(bodies.map((body) => ["response_format" in body, body.max_tokens])).toEqual([[true, 16_000], [false, 16_000]]);
+  });
+
+  it("is the only difference from a turn without it, which is sent AGENT_MAX_OUTPUT_TOKENS as before", async () => {
+    const own = await bodiesOf("claude-opus-4-8", CAP);
+    const unset = await bodiesOf("claude-opus-4-8", ON);
+    expect(caps(unset.bodies)).toEqual(unset.bodies.map(() => [maxOutputTokens(), false]));
+    const at = (bodies: readonly Body[]) => JSON.stringify(bodies.map((body) => ({ ...body, max_tokens: 0 })));
+    expect(at(own.bodies)).toBe(at(unset.bodies));
+    const frames = (await unset.state.read(RUN)).filter((one) => one.kind === "frame").map((one) => (one.payload as FramePayload).sampling["max_output_tokens"]);
+    expect(frames).toEqual(unset.bodies.map(() => maxOutputTokens()));
   });
 });
 

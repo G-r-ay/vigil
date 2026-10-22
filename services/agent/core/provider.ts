@@ -46,6 +46,9 @@ export interface TurnRequest {
   // thinking on, so a forced round never thinks.
   cache_conversation?: boolean;
   think?: boolean;
+  // This call's output ceiling, thinking included, in place of AGENT_MAX_OUTPUT_TOKENS. Unset, the
+  // surface's own ceiling is sent, as it always was.
+  max_output_tokens?: number;
   signal?: AbortSignal;
 }
 

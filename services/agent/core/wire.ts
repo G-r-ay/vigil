@@ -280,7 +280,7 @@ class OpenAiSurface implements Provider {
     const forced = request.tools.find((tool) => tool.id === request.force);
     if (forced === undefined) {
       const thinks = request.think === true && claude && thinksAdaptively(this.model);
-      return turnOf(await this.call({ ...body(request.tools), ...(thinks ? ADAPTIVE : {}) }, request.signal, tail));
+      return turnOf(await this.call({ ...body(request.tools), ...(thinks ? ADAPTIVE : {}) }, request.signal, tail, request.max_output_tokens));
     }
     // Remembered per model like emitModes: "tool" means the gateway refuses a forced choice,
     // "prompt" that it refuses tools at all. Each is remembered once the next rung has gone
@@ -291,7 +291,7 @@ class OpenAiSurface implements Provider {
     if (known === undefined) {
       try {
         const tool_choice = { type: "function" as const, function: { name: forced.id } };
-        return turnOf(await this.call({ ...body(request.tools), tool_choice }, request.signal, tail));
+        return turnOf(await this.call({ ...body(request.tools), tool_choice }, request.signal, tail, request.max_output_tokens));
       } catch (error) {
         if (!refusal(error)) throw error;
       }
@@ -299,7 +299,7 @@ class OpenAiSurface implements Provider {
     // Where the choice cannot be forced, offering only the named tool is the next best thing to it.
     if (known !== "prompt") {
       try {
-        const turn = turnOf(await this.call(body([forced]), request.signal, tail));
+        const turn = turnOf(await this.call(body([forced]), request.signal, tail, request.max_output_tokens));
         rememberMode(mode, "tool");
         return turn;
       } catch (error) {
@@ -322,7 +322,7 @@ class OpenAiSurface implements Provider {
     if ((emitModes.get(mode) ?? "schema") === "schema") {
       try {
         const format = { type: "json_schema" as const, json_schema: { name: "emission", strict: false, schema } };
-        const turn = spend.count(turnOf(await this.call({ model: this.wire_model, messages, response_format: format }, request.signal, tail)));
+        const turn = spend.count(turnOf(await this.call({ model: this.wire_model, messages, response_format: format }, request.signal, tail, request.max_output_tokens)));
         // A gateway that drops response_format answers 200 with an object of the model's
         // own invention, so fall through to the tool, whose parameters it does forward.
         if (honours(turn.content, schema)) return turn;
@@ -334,7 +334,7 @@ class OpenAiSurface implements Provider {
     }
 
     if (emitModes.get(mode) !== "prompt") {
-      const carried = await this.viaTool(messages, schema, spend, request.signal, tail);
+      const carried = await this.viaTool(messages, schema, spend, request.signal, tail, request.max_output_tokens);
       if (carried !== null) return carried;
       rememberMode(mode, "prompt");
     }
@@ -342,7 +342,7 @@ class OpenAiSurface implements Provider {
     // Neither wire carried it, so the schema goes in the prompt, which asks nothing of
     // the gateway. What comes back is JSON the caller already parses and corrects.
     const asked = [...messages, { role: "user" as const, content: prompted(schema) }];
-    const turn = spend.count(turnOf(await this.call({ model: this.wire_model, messages: asked }, request.signal, tail)));
+    const turn = spend.count(turnOf(await this.call({ model: this.wire_model, messages: asked }, request.signal, tail, request.max_output_tokens)));
     if (turn.content !== "" || turn.tool_calls.length === 0) return turn;
 
     // No tools were offered and it called one anyway: a provider that finds a name in
@@ -353,6 +353,7 @@ class OpenAiSurface implements Provider {
           { model: this.wire_model, messages: [...asked, { role: "user", content: instead(turn) }] },
           request.signal,
           tail,
+          request.max_output_tokens,
         ),
       ),
     );
@@ -366,6 +367,7 @@ class OpenAiSurface implements Provider {
     spend: Tally,
     signal?: AbortSignal,
     tail = false,
+    ceiling?: number,
   ): Promise<Turn | null> {
     const emit = { name: EMIT_TOOL, description: "Emit your answer.", parameters: schema };
     const forced = {
@@ -377,7 +379,7 @@ class OpenAiSurface implements Provider {
 
     let turn: Turn;
     try {
-      turn = spend.count(turnOf(await this.call(forced, signal, tail)));
+      turn = spend.count(turnOf(await this.call(forced, signal, tail, ceiling)));
     } catch (error) {
       // Only a refusal: returning null claims this wire never works here, which a local
       // fault (no status) and a ceiling ("not now") do not establish.
@@ -398,6 +400,7 @@ class OpenAiSurface implements Provider {
           { ...forced, messages: [...messages, { role: "user", content: instead(turn, `Call ${EMIT_TOOL} with your final answer, and call nothing else.`) }] },
           signal,
           tail,
+          ceiling,
         ),
       ),
     );
@@ -407,35 +410,37 @@ class OpenAiSurface implements Provider {
 
   // Streamed, and not for the deltas: a buffered completion is subject to the gateway's
   // non-streaming ceiling -- 30 seconds in Bifrost, returned as a 504.
-  private async call(body: Body, signal?: AbortSignal, conversation = false): Promise<OpenAI.Chat.ChatCompletion> {
+  // `ceiling` is the call's output cap, thinking included: AGENT_MAX_OUTPUT_TOKENS unless the turn set its own.
+  private async call(body: Body, signal?: AbortSignal, conversation = false, ceiling = maxOutputTokens()): Promise<OpenAI.Chat.ChatCompletion> {
     // Before the limiter, not only inside the request: a call still queued behind
     // a rate limit is the cheapest one to give up on.
     signal?.throwIfAborted();
     if (takesCacheMarker(this.provider_type, this.model)) body = { ...body, messages: cacheable(body.messages, conversation) };
     const cap = outputCaps.get(this.model) ?? "max_tokens";
     try {
-      return await this.send(body, cap, signal);
+      return await this.send(body, cap, ceiling, signal);
     } catch (error) {
       const other = renamed(error, cap);
       if (other === null) throw error;
       outputCaps.set(this.model, other);
-      return await this.send(body, other, signal);
+      return await this.send(body, other, ceiling, signal);
     }
   }
 
-  private async send(body: Body, cap: OutputCap, signal?: AbortSignal): Promise<OpenAI.Chat.ChatCompletion> {
+  private async send(body: Body, cap: OutputCap, ceiling: number, signal?: AbortSignal): Promise<OpenAI.Chat.ChatCompletion> {
     let wasted: TokenCounts = { input: 0, output: 0, cache_read: 0, cache_write: 0 };
     for (let attempt = 0; ; attempt += 1) {
-      const { response, reported } = await this.sendOnce(body, cap, signal);
+      const { response, reported } = await this.sendOnce(body, cap, ceiling, signal);
       const finish: string | undefined = response.choices[0]?.finish_reason;
       if (finish === "refusal" || finish === "content_filter") {
         throw new ModelRefused(`the model refused to answer (finish_reason=${finish}) from ${this.wire_model}`, tokensOf(plus(response.usage, wasted)));
       }
       if (response.choices[0]?.finish_reason === "length" && !said(response)) {
         const spent = tokensOf(plus(response.usage, wasted));
+        // A turn's own ceiling is not raised by the variable, so it is only named where it set the cap.
         throw new OutputCapReached(
-          `the model spent all ${maxOutputTokens()} output tokens before answering (finish_reason=length, empty reply) from ${this.wire_model}; ` +
-            "reasoning tokens count against the cap -- raise AGENT_MAX_OUTPUT_TOKENS",
+          `the model spent all ${ceiling} output tokens before answering (finish_reason=length, empty reply) from ${this.wire_model}; ` +
+            `reasoning tokens count against the cap${ceiling === maxOutputTokens() ? " -- raise AGENT_MAX_OUTPUT_TOKENS" : ""}`,
           spent,
         );
       }
@@ -453,9 +458,8 @@ class OpenAiSurface implements Provider {
 
   // One request. `reported` says the gateway sent usage: a guessed usage cannot tell
   // an empty reply from one the stream lost.
-  private async sendOnce(body: Body, cap: OutputCap, signal?: AbortSignal): Promise<{ response: OpenAI.Chat.ChatCompletion; reported: boolean }> {
+  private async sendOnce(body: Body, cap: OutputCap, ceiling: number, signal?: AbortSignal): Promise<{ response: OpenAI.Chat.ChatCompletion; reported: boolean }> {
     let reported = false;
-    const ceiling = maxOutputTokens();
     const limit = cap === "max_tokens" ? { max_tokens: ceiling } : { max_completion_tokens: ceiling };
     const estimate = estimateTokens(JSON.stringify(body));
     const attributes = {

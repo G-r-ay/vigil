@@ -5,7 +5,7 @@ import { InProcessState } from "../../../core/state.js";
 import { loadPlugin } from "../../../plugins/index.js";
 import { defaultConfig } from "../../../plugins/rootcause/v3/config.js";
 import type { V3Kinds } from "../../../plugins/rootcause/v3/ledger.js";
-import { CORRECTIONS, KernelModelClient, KernelTurns, Refused, type TurnRequest } from "../../../plugins/rootcause/v3/model/client.js";
+import { CORRECTIONS, KernelModelClient, KernelTurns, OUTPUT_TOKENS, Refused, type TurnRequest } from "../../../plugins/rootcause/v3/model/client.js";
 import { constraints, instructions, SYSTEM_PROMPT } from "../../../plugins/rootcause/v3/model/prompts.js";
 import { correction, issued, neverRan, Registry, type EvidenceTool } from "../../../plugins/rootcause/v3/tools/registry.js";
 import { rootCauseV3Projection } from "../../../plugins/rootcause/v3/projection.js";
@@ -101,6 +101,19 @@ describe("a move as a kernel turn", () => {
       [undefined, true, true],
       [SUBMIT_TOOL, true, true],
     ]);
+  });
+
+  // The reference sends max_tokens 16000 on every call, free or forced; the kernel's AGENT_MAX_OUTPUT_TOKENS is not asked.
+  it("asks every call of a move, its emission's included, for the reference's output cap", async () => {
+    const t = setup(
+      (request) => (request.emit !== undefined ? { emit: { candidates: [cand("curl wrote /tmp/x", ["r1"])], reasoning: "r" } } : request.force === SUBMIT_TOOL ? { content: "no call" } : { calls: [{ tool: "splunk_query", args: SEARCH }] }),
+      { [SEARCH.spl]: "3 events matched\ncurl wrote /tmp/x" },
+    );
+    await t.client.runTurn(t.request({ maxSearches: 1 }));
+    expect(OUTPUT_TOKENS).toBe(16_000);
+    const asked = t.provider.requests.map((r) => [r.force ?? (r.emit === undefined ? "free" : "emit"), r.max_output_tokens]);
+    expect(new Set(asked.map(([kind]) => kind))).toEqual(new Set(["free", SUBMIT_TOOL, "emit"]));
+    expect(asked.every(([, cap]) => cap === 16_000)).toBe(true);
   });
 
   // A move that searches to its cap one search a round gets every search, then answers on the forced round.
@@ -628,6 +641,8 @@ describe("a move's model: scope on the scope model, a refused move asked again a
     expect(t.provider.models.length).toBeGreaterThan(0);
     expect(new Set(t.provider.models)).toEqual(new Set(["claude-sonnet-5"]));
     expect(await spends(t.state)).toEqual(t.provider.models.map(() => expect.objectContaining({ model_id: "claude-sonnet-5", role: "scope" })));
+    // As the reference's scope, which runs through the same model call as a move: 16000 on every call.
+    expect(new Set(t.provider.requests.map((r) => r.max_output_tokens))).toEqual(new Set([OUTPUT_TOKENS]));
 
     const before = t.provider.models.length;
     await t.client.runTurn(t.request());
@@ -662,6 +677,8 @@ describe("a move's model: scope on the scope model, a refused move asked again a
       { attempt: 2, model: "scripted/model", retry: "fallback model claude-sonnet-5" },
     ]);
     expect((await spends(t.state)).slice(2).every((s) => s.model_id === "claude-sonnet-5" && s.role === "expand")).toBe(true);
+    // The reference's fallback is the same model call on another model, so the same cap.
+    expect(new Set(t.provider.requests.map((r) => r.max_output_tokens))).toEqual(new Set([OUTPUT_TOKENS]));
   });
 
   it("refused a third time, gives up on the move: no submission, no searches, the run goes on", async () => {

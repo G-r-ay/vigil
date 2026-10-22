@@ -802,6 +802,8 @@ export interface Subturn {
   // TurnConfig's: Claude caches the whole conversation and thinks on open rounds. Off unless set.
   cache_conversation?: boolean;
   think?: boolean;
+  // TurnConfig's: this step's output ceiling in place of AGENT_MAX_OUTPUT_TOKENS. Unset, the surface's.
+  max_output_tokens?: number;
 }
 
 export async function runSubturn<T>(ctx: PluginContext, sub: Subturn): Promise<Outcome<T>> {
@@ -837,6 +839,7 @@ export async function runSubturn<T>(ctx: PluginContext, sub: Subturn): Promise<O
     ...(sub.answer_now === undefined ? {} : { answer_now: sub.answer_now }),
     ...(sub.cache_conversation === true ? { cache_conversation: true } : {}),
     ...(sub.think === true ? { think: true } : {}),
+    ...(sub.max_output_tokens === undefined ? {} : { max_output_tokens: sub.max_output_tokens }),
     ...(options.signal === undefined ? {} : { signal: options.signal }),
   };
   const framer = await Framer.open(harness.state, options.run_id, options.run_kind, [], []);
