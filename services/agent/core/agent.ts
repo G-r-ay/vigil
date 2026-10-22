@@ -789,6 +789,10 @@ export interface Subturn {
   max_turns?: number;
   // Numbers each result as the ledger will (r12), so the answer can cite them.
   cite?: boolean;
+  // The caller's test of a submitted answer, and how many times a failed one goes back to
+  // the model to fix: TurnConfig's. Each correction is a submit_answer call on the ledger.
+  check?: TurnConfig["check"];
+  corrections?: number;
 }
 
 export async function runSubturn<T>(ctx: PluginContext, sub: Subturn): Promise<Outcome<T>> {
@@ -815,6 +819,7 @@ export async function runSubturn<T>(ctx: PluginContext, sub: Subturn): Promise<O
     result_cap: options.spec.runtime.result_cap,
     recall_limit: options.spec.runtime.recall_limit,
     ...(sub.cite === true ? { refs: { prefix: CALL_REF, offset: count } } : {}),
+    ...(sub.check === undefined ? {} : { check: sub.check, corrections: sub.corrections ?? 0 }),
     ...(options.signal === undefined ? {} : { signal: options.signal }),
   };
   const framer = await Framer.open(harness.state, options.run_id, options.run_kind, [], []);
