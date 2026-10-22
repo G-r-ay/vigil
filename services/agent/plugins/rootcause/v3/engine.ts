@@ -15,7 +15,7 @@ import { run, seedFromAlert } from "./orchestrator.js";
 import { renderReport } from "./report.js";
 import { scope } from "./scope.js";
 import { correction, neverRan, Registry, type Journal } from "./tools/registry.js";
-import { sourceFor, UnsupportedSource, type Invoke, type SourceAdapter } from "./tools/source.js";
+import { sourceFor, UnsupportedSource, type DataSpan, type Invoke, type SourceAdapter } from "./tools/source.js";
 import { splunkAdapter } from "./tools/splunk-source.js";
 import { MemoryTrace } from "./trace.js";
 import type { Deps, ExitReason } from "./types.js";
@@ -253,10 +253,47 @@ async function open(options: V3Options, adapter: SourceAdapter, invoke: Invoke, 
   const framed = await frameAlert(turns, run_id, spec.prompt, indexes);
   const index = configured ?? framed.index;
   if (index === null) throw new Unframed(`the brief does not say which of the indexes holds its telemetry (${indexes.slice(0, 20).join(", ") || "none listed"}), and no root_cause_index is configured`);
-  const t = Date.parse(framed.alert.observedAt);
-  const range: [string, string] = [new Date(t - defaultConfig.lookbackDays * DAY_MS).toISOString(), new Date(t + DAY_MS).toISOString()];
-  const survey = await adapter.open(invoke, { index, range }).survey();
-  return { cfg: configFor(spec), alert: framed.alert, index, range, survey, environment: null };
+  let span: DataSpan | null = null;
+  let unmeasured = "the index holds no events";
+  try {
+    span = await adapter.span(invoke, index);
+  } catch (error) {
+    unmeasured = error instanceof Error ? error.message : String(error);
+  }
+  const ranged = rangeOf(framed.alert.observedAt, span, defaultConfig.lookbackDays, unmeasured);
+  const survey = await adapter.open(invoke, { index, range: ranged.range }).survey();
+  return { cfg: configFor(spec), alert: framed.alert, index, ...ranged, survey, environment: null };
+}
+
+const dayOf = (ms: number) => Math.floor(ms / DAY_MS) * DAY_MS;
+const iso = (ms: number) => new Date(ms).toISOString();
+
+type Ranged = Required<Pick<SetupPayload, "range" | "range_source" | "data_span" | "range_note">> & Pick<SetupPayload, "span_query">;
+
+// The run's range, as the reference's scenarios set theirs: the data's own span in whole UTC days, from the
+// midnight before its first event to the midnight after its last. The alert stays inside it: an alert outside the
+// data widens the range to the alert's day. A span that could not be measured (why: the reason) leaves the alert's
+// window, lookbackDays before it to a day after.
+export function rangeOf(observedAt: string, span: DataSpan | null, lookbackDays: number, why: string): Ranged {
+  const t = Date.parse(observedAt);
+  if (span === null) {
+    return {
+      range: [iso(t - lookbackDays * DAY_MS), iso(t + DAY_MS)],
+      range_source: "alert-window",
+      data_span: null,
+      range_note: `the data's span was not measured (${why}), so the range is the alert's window: ${lookbackDays} days before it to a day after`,
+    };
+  }
+  const first = Date.parse(span.first), last = Date.parse(span.last);
+  const range: [string, string] = [iso(dayOf(Math.min(first, t))), iso(dayOf(Math.max(last, t)) + DAY_MS)];
+  const outside = t < first ? `; the alert at ${observedAt} is before the data's first event, so the range starts on its day` : t > last ? `; the alert at ${observedAt} is after the data's last event, so the range ends after its day` : "";
+  return {
+    range,
+    range_source: "data",
+    data_span: [span.first, span.last],
+    span_query: span.query,
+    range_note: `the data's own span, ${span.first} to ${span.last}, in whole days${outside}`,
+  };
 }
 
 async function halted(

@@ -20,6 +20,12 @@ export interface SetupPayload {
   alert: Alert;
   index: string;
   range: [string, string];
+  // Where the range came from: the data's own span (data_span, measured by span_query), whole days, or, when that
+  // could not be measured, the alert's window. range_note says how, in words. Absent on ledgers written before.
+  range_source?: "data" | "alert-window";
+  data_span?: [string, string] | null;
+  span_query?: string;
+  range_note?: string;
   survey: Survey;
   // The environment map (scope.ts), or null when mapping failed and the run went on without it.
   environment: string | null;

@@ -95,6 +95,18 @@ describe("splunkAdapter", () => {
     expect(asked[0]!["spl_query"]).toMatch(/^\| eventcount summarize=false index=\*/);
   });
 
+  it("measures the index's span over all time, every sourcetype together", async () => {
+    const { invoke, asked } = recording([envelope([{ first: "1786417920", last: "1786657200" }])]);
+    expect(await splunkAdapter.span(invoke, "lab")).toEqual({ query: "| tstats min(_time) as first max(_time) as last where index=lab", first: "2026-08-11T03:12:00.000Z", last: "2026-08-13T21:40:00.000Z" });
+    expect(asked[0]).toMatchObject({ spl_query: "| tstats min(_time) as first max(_time) as last where index=lab", earliest: "0", latest: "2000000000" });
+  });
+
+  it("has no span for an index with no events, and throws on a failed search", async () => {
+    expect(await splunkAdapter.span(recording([envelope([])]).invoke, "lab")).toBeNull();
+    expect(await splunkAdapter.span(recording([envelope([{ first: "", last: "" }])]).invoke, "lab")).toBeNull();
+    await expect(splunkAdapter.span(recording([{ ok: false, failure: { kind: "backend_error", detail: "Splunk: index lab not found" } }]).invoke, "lab")).rejects.toThrow("index lab not found");
+  });
+
   it("searches with v3's guarded tool, scoped to the run's index", () => {
     const tool = splunkAdapter.open(async () => envelope([]), { index: "lab", range }).evidenceTool();
     expect(tool.name).toBe("splunk_query");
