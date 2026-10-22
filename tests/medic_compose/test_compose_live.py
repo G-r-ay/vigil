@@ -4,20 +4,23 @@ Opt-in (it builds three images and runs a stack for ~5 minutes):
 
     VIGIL_MEDIC_COMPOSE_LIVE=1 python -m pytest tests/medic_compose -p no:cacheprovider
 
-It runs `scripts/medic/enable-compose.sh` for real (secrets, image build, file
-ownership), then brings up the real Compose files plus the Medic overlay plus
+It runs `scripts/medic/enable-compose.sh --secrets-only` for real, builds the
+three Medic images and hands the secret files to their users as the full run
+does, then brings up the real Compose files plus the Medic overlay plus
 `compose.test.yml` under its own project (`medic-s6`, or
 VIGIL_MEDIC_COMPOSE_PROJECT). Backend, agents, daemon, Redis, Postgres and
 Bifrost are stubs on their real networks and ports; the Medic services are the
 real images. Every probe runs from inside the Medic container. The project is
 torn down at the end, and nothing outside it is touched.
+
+The full run also makes the gateway's service account inside the backend (V1),
+which needs the real backend and Postgres: test_enable_live.py covers it.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
 import secrets
 import subprocess
 import time
@@ -69,6 +72,10 @@ class Stack:
         self.secrets_dir = home / "medic-secrets"
         self.env = clean_env(
             home,
+            # enable-compose.sh's full run drives compose itself (V1): if this
+            # suite ever runs it, it acts on this project, not a developer's.
+            COMPOSE_PROJECT_NAME=PROJECT,
+            VIGIL_MEDIC_COMPOSE_OVERRIDE=str(HERE / "compose.test.yml"),
             VIGIL_MEDIC_SECRETS_DIR=str(self.secrets_dir),
             MEDIC_S6_STUB_DIR=str(HERE),
             MEDIC_S6_CANARY=self.canary,
@@ -124,23 +131,39 @@ class Stack:
 def stack(tmp_path_factory):
     s = Stack(tmp_path_factory.mktemp("home"))
     enable = subprocess.run(
-        [str(ENABLE)],
+        [str(ENABLE), "--secrets-only"],
         check=False,
         env=s.env,
         capture_output=True,
         text=True,
-        timeout=1200,
+        timeout=60,
     )
     assert enable.returncode == 0, enable.stdout + enable.stderr
     s.enable_output = enable.stdout
-    # enable-compose.sh prints this host's socket group in the up command and
-    # does not export it. Compose's default is 0, which can read the socket on
-    # Docker Desktop (root:root) and cannot on Linux (root:docker). The stack
-    # has to use the printed value, or the proxy never answers /_ping.
-    gid = re.search(r"VIGIL_MEDIC_DOCKER_GID=(\d+)", enable.stdout)
-    assert gid, enable.stdout
-    s.env["VIGIL_MEDIC_DOCKER_GID"] = gid.group(1)
+    # V1: enable-compose.sh writes Medic's settings to compose.env (the
+    # gateway's Viewer account, this host's socket group) and every compose
+    # command with Medic on passes it, as test_enable_live.py's stack does.
+    s.base[2:4] = ["--env-file", str(s.secrets_dir / "compose.env")]
     s.compose("down", "-v", "--remove-orphans", check=False)
+    s.compose("build", "medic", "medic-gateway", "medic-dockerproxy")
+    if os.uname().sysname == "Linux":
+        # What the full run does on Linux: each secret file is read by one
+        # service's user. Docker Desktop's file sharing needs none of it.
+        s.docker(
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--user",
+            "0:0",
+            "-v",
+            f"{s.secrets_dir}:/s",
+            "--entrypoint",
+            "sh",
+            "vigil-medic-gateway:local",
+            "-c",
+            "chown 10002:10002 /s/viewer_password && chown 10001:10001 /s/api_key",
+        )
     try:
         s.compose("up", "-d", "--no-build", *SERVICES)
         s.started = time.monotonic()
@@ -234,7 +257,10 @@ def backend_seen(s: Stack) -> list[dict]:
 
 
 def test_enable_prints_the_manual_step(healthy) -> None:
-    assert "Viewer" in healthy.enable_output
+    # V1: the full run makes the gateway's Viewer service account itself;
+    # --secrets-only says that is still to come. Either way the step left to
+    # the operator is the compose command.
+    assert "Viewer service account" in healthy.enable_output
     assert "--profile medic" in healthy.enable_output
 
 

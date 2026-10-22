@@ -51,6 +51,27 @@ class UpdateUserRequest(BaseModel):
     is_active: Optional[bool] = None
 
 
+# A service account (Medic's gateway, D2-17) is exempt from lockout, which is
+# safe only while it can read no more than a Viewer.
+SERVICE_ACCOUNT_ROLE_ID = "role-viewer"
+
+
+def _is_service_account(user: User) -> bool:
+    # Only an explicit True is one; a user object without the field is not.
+    try:
+        return user.service_account is True
+    except AttributeError:
+        return False
+
+
+def _refuse_service_account_role(user: User, role_id: str) -> None:
+    if _is_service_account(user) and role_id != SERVICE_ACCOUNT_ROLE_ID:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="A service account can only hold the Viewer role",
+        )
+
+
 def _can_assign_role(current_user: User, target_role: Role, session: Session) -> bool:
     """Return True only if current_user holds every permission granted by target_role.
 
@@ -299,6 +320,12 @@ def _apply_user_update(
         user.full_name = request.full_name
 
     if request.email is not None:
+        if _is_service_account(user):
+            # A reachable address is the first step to a password reset.
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="A service account's email can't be changed",
+            )
         existing = (
             session.query(User)
             .filter(User.email == request.email, User.user_id != user_id)
@@ -324,6 +351,7 @@ def _apply_user_update(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Cannot assign a role with more privileges than your own",
             )
+        _refuse_service_account_role(user, request.role_id)
         if request.role_id != user.role_id:
             stale_reason = stale_reason or "Role changed"
         user.role_id = request.role_id
