@@ -378,6 +378,44 @@ describe("an answer that fails its check goes back to the model, twice at most",
   });
 });
 
+describe("an answer that fails its schema goes back to the model like one that fails its check", () => {
+  const submit = (answer: unknown) => ({ calls: [{ tool: SUBMIT_TOOL, args: answer }] });
+  const good = { candidates: [cand("curl wrote /tmp/x", ["r1"]), cand("bash ran curl", ["r1"])], reasoning: "r" };
+  // The live failure: a key the schema does not know on the second candidate.
+  const stray = { candidates: [cand("curl wrote /tmp/x", ["r1"]), { ...cand("bash ran curl", ["r1"]), boundary: { source: "proxy" } }], reasoning: "r" };
+  const labels = (out: { submission: unknown }) => (out.submission as { candidates: { label: string }[] }).candidates.map((c) => c.label);
+  const fix = `Invalid submission: candidates.1: unrecognized key "boundary". Fix it and call ${SUBMIT_TOOL} again.`;
+
+  it("takes the fixed answer after one correction, with nothing salvaged", async () => {
+    const t = setup((_, n) => (n === 1 ? { calls: [{ tool: "splunk_query", args: SEARCH }] } : n === 2 ? submit(stray) : submit(good)), { [SEARCH.spl]: "3 events matched" });
+    const out = await t.client.runTurn(t.request());
+
+    expect(t.provider.requests).toHaveLength(3);
+    expect(t.provider.requests.some((r) => r.emit !== undefined)).toBe(false);
+    expect(labels(out)).toEqual(["curl wrote /tmp/x", "bash ran curl"]);
+    expect(t.trace.chronological().map((e) => e.type)).not.toContain("rejected-submission");
+    const calls = await t.calls();
+    expect(calls.map((c) => [c.ref, c.tool, c.ok, c.failure])).toEqual([["r1", "splunk_query", true, null], ["r2", SUBMIT_TOOL, false, "invalid_args"]]);
+    expect(calls[1]!.result).toContain(fix);
+    expect(out.toolCalls.map((c) => c.id)).toEqual(["r1"]);
+    expect(issued(t.tools, "r2")).toBe(false);
+  });
+
+  it("salvages the last answer as before once both corrections are spent", async () => {
+    const t = setup((request, n) => (n === 1 ? { calls: [{ tool: "splunk_query", args: SEARCH }] } : request.emit !== undefined ? { emit: stray } : submit(stray)), { [SEARCH.spl]: "3 events matched" });
+    const out = await t.client.runTurn(t.request());
+
+    // Two sent back, the third to the emission turn and its retry, as a schema-invalid submit always went.
+    expect(t.provider.requests.map((r) => r.emit !== undefined)).toEqual([false, false, false, false, true, true]);
+    expect((await t.calls()).map((c) => [c.ref, c.tool])).toEqual([["r1", "splunk_query"], ["r2", SUBMIT_TOOL], ["r3", SUBMIT_TOOL]]);
+    expect(labels(out)).toEqual(["curl wrote /tmp/x", "bash ran curl"]);
+    const note = t.trace.chronological().filter((e) => e.type === "rejected-submission").map((e) => e.payload as Record<string, string>);
+    expect(note).toHaveLength(1);
+    expect(note[0]!["repaired"]).toBe("stripped 1 unknown key(s)");
+    expect(out.failed).toBeUndefined();
+  });
+});
+
 describe("a turn's search cap counts searches, not rounds", () => {
   const search = (i: number) => ({ purpose: `search ${i}`, spl: `index=lab sourcetype=edr q=${i}` });
   const table = (n: number) => Object.fromEntries(Array.from({ length: n }, (_, i) => [search(i + 1).spl, `${i + 1} events matched`]));

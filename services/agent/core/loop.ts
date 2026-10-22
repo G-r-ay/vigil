@@ -93,6 +93,9 @@ export interface TurnConfig {
   // not count against max_turns. An answer that came by emission instead is checked once, with
   // no corrections. Absent, the schema is the only test, as before.
   check?: (answer: unknown) => string | null | Promise<string | null>;
+  // A submit that parsed but missed the schema is sent back the same way, with the schema's
+  // errors, and counts against the same corrections; once they are spent it goes to the
+  // emission turn as it always has. 0 sends nothing back.
   corrections?: number;
   // Asked once more when the model stops with turns left and fewer than min_results
   // results: keep going or say it is done. The ask is the next frame's transient tail.

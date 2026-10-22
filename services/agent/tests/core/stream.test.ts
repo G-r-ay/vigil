@@ -664,8 +664,9 @@ describe("the caller's check of a submitted answer", () => {
     expect(requests(harness).map((request) => request.force)).toEqual([undefined, undefined, SUBMIT_TOOL]);
   });
 
+  // A submit that missed the schema is corrected now too, so the emission is reached by a round that did not submit.
   it("holds an emitted answer to the check too, once", async () => {
-    const harness = harnessOf([submit("SHOUT"), { emit: { verb: "TALLY" } }]);
+    const harness = harnessOf([{ content: "nothing to submit" }, { emit: { verb: "TALLY" } }]);
     const outcome = await outcomeOf<{ verb: string }>(config({ check: halts, corrections: 2 }), harness);
 
     expect(requests(harness).at(-1)!.emit).toBeDefined();
@@ -681,6 +682,114 @@ describe("the caller's check of a submitted answer", () => {
 
     expect(requests(checked)).toEqual(requests(plain));
     expect({ ...passing, cost_usd: 0 }).toEqual({ ...without, cost_usd: 0 });
+  });
+});
+
+describe("a submit that misses the schema, with corrections", () => {
+  const submit = (verb: string): ScriptedTurn => ({ calls: [{ tool: SUBMIT_TOOL, args: JSON.stringify({ verb }) }] });
+  const extra = (verb: string, key: string): ScriptedTurn => ({ calls: [{ tool: SUBMIT_TOOL, args: JSON.stringify({ verb, [key]: 1 }) }] });
+  const requests = (harness: Harness) => (harness.provider as ScriptedProvider).requests;
+  const halts = (answer: unknown) => ((answer as { verb: string }).verb === "HALT" ? null : "the count is not done; HALT when it is");
+  const LOOSE = { type: "object", required: ["verb"], additionalProperties: false, properties: { verb: { type: "string", enum: ["TALLY", "HALT"] } } };
+  const told = (harness: Harness) => requests(harness).at(-1)!.messages.filter((message) => message.role === "tool").map((message) => message.content);
+
+  it("answers it with the schema's errors, and takes the fixed answer from the next round", async () => {
+    const harness = harnessOf([submit("SHOUT"), submit("HALT")]);
+    const outcome = await outcomeOf<{ verb: string }>(config({ corrections: 2 }), harness);
+
+    expect(outcome.status).toBe("completed");
+    expect(outcome.value).toEqual({ verb: "HALT" });
+    expect(requests(harness)).toHaveLength(2);
+    expect(requests(harness).some((request) => request.emit !== undefined)).toBe(false);
+    const [said, answered] = requests(harness)[1]!.messages.slice(-2);
+    expect(said).toMatchObject({ role: "assistant", tool_calls: [{ id: "c1-0", tool: SUBMIT_TOOL, args: '{"verb":"SHOUT"}' }] });
+    expect(answered).toMatchObject({ role: "tool", call_id: "c1-0" });
+    expect(answered!.content).toContain("failed: invalid_args -- Invalid submission: verb: must be equal to one of the allowed values: TALLY, HALT. Fix it and call submit_answer again.");
+    expect(outcome.calls.map((call) => [call.tool, call.result.ok])).toEqual([[SUBMIT_TOOL, false]]);
+    expect(outcome.rejected).toHaveLength(1);
+  });
+
+  it("names an unknown key by where it is and what it is called", async () => {
+    const harness = harnessOf([extra("HALT", "note"), submit("HALT")]);
+    const outcome = await outcomeOf<{ verb: string }>(config({ schema: LOOSE, corrections: 1 }), harness);
+
+    expect(outcome.value).toEqual({ verb: "HALT" });
+    expect(told(harness)[0]).toContain('Invalid submission: unrecognized key "note". Fix it and call submit_answer again.');
+  });
+
+  it("goes to the emission as it always has once the corrections are spent, with the last answer handed on", async () => {
+    const script = [submit("SHOUT"), submit("SHOUT"), submit("SHOUT"), { emit: { verb: "SHOUT" } }, { emit: { verb: "SHOUT" } }];
+    const harness = harnessOf(script);
+    const outcome = await outcomeOf<{ verb: string }>(config({ corrections: 2 }), harness);
+
+    expect(requests(harness).map((request) => request.emit !== undefined)).toEqual([false, false, false, true, true]);
+    expect(outcome.calls.map((call) => call.tool)).toEqual([SUBMIT_TOOL, SUBMIT_TOOL]);
+    expect(told(harness).filter((content) => content.includes("Invalid submission: verb: "))).toHaveLength(2);
+    // What a run with no corrections ends on, after the same failed submit.
+    const before = harnessOf(script.slice(2));
+    const today = await outcomeOf<{ verb: string }>(config(), before);
+    expect(today).toMatchObject({ status: "failed", value: null, emission_rejected: true, rejected_value: { verb: "SHOUT" } });
+    expect(outcome).toMatchObject({ status: today.status, value: today.value, emission_rejected: today.emission_rejected, rejected_value: today.rejected_value });
+    expect(outcome.check_failed).toBeUndefined();
+    // The emission turn is asked with what was wrong with the last submit, as it is with no corrections.
+    expect(requests(harness)[3]!.messages.at(-1)).toEqual(requests(before)[1]!.messages.at(-1));
+    expect(outcome.reason.startsWith("the role never emitted a valid answer: ")).toBe(true);
+  });
+
+  it("counts a schema failure and a check failure against the one budget", async () => {
+    const fixed = harnessOf([submit("SHOUT"), submit("TALLY"), submit("HALT")]);
+    const outcome = await outcomeOf<{ verb: string }>(config({ check: halts, corrections: 2 }), fixed);
+    expect(outcome.value).toEqual({ verb: "HALT" });
+    expect(outcome.calls).toHaveLength(2);
+    expect(told(fixed)).toEqual([expect.stringContaining("Invalid submission: verb: must be equal to one of the allowed values"), expect.stringContaining("Invalid submission: the count is not done; HALT when it is.")]);
+
+    const spent = harnessOf([submit("SHOUT"), submit("TALLY")]);
+    const short = await outcomeOf<{ verb: string }>(config({ check: halts, corrections: 1 }), spent);
+    expect(requests(spent)).toHaveLength(2);
+    expect(short).toMatchObject({ status: "failed", emission_rejected: true, rejected_value: { verb: "TALLY" }, check_failed: "the count is not done; HALT when it is" });
+    expect(short.reason).toBe("the answer failed its check after 1 correction(s): the count is not done; HALT when it is");
+
+    const checkFirst = harnessOf([submit("TALLY"), submit("SHOUT"), HALT]);
+    const late = await outcomeOf<{ verb: string }>(config({ check: halts, corrections: 1 }), checkFirst);
+    expect(requests(checkFirst).map((request) => request.emit !== undefined)).toEqual([false, false, true]);
+    expect(late.value).toEqual({ verb: "HALT" });
+  });
+
+  it("forces the correction when the failed answer came on the forced round", async () => {
+    const harness = harnessOf([submit("SHOUT"), submit("HALT")]);
+    const outcome = await outcomeOf<{ verb: string }>(config({ max_turns: 1, answer_within_cap: true, corrections: 1 }), harness);
+
+    expect(outcome.value).toEqual({ verb: "HALT" });
+    expect(requests(harness).map((request) => request.force)).toEqual([SUBMIT_TOOL, SUBMIT_TOOL]);
+  });
+
+  it("sends back no submit that did not parse: that goes to the emission as before", async () => {
+    const harness = harnessOf([{ calls: [{ tool: SUBMIT_TOOL, args: '{"verb": "HA' }] }, HALT]);
+    const outcome = await outcomeOf<{ verb: string }>(config({ corrections: 2 }), harness);
+
+    expect(requests(harness).map((request) => request.emit !== undefined)).toEqual([false, true]);
+    expect(outcome.value).toEqual({ verb: "HALT" });
+    expect(outcome.calls).toEqual([]);
+  });
+
+  // Without corrections nothing is sent back, with a check or without one: the run is the one it was.
+  it("changes nothing with corrections unset or 0", async () => {
+    const scripts: ScriptedTurn[][] = [
+      [submit("SHOUT"), HALT],
+      [submit("SHOUT"), { emit: { verb: "SHOUT" } }, { emit: { verb: "SHOUT" } }],
+      [{ calls: [{ tool: "bump", args: "{}" }] }, extra("HALT", "note"), HALT],
+    ];
+    for (const script of scripts) {
+      const plain = harnessOf(script);
+      const without = await outcomeOf(config({ schema: LOOSE }), plain);
+      for (const over of [{ corrections: 0 }, { check: () => null }, { check: () => null, corrections: 0 }]) {
+        const other = harnessOf(script);
+        const outcome = await outcomeOf(config({ schema: LOOSE, ...over }), other);
+        expect(requests(other)).toEqual(requests(plain));
+        expect({ ...outcome, cost_usd: 0 }).toEqual({ ...without, cost_usd: 0 });
+      }
+      expect(without.calls.filter((call) => call.tool === SUBMIT_TOOL)).toEqual([]);
+    }
   });
 });
 
