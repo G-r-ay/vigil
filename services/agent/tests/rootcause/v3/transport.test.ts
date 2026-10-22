@@ -1,13 +1,14 @@
-// A move is one kernel turn: its role, its schema, its searches as calls on the run's ledger, its answer checked once.
+// A move is one kernel turn: its role, its schema, its searches as calls on the run's ledger, its answer checked and sent back to fix.
 import { describe, expect, it } from "vitest";
 import type { CallPayload } from "../../../contracts/events.js";
 import { InProcessState } from "../../../core/state.js";
 import { loadPlugin } from "../../../plugins/index.js";
 import { defaultConfig } from "../../../plugins/rootcause/v3/config.js";
 import type { V3Kinds } from "../../../plugins/rootcause/v3/ledger.js";
-import { KernelModelClient, KernelTurns, Refused, type TurnRequest } from "../../../plugins/rootcause/v3/model/client.js";
+import { CORRECTIONS, KernelModelClient, KernelTurns, Refused, type TurnRequest } from "../../../plugins/rootcause/v3/model/client.js";
 import { constraints, instructions, SYSTEM_PROMPT } from "../../../plugins/rootcause/v3/model/prompts.js";
-import { issued, neverRan, Registry, type EvidenceTool } from "../../../plugins/rootcause/v3/tools/registry.js";
+import { correction, issued, neverRan, Registry, type EvidenceTool } from "../../../plugins/rootcause/v3/tools/registry.js";
+import { rootCauseV3Projection } from "../../../plugins/rootcause/v3/projection.js";
 import { MemoryTrace } from "../../../plugins/rootcause/v3/trace.js";
 import { toolsFrom } from "../../../tools/remote.js";
 import { SUBMIT_TOOL } from "../../../core/stream.js";
@@ -298,6 +299,82 @@ describe("a move as a kernel turn", () => {
     const spec = specOf({ budgets: { max_calls: 0, max_cost_usd: 10, max_wall_ms: 600_000, max_park_ms: 60_000 } });
     const t = setup(() => ({}), {}, spec);
     await expect(t.client.runTurn(t.request())).rejects.toBeInstanceOf(Refused);
+  });
+});
+
+describe("an answer that fails its check goes back to the model, twice at most", () => {
+  const submit = (answer: unknown) => ({ calls: [{ tool: SUBMIT_TOOL, args: answer }] });
+  const good = { candidates: [cand("curl wrote /tmp/x", ["r1"])], reasoning: "r" };
+  const bad = { candidates: [cand("curl wrote /tmp/x", ["r1"]), cand("ghost event", ["r9"])], reasoning: "r" };
+  const labels = (out: { submission: unknown }) => (out.submission as { candidates: { label: string }[] }).candidates.map((c) => c.label);
+  const kinds = (t: ReturnType<typeof setup>) => t.trace.chronological().map((e) => e.type);
+
+  it("takes the fixed answer after one correction, with nothing salvaged, and the correction is no search", async () => {
+    const t = setup((_, n) => (n === 1 ? { calls: [{ tool: "splunk_query", args: SEARCH }] } : n === 2 ? submit(bad) : submit(good)), { [SEARCH.spl]: "3 events matched\ncurl wrote /tmp/x" });
+    const out = await t.client.runTurn(t.request());
+
+    expect(CORRECTIONS).toBe(2);
+    expect(t.provider.requests).toHaveLength(3);
+    // The answer citing this move's own search r1 passes the check inside the turn.
+    expect(labels(out)).toEqual(["curl wrote /tmp/x"]);
+    expect(kinds(t)).not.toContain("rejected-submission");
+    // On the ledger: the search, then the answer sent back, under the move's role.
+    const calls = await t.calls();
+    expect(calls.map((c) => [c.ref, c.tool, c.ok, c.failure, c.role])).toEqual([["r1", "splunk_query", true, null, "expand"], ["r2", SUBMIT_TOOL, false, "invalid_args", "expand"]]);
+    expect(calls[1]!.result).toContain(`Invalid submission: toolCallIds never issued in this run: r9.`);
+    expect(t.provider.requests[2]!.messages.filter((m) => m.role === "tool").at(-1)!.content).toContain(`Fix it and call ${SUBMIT_TOOL} again.`);
+    // Not a search: not returned, not traced, not citable, not coverage, not in the projection; it keeps its number.
+    expect(out.toolCalls.map((c) => c.id)).toEqual(["r1"]);
+    expect(t.trace.chronological().filter((e) => e.type === "query").map((e) => (e.payload as { toolCallId: string }).toolCallId)).toEqual(["r1"]);
+    expect(correction(calls[1]!)).toBe(true);
+    expect(issued(t.tools, "r2")).toBe(false);
+    expect(t.tools.callCount).toBe(2);
+    expect(t.tools.coverage).toEqual({ edr: 1 });
+    expect(rootCauseV3Projection("r1", (await t.state.read("r1")) as never).searches).toBe(1);
+  });
+
+  it("salvages the last answer after two corrections", async () => {
+    const t = setup((_, n) => (n === 1 ? { calls: [{ tool: "splunk_query", args: SEARCH }] } : submit(bad)), { [SEARCH.spl]: "3 events matched" });
+    const out = await t.client.runTurn(t.request());
+
+    expect(t.provider.requests).toHaveLength(4);
+    const calls = await t.calls();
+    expect(calls.map((c) => [c.ref, c.tool, c.failure])).toEqual([["r1", "splunk_query", null], ["r2", SUBMIT_TOOL, "invalid_args"], ["r3", SUBMIT_TOOL, "invalid_args"]]);
+    expect(labels(out)).toEqual(["curl wrote /tmp/x"]);
+    const note = t.trace.chronological().filter((e) => e.type === "rejected-submission").map((e) => e.payload as Record<string, string>);
+    expect(note).toHaveLength(1);
+    expect(note[0]!["salvaged"]).toBe("kept the rest, dropped 1 item(s)");
+    expect(out.toolCalls.map((c) => c.id)).toEqual(["r1"]);
+    expect(out.failed).toBeUndefined();
+  });
+
+  it("spends none of the move's searches: both run, and the next ref follows the correction's", async () => {
+    const two = { purpose: "the parent", spl: "index=lab sourcetype=edr host=ws-7 parent" };
+    const t = setup(
+      (request, n) => (request.force === SUBMIT_TOOL ? { emit: { candidates: [cand("curl wrote /tmp/x", ["r1", "r3"])], reasoning: "r" } } : n === 1 ? { calls: [{ tool: "splunk_query", args: SEARCH }] } : n === 2 ? submit(bad) : { calls: [{ tool: "splunk_query", args: two }] }),
+      { [SEARCH.spl]: "3 events matched", [two.spl]: "1 event matched" },
+    );
+    const out = await t.client.runTurn(t.request({ maxSearches: 2 }));
+
+    expect(t.provider.requests.map((r) => r.force)).toEqual([undefined, undefined, undefined, SUBMIT_TOOL]);
+    const calls = await t.calls();
+    expect(calls.map((c) => [c.ref, c.tool, c.ok])).toEqual([["r1", "splunk_query", true], ["r2", SUBMIT_TOOL, false], ["r3", "splunk_query", true]]);
+    expect(calls.filter((c) => neverRan(c))).toEqual([]);
+    expect(out.toolCalls.map((c) => [c.id, c.text])).toEqual([["r1", "3 events matched"], ["r3", "1 event matched"]]);
+    expect(labels(out)).toEqual(["curl wrote /tmp/x"]);
+    expect(["r1", "r2", "r3"].map((id) => issued(t.tools, id))).toEqual([true, false, true]);
+    // A search the code makes next takes r4, not the correction's number.
+    expect((await t.tools.call("splunk_query", SEARCH, { allowedDomains: ["edr"], allDomains: ["edr"], timeoutMs: 1000, range })).toolCallId).toBe("r4");
+  });
+
+  it("corrects a move with no searches too", async () => {
+    const fixed = { evidence: [{ summary: "s", strength: "direct", polarity: "supports", toolCallIds: [] }], reasoning: "r" };
+    const t = setup((_, n) => ({ emit: n === 1 ? { evidence: [{ ...fixed.evidence[0], toolCallIds: ["r9"] }], reasoning: "r" } : fixed }));
+    const out = await t.client.runTurn(t.request({ move: "strengthen", submitTool: "submit_assessment", maxSearches: 0 }));
+    expect(t.provider.requests.map((r) => r.force)).toEqual([SUBMIT_TOOL, SUBMIT_TOOL]);
+    expect((await t.calls()).map((c) => [c.ref, c.tool])).toEqual([["r1", SUBMIT_TOOL]]);
+    expect(out.submission).toEqual(fixed);
+    expect(out.toolCalls).toEqual([]);
   });
 });
 

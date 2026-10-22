@@ -1,7 +1,8 @@
 // Model calls (spec §5.2). A move is one kernel turn: the model may search up to the move's cap
 // (maxToolCallsPerTurn, counted in searches, not rounds) through the evidence tool, which refuses any search past it,
 // then emits the move's submission against its schema. The kernel journals every search as a `call` event
-// with a ref, bills the model, delimits the results and resumes; what is left here is the move's own check, once.
+// with a ref, bills the model, delimits the results and resumes. The move's own check runs inside the turn: an
+// answer that fails it goes back to the model to fix, twice at most, and then what is sound in it is salvaged.
 import { runSubturn, type PluginContext, type PluginHooks, type Subturn, type AgentKinds, type AgentOptions } from "../../../../core/agent.js";
 import { schemaErrors, schemaIssues, SUBMIT_TOOL } from "../../../../core/stream.js";
 import type { CallPayload, RunKind } from "../../../../contracts/events.js";
@@ -11,7 +12,7 @@ import type { PluginManifest } from "../../../../contracts/plugin.js";
 import type { RunSpec } from "../../../../core/spec.js";
 import type { AgentConfig } from "../config.js";
 import type { Move } from "../frontier.js";
-import { issued, neverRan, type EvidenceTool, type Registry, type ToolRegistry } from "../tools/registry.js";
+import { correction, issued, neverRan, type EvidenceTool, type Registry, type ToolRegistry } from "../tools/registry.js";
 import type { TurnTrace } from "../trace.js";
 import type { Domain } from "../types.js";
 import { lengthLimits, SUBMIT, SUBMIT_DESCRIPTIONS, type SubmitName } from "./schemas.js";
@@ -86,8 +87,8 @@ function schemaProblem(name: SubmitName, value: unknown): { msg: string; drop: P
 }
 
 // The kernel's ajv has held the emission to the schema already; this clips it, then checks citations and the rest.
-// Every toolCallId must be a search the run journaled. A failure is not sent back to the model: salvage keeps what
-// is sound and the move's attempt is spent.
+// Every toolCallId must be a search the run journaled. A failure goes back to the model to fix (CORRECTIONS times);
+// after that, salvage keeps what is sound and the move's attempt is spent.
 type Cand = { label: string; baseline?: { unusual: boolean; toolCallIds: string[] } };
 // No "recon": it names resources too ("recon job"), and refusing on it lost a correct finding.
 export const ACCUSE = /\b(attacker|attacker's|malicious|adversary|threat actor|stolen|compromised|hijacked|backdoor|exfiltrat\w*|intruder|rogue|abus\w*|tamper\w*)\b/i;
@@ -264,6 +265,9 @@ const wire = (name: SubmitName): Record<string, unknown> => {
 
 const argsOf = (raw: string): unknown => { try { return JSON.parse(raw); } catch { return {}; } };
 
+// How many times an answer that fails its check goes back to the model before it is salvaged: every move's.
+export const CORRECTIONS = 2;
+
 export class KernelModelClient implements ModelClient {
   private system: string[];
   private cur: TurnRequest | undefined;
@@ -272,6 +276,9 @@ export class KernelModelClient implements ModelClient {
   // The searches this move has run, and how many of them the model's current response asked for.
   private searched = 0;
   private batch = { round: -1, n: 0 };
+  // The move's calls the registry has noted so far, in ledger order, and how many of `answered` they matched.
+  private seen: { call: CallPayload; input: unknown; text: string }[] = [];
+  private matched = 0;
 
   constructor(private d: ClientDeps & { tools: Registry }, private turns: KernelTurns) {
     this.system = [SYSTEM_PROMPT, d.survey];
@@ -325,6 +332,9 @@ export class KernelModelClient implements ModelClient {
     this.answered = [];
     this.searched = 0;
     this.batch = { round: -1, n: 0 };
+    this.seen = [];
+    this.matched = 0;
+    const cx: CheckCtx = { inputOf: tools.inputOf?.bind(tools), range: this.d.range };
     let outcome: Outcome<unknown> | undefined;
     let failure: unknown;
     try {
@@ -338,6 +348,14 @@ export class KernelModelClient implements ModelClient {
         // per search at most, and the answer's.
         max_turns: searches + 1,
         cite: true,
+        // Held to the move's check over what the move has searched so far; a failed answer is answered with what
+        // is wrong and the model goes again. An answer kept to the end is checked once more below.
+        check: async (answer) => {
+          await this.sync(before);
+          const v = check(req.submitTool, answer, tools, cx);
+          return v.success ? null : v.msg;
+        },
+        corrections: CORRECTIONS,
       });
     } catch (error) {
       failure = error;
@@ -349,9 +367,9 @@ export class KernelModelClient implements ModelClient {
     if (failure !== undefined) throw failure;
     if (outcome!.refusal !== null) throw new Refused(outcome!.reason);
 
-    // The emitted value is checked once: what is sound is kept, what is not is dropped, and a turn with no
-    // valid submission is one attempt on its target.
-    // An emission the kernel rejected twice is salvaged too, when it parsed: what in it is sound is kept.
+    // The answer the turn ended on is checked: what is sound is kept, what is not is dropped, and a turn with no
+    // valid submission is one attempt on its target. One the check still failed after the corrections, and an
+    // emission the kernel rejected twice, are salvaged when they parsed: what in them is sound is kept.
     let submission: unknown = null;
     // A provider failure is not an answer the model got wrong: it is told apart on the ledger and in the result.
     const failed = outcome!.status === "failed" && outcome!.emission_rejected !== true ? outcome!.reason : undefined;
@@ -359,7 +377,6 @@ export class KernelModelClient implements ModelClient {
     if (failed !== undefined) req.trace.write("provider-failure", { reason: failed });
     else if (kept === undefined || kept === null || typeof kept !== "object") req.trace.write("rejected-submission", { reason: outcome!.reason });
     else {
-      const cx: CheckCtx = { inputOf: tools.inputOf?.bind(tools), range: this.d.range };
       const bad = outcome!.value === null ? schemaProblem(req.submitTool, clip(kept)) : null;
       const v: CheckResult = bad ? { success: false, ...bad } : check(req.submitTool, kept, tools, cx);
       if (v.success) submission = v.data;
@@ -373,17 +390,31 @@ export class KernelModelClient implements ModelClient {
     return { submission, toolCalls, ...(failed !== undefined ? { failed } : {}) };
   }
 
-  // The move's searches as the ledger holds them: citable from here on, and traced for the report.
-  private async settle(req: TurnRequest, before: number): Promise<ToolCallOut[]> {
-    const out: ToolCallOut[] = [];
-    let at = 0;
-    for (const call of (await this.turns.calls()).slice(before)) {
+  // The move's calls on the ledger since the last look, noted in the registry: a search citable from here on, one
+  // that never ran or a correction numbered but not evidence. The check reads them mid-move, settle after it.
+  private async sync(before: number): Promise<void> {
+    for (const call of (await this.turns.calls()).slice(before + this.seen.length)) {
       const input = argsOf(call.arguments);
+      if (correction(call)) {
+        this.d.tools.note(call.ref, input, "", false);
+        this.seen.push({ call, input, text: call.result });
+        continue;
+      }
       // The kernel journals a search refused before the tool ran too (by the kernel or past the cap), which the tool
       // never answered.
-      const mine = !neverRan(call) && this.answered[at]?.key === JSON.stringify(input) ? this.answered[at++] : undefined;
-      const text = mine?.output ?? call.result;
+      const mine = !neverRan(call) && this.answered[this.matched]?.key === JSON.stringify(input) ? this.answered[this.matched++] : undefined;
       this.d.tools.note(call.ref, input, mine?.ok ? mine.output : "", !neverRan(call));
+      this.seen.push({ call, input, text: mine?.output ?? call.result });
+    }
+  }
+
+  // The move's searches as the ledger holds them: citable from here on, and traced for the report. An answer sent
+  // back to fix is no search: it is not traced, returned or cited.
+  private async settle(req: TurnRequest, before: number): Promise<ToolCallOut[]> {
+    await this.sync(before);
+    const out: ToolCallOut[] = [];
+    for (const { call, input, text } of this.seen) {
+      if (correction(call)) continue;
       req.trace.write("query", { toolCallId: call.ref, tool: call.tool, input });
       const traceId = req.trace.write("tool-output", { toolCallId: call.ref, ok: call.ok, output: text });
       out.push({ id: call.ref, tool: call.tool, input, ok: call.ok, traceId, text });
