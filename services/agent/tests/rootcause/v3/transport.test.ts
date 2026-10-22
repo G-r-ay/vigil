@@ -82,9 +82,11 @@ describe("a move as a kernel turn", () => {
     expect(t.tools.outputOf("r1")).toBe("3 events matched\ncurl wrote /tmp/x");
     expect(t.trace.chronological().filter((e) => e.type === "query").map((e) => (e.payload as { toolCallId: string }).toolCallId)).toEqual(["r1"]);
 
-    // The emitted value is checked once: the item citing a ref the kernel never journaled is dropped, the rest kept.
-    expect((out.submission as { candidates: { label: string }[] }).candidates.map((c) => c.label)).toEqual(["curl wrote /tmp/x"]);
-    expect(t.trace.chronological().some((e) => e.type === "rejected-submission" && JSON.stringify(e.payload).includes("r9"))).toBe(true);
+    // The emitted value is checked once: a ref the kernel never journaled fails the answer whole, as the reference.
+    expect(out.submission).toBeNull();
+    const rejected = t.trace.chronological().filter((e) => e.type === "rejected-submission");
+    expect(rejected.some((e) => JSON.stringify(e.payload).includes("r9"))).toBe(true);
+    expect(rejected.some((e) => "salvaged" in (e.payload as object))).toBe(false);
   });
 
   // The reference's two settings for Claude: the conversation cached to its last message, and thinking on open rounds.
@@ -159,15 +161,23 @@ describe("a move as a kernel turn", () => {
     const withArtifacts = (label: string, artifacts: unknown[]) => ({ ...cand(label, []), artifacts });
     const salvaged = (t: ReturnType<typeof setup>) => t.trace.chronological().some((e) => e.type === "rejected-submission" && /dropped 1 item/.test(JSON.stringify(e.payload)));
 
-    it("keeps the sound candidates and drops the artifact that missed the enum, nested inside a candidate", async () => {
+    it("drops the whole candidate holding an artifact that missed the enum, as the reference, and keeps the others", async () => {
       const bad = { candidates: [withArtifacts("good", [art("email-address")]), withArtifacts("has a bad artifact", [art("host"), art("email-sender")]), cand("also good", [])], reasoning: "r" };
       const t = setup((request) => (request.emit !== undefined ? { emit: bad } : { content: "done" }));
       const out = await t.client.runTurn(t.request());
 
       expect(t.provider.requests.filter((r) => r.emit !== undefined)).toHaveLength(2);
       const got = (out.submission as { candidates: { label: string; artifacts: unknown[] }[] }).candidates;
-      expect(got.map((c) => c.label)).toEqual(["good", "has a bad artifact", "also good"]);
-      expect(got[1]!.artifacts).toEqual([art("host")]);
+      expect(got.map((c) => c.label)).toEqual(["good", "also good"]);
+      expect(salvaged(t)).toBe(true);
+    });
+
+    it("drops the whole candidate holding one bad identity signal, and keeps the others", async () => {
+      const signal = (layer: string) => ({ layer, kind: "account", value: "svc", toolCallIds: [] });
+      const bad = { candidates: [cand("good", []), { ...cand("has a bad signal", []), identitySignals: [signal("machine-facing"), signal("both")] }], reasoning: "r" };
+      const t = setup((request) => (request.emit !== undefined ? { emit: bad } : { content: "done" }));
+      const out = await t.client.runTurn(t.request());
+      expect((out.submission as { candidates: { label: string }[] }).candidates.map((c) => c.label)).toEqual(["good"]);
       expect(salvaged(t)).toBe(true);
     });
 
@@ -231,12 +241,12 @@ describe("a move as a kernel turn", () => {
       });
 
       it("is lifted only from a candidate the check keeps, and only the dropped candidate is counted", async () => {
-        const lost = await emit({ candidates: [{ ...cand("cites a search never run", ["r9"]), boundary }, { ...cand("kept", []), notes: "x" }], reasoning: "r" });
+        const lost = await emit({ candidates: [{ ...cand("token minted outside captured telemetry", []), boundary }, { ...cand("kept", []), notes: "x" }], reasoning: "r" });
         expect(lost.got!.candidates.map((c) => c.label)).toEqual(["kept"]);
         expect(lost.got).not.toHaveProperty("boundary");
         expect(lost.note!["salvaged"]).toBe("kept the rest, dropped 1 item(s)");
         expect(lost.note!["repaired"]).toBe("stripped 2 unknown key(s)");
-        const kept = await emit({ candidates: [cand("cites a search never run", ["r9"]), { ...cand("kept", []), boundary }], reasoning: "r" });
+        const kept = await emit({ candidates: [cand("token minted outside captured telemetry", []), { ...cand("kept", []), boundary }], reasoning: "r" });
         expect(kept.got!.candidates).toEqual([cand("kept", [])]);
         expect(kept.got!.boundary).toEqual(boundary);
         expect(kept.note!["salvaged"]).toBe("kept the rest, dropped 1 item(s)");
@@ -246,6 +256,12 @@ describe("a move as a kernel turn", () => {
       it("does not fill a missing required field from an item: the submission still fails", async () => {
         const ev = [{ summary: "s", strength: "direct", polarity: "supports", toolCallIds: [] }];
         expect((await emit({ causes: [{ ...cand("upstream", []), evidence: ev }], reasoning: "r" }, "submit_assessment")).got).toBeNull();
+      });
+
+      it("does not save a submission citing a search never run, however sound the rest", async () => {
+        const { got, note } = await emit({ candidates: [cand("cites a search never run", ["r9"]), { ...cand("kept", []), notes: "x" }], reasoning: "r" });
+        expect(got).toBeNull();
+        expect(note).not.toHaveProperty("salvaged");
       });
 
       it("is dropped, not lifted, when the submission has no such field (entry points carry no boundary)", async () => {
@@ -348,7 +364,8 @@ describe("an answer that fails its check goes back to the model, twice at most",
   });
 
   it("salvages the last answer after two corrections", async () => {
-    const t = setup((_, n) => (n === 1 ? { calls: [{ tool: "splunk_query", args: SEARCH }] } : submit(bad)), { [SEARCH.spl]: "3 events matched" });
+    const unseen = { candidates: [cand("curl wrote /tmp/x", ["r1"]), cand("token minted outside captured telemetry", ["r1"])], reasoning: "r" };
+    const t = setup((_, n) => (n === 1 ? { calls: [{ tool: "splunk_query", args: SEARCH }] } : submit(unseen)), { [SEARCH.spl]: "3 events matched" });
     const out = await t.client.runTurn(t.request());
 
     expect(t.provider.requests).toHaveLength(4);
@@ -360,6 +377,16 @@ describe("an answer that fails its check goes back to the model, twice at most",
     expect(note[0]!["salvaged"]).toBe("kept the rest, dropped 1 item(s)");
     expect(out.toolCalls.map((c) => c.id)).toEqual(["r1"]);
     expect(out.failed).toBeUndefined();
+  });
+
+  it("salvages nothing after two corrections when the answer cites a search never run", async () => {
+    const t = setup((_, n) => (n === 1 ? { calls: [{ tool: "splunk_query", args: SEARCH }] } : submit(bad)), { [SEARCH.spl]: "3 events matched" });
+    const out = await t.client.runTurn(t.request());
+    expect(out.submission).toBeNull();
+    const note = t.trace.chronological().filter((e) => e.type === "rejected-submission").map((e) => e.payload as Record<string, string>);
+    expect(note).toHaveLength(1);
+    expect(note[0]!["error"]).toContain("toolCallIds never issued in this run: r9.");
+    expect(note[0]).not.toHaveProperty("salvaged");
   });
 
   it("spends none of the move's searches: both run, and the next ref follows the correction's", async () => {

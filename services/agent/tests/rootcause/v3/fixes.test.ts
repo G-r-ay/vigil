@@ -342,13 +342,15 @@ describe("baselines are checked, not taken on the model's word", () => {
       expect(e.baseline).toBeUndefined();
     }
   });
-  it("drops an item citing a ref the run never issued, and keeps the rest", async () => {
+  it("fails the whole submission on a ref the run never issued, and salvage keeps nothing, as the reference", async () => {
     const { salvage } = await import("../../../plugins/rootcause/v3/model/client.js");
     const two = sub({ ...cand(["r1"]), label: "second" });
     const input = { effects: [cand(["r1"]), { ...cand(["r9"]), label: "second" }, two.effects[0]], reasoning: "r" };
     const first = check("submit_effects", input, 3, cx);
-    expect(first).toMatchObject({ success: false, drop: [["effects", 1]] });
-    expect(salvage("submit_effects", input, 3, cx, first)).toMatchObject({ dropped: 1, data: { effects: [{ label: "register_self_hosted_runner by dev-a" }, { label: "second" }] } });
+    expect(first).toMatchObject({ success: false, drop: [] });
+    expect(salvage("submit_effects", input, 3, cx, first)).toBeNull();
+    const nested = { effects: [cand(["r1"]), { ...cand(["r1"]), nodeEvidence: [{ summary: "s", strength: "direct", polarity: "supports", toolCallIds: ["r1", "r9"] }] }], reasoning: "r" };
+    expect(salvage("submit_effects", nested, 3, cx, check("submit_effects", nested, 3, cx))).toBeNull();
   });
 });
 
