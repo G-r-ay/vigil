@@ -66,6 +66,23 @@ describe("a subturn's check", () => {
     expect(replayed.reproduced).toBe(3);
   });
 
+  it("sends back a submit that missed the schema with corrections and no check, journaled the same way", async () => {
+    const { state, ctx } = contextOf([{ calls: [{ tool: "bump", args: "{}" }] }, submit("SHOUT"), submit("HALT")]);
+    const outcome = await runSubturn<{ verb: string }>(ctx, step({ corrections: 2 }));
+
+    expect(outcome.value).toEqual({ verb: "HALT" });
+    const events = await state.read(RUN);
+    const calls = events.filter((one) => one.kind === "call").map((one) => one.payload as CallPayload);
+    expect(calls.map((call) => [call.ref, call.turn, call.tool, call.ok, call.failure])).toEqual([
+      ["r1", 1, "bump", true, null],
+      ["r2", 2, SUBMIT_TOOL, false, "invalid_args"],
+    ]);
+    expect(calls[1]!.result).toContain("Invalid submission: verb: must be equal to one of the allowed values: TALLY, HALT. Fix it and call submit_answer again.");
+    const replayed = replayFrames(events);
+    expect(replayed.frames.filter((one) => one.mismatch !== null)).toEqual([]);
+    expect(replayed.reproduced).toBe(3);
+  });
+
   it("journals nothing new for a step with no check", async () => {
     const script = [{ calls: [{ tool: "bump", args: "{}" }] }, submit("TALLY")];
     const plain = contextOf(script);

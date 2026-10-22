@@ -2,7 +2,7 @@
 // (maxToolCallsPerTurn, counted in searches, not rounds) through the evidence tool, which refuses any search past it,
 // then emits the move's submission against its schema. The kernel journals every search as a `call` event
 // with a ref, bills the model, delimits the results and resumes. The move's own check runs inside the turn: an
-// answer that fails it goes back to the model to fix, twice at most, and then what is sound in it is salvaged.
+// answer that fails it or the schema goes back to the model to fix, twice at most, and then what is sound in it is salvaged.
 import { runSubturn, type PluginContext, type PluginHooks, type Subturn, type AgentKinds, type AgentOptions } from "../../../../core/agent.js";
 import { schemaErrors, schemaIssues, SUBMIT_TOOL } from "../../../../core/stream.js";
 import type { CallPayload, RunKind } from "../../../../contracts/events.js";
@@ -265,7 +265,7 @@ const wire = (name: SubmitName): Record<string, unknown> => {
 
 const argsOf = (raw: string): unknown => { try { return JSON.parse(raw); } catch { return {}; } };
 
-// How many times an answer that fails its check goes back to the model before it is salvaged: every move's.
+// How many times an answer that fails its check or its schema goes back to the model before it is salvaged: every move's.
 export const CORRECTIONS = 2;
 
 export class KernelModelClient implements ModelClient {

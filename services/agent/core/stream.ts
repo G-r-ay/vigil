@@ -325,29 +325,42 @@ class Run<T, Kinds extends Record<string, unknown>> {
     return null;
   }
 
-  // The submit call as the answer when it holds to the schema. When it does not, the
-  // emission turn is asked with what was wrong, as it would be of an emission. One that holds
-  // to it but fails the caller's check is answered with what the check said, while corrections
-  // last, and the model goes another round (AGAIN): the failed call and that answer are on the
-  // transcript and the ledger like any refused call, so a replay rebuilds the next round.
+  // The submit call as the answer when it holds to the schema and the caller's check. One that
+  // fails either is answered with what is wrong, while corrections last, and the model goes
+  // another round (AGAIN): the failed call and that answer are on the transcript and the ledger
+  // like any refused call, so a replay rebuilds the next round. Schema and check draw on the one
+  // budget. Once it is spent, one that fails the check is handed on as failed, and one that misses
+  // the schema (or never parsed, which is not sent back) asks the emission turn with what was
+  // wrong, as it would of an emission.
   private async *accepted(call: ToolCall, said: string): AsyncGenerator<StreamEvent<T>, Outcome<T> | null | typeof AGAIN> {
     const schema = this.cfg.schema!;
     const validate = compile(schema);
     const parsed = tryParse(call.args === "" ? "{}" : call.args);
+    const budget = this.cfg.corrections ?? 0;
     if (parsed !== undefined && validate(parsed)) {
       const failed = await this.failedCheck(parsed);
       if (failed === null) return this.done("completed", parsed as T, "the role answered");
-      if (this.corrected >= (this.cfg.corrections ?? 0)) return this.uncorrected(parsed, failed);
-      this.corrected += 1;
+      if (this.corrected >= budget) return this.uncorrected(parsed, failed);
       this.rejected.push(`the answer failed its check: ${failed}`);
-      this.transcript.push({ role: "assistant", content: said, tool_calls: [call] });
-      yield* this.record(call, { ok: false, failure: { kind: "invalid_args", detail: `Invalid submission: ${failed}. Fix it and call ${SUBMIT_TOOL} again.` } });
+      yield* this.sentBack(call, said, failed);
       return AGAIN;
     }
     const reason = parsed === undefined ? "the response was not valid JSON" : errorsOf(validate);
+    const issues = parsed === undefined ? reason : issuesOf(validate);
     this.rejected.push(`${reason}: ${call.args.slice(0, 400)}`);
+    if (parsed !== undefined && this.corrected < budget) {
+      yield* this.sentBack(call, said, issues);
+      return AGAIN;
+    }
     this.refusedSubmit = { content: call.args, parsed, reason };
     return null;
+  }
+
+  // A submit answered with what is wrong with it, as one correction.
+  private async *sentBack(call: ToolCall, said: string, wrong: string): AsyncGenerator<StreamEvent<T>, void> {
+    this.corrected += 1;
+    this.transcript.push({ role: "assistant", content: said, tool_calls: [call] });
+    yield* this.record(call, { ok: false, failure: { kind: "invalid_args", detail: `Invalid submission: ${wrong}. Fix it and call ${SUBMIT_TOOL} again.` } });
   }
 
   // What the caller's check says is wrong with an answer that met the schema; null when it
@@ -924,6 +937,20 @@ export function schemaErrors(schema: Record<string, unknown>, value: unknown): s
 export function schemaIssues(schema: Record<string, unknown>, value: unknown): ErrorObject[] {
   const validate = compile(schema);
   return validate(value) ? [] : [...(validate.errors ?? [])];
+}
+
+// The same errors as a submit sent back to fix is told them: a dotted path, then what is wrong
+// there, as the reference's own schema issues read ("candidates.1: unrecognized key \"boundary\"").
+function issuesOf(validate: ValidateFunction): string {
+  return (validate.errors ?? []).map((error) => {
+    const at = error.instancePath.split("/").slice(1).join(".");
+    const params = error.params as { additionalProperty?: string; allowedValues?: unknown[] };
+    const what =
+      error.keyword === "additionalProperties" ? `unrecognized key "${params.additionalProperty ?? ""}"`
+      : error.keyword === "enum" ? `${error.message ?? ""}: ${(params.allowedValues ?? []).join(", ")}`
+      : error.message ?? "";
+    return at === "" ? what : `${at}: ${what}`;
+  }).join("; ");
 }
 
 // An enum error names the values it would take, or the model is asked to correct a field blind.
