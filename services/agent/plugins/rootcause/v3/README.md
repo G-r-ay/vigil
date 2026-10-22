@@ -26,10 +26,12 @@ How a run goes (`engine.ts`):
   journals the search as a `call` event with it; the model cites refs. The registry keeps
   what each ref ran and returned for the baseline checks. A search the code makes itself
   (the rare sweep, a story's sweep, a presence lookup) takes the next ref and is journaled the same way.
-- A move's answer is checked once, in `check()`: an accusing label with no baseline is
+- A move's answer is held to `check()` inside the turn: an accusing label with no baseline is
   tagged unverified, a link with no shared value is kept as inferred, and an item citing a
-  ref the ledger never journaled is dropped. A turn with no valid answer is one attempt
-  on its target. Nothing is asked again.
+  ref the ledger never journaled fails it. A failed answer goes back to the model to fix,
+  twice at most (each time a `submit_answer` call on the ledger, numbered but no search);
+  then salvage drops the items the failure rests on and keeps the rest. A turn with no
+  valid answer is one attempt on its target.
 - `ledger.ts` journals `rootcause_setup`, `rootcause_turn` (the turn's trace entries, its
   graph patch among them) and `rootcause_exit`. The graph is folded back from patches, so
   a resume continues at the next turn with its graph, trace and calls as they were.

@@ -7,7 +7,7 @@ import { RECENT_SEARCHES } from "../projection.js";
 import type { Proof, StepPayload } from "../proof.js";
 import { bestPathFromSymptom, getParents, type Graph, type GraphEdge, type GraphNode } from "./graph.js";
 import { fold, type V3Kinds, type V3Step } from "./ledger.js";
-import { neverRan } from "./tools/registry.js";
+import { correction, neverRan } from "./tools/registry.js";
 import { disposition, forReport, reportRows, unconfirmedNote, type AccountRow, type ChainEvent, type Rejected, type ReportRows, type TimelineRow } from "./report.js";
 
 // A v3 run in the shape the console already reads a root-cause run in: its chain as
@@ -101,9 +101,10 @@ export function rootCauseV3Projection(runId: string, events: readonly AgentEvent
       if (spent !== null) cost = (cost ?? 0) + spent;
     } else if (event.kind === "call") {
       const call = event.payload as CallPayload;
-      // Only the model's searches that ran: not the code's own, and not a call refused before it ran.
+      // Only the model's searches that ran: not the code's own, not a call refused before it ran, and not an
+      // answer sent back to the model to fix.
       if (call.role === "code") codeSearches += 1;
-      else if (!neverRan(call)) {
+      else if (!neverRan(call) && !correction(call)) {
         const rows = call.ok ? rowsIn(call.result) : undefined;
         searches.push({ tool: call.tool, args: queryOf(call.arguments).slice(0, 500), ...(rows === undefined ? {} : { rows }), failed: !call.ok });
       }
