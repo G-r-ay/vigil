@@ -2,11 +2,11 @@
 // up with the dead-end node the marker hangs off?
 import type { AgentConfig } from "./config.js";
 import type { EvidenceDraft, GraphNode } from "./graph.js";
-import { MEDIUM_KINDS, STRONG_KINDS, type Artifact } from "./types.js";
+import { ACCOUNT_KINDS, MEDIUM_KINDS, STRONG_KINDS, type Artifact } from "./types.js";
 
 // The same event described twice: same source, within 5 seconds, and at least two identifying values in common
 // (hosts and accounts alone do not pin an event: they repeat).
-const LOOSE = new Set(["host", "user", "process-guid", "parent-process-guid"]);
+const LOOSE: ReadonlySet<string> = new Set(["host", ...ACCOUNT_KINDS, "process-guid", "parent-process-guid"]);
 export function sameEvent(a: Pick<GraphNode, "artifacts" | "observedAt" | "domain">, b: Pick<GraphNode, "artifacts" | "observedAt" | "domain">): boolean {
   if (a.domain !== b.domain || !a.observedAt || !b.observedAt) return false;
   if (Math.abs(Date.parse(a.observedAt) - Date.parse(b.observedAt)) > 5000) return false;

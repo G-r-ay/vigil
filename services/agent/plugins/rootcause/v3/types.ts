@@ -18,9 +18,15 @@ export const ARTIFACT_KINDS = [
 export type ArtifactKind = (typeof ARTIFACT_KINDS)[number];
 
 // Strong: one value names one thing, so a shared value joins two records (dedup, direct stitch).
-export const STRONG_KINDS: ReadonlySet<ArtifactKind> = new Set(["event-id", "process-guid", "file-hash", "image-digest", "commit-sha", "workflow-run-id", "message-id"]);
+export const STRONG_KINDS: ReadonlySet<ArtifactKind> = new Set(["event-id", "process-guid", "file-hash", "image-digest", "commit-sha", "workflow-run-id"]);
 // Medium: shared values make a link likely but not certain (corroborating stitch).
-export const MEDIUM_KINDS: ReadonlySet<ArtifactKind> = new Set(["arn", "access-key", "k8s-resource", "cache-key", "pr-number", "url", "domain-name", "ip", "email-address"]);
+export const MEDIUM_KINDS: ReadonlySet<ArtifactKind> = new Set(["arn", "access-key", "k8s-resource", "cache-key", "pr-number", "url", "domain-name", "ip"]);
+// A message id is neither: it rides on every event about one email (delivery, click, attachment open), so it links
+// them as a shared value but never makes two of them one event. The mail log's own record id is an event-id.
+
+// An account, by its login or its email address: either joins two events only when both ran as it, and is read
+// and listed the same way everywhere.
+export const ACCOUNT_KINDS: ReadonlySet<ArtifactKind> = new Set(["user", "email-address"]);
 
 export interface Artifact {
   kind: ArtifactKind;

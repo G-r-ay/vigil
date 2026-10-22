@@ -7,14 +7,14 @@ import { ACCUSE, TAKEOVER } from "./model/client.js";
 import { allPaths, bestPathFromSymptom, getParents, islands, type EdgeKind, type Graph, type GraphEdge, type GraphNode } from "./graph.js";
 import { settled } from "./scoring.js";
 import type { TraceEntry, TraceWriter } from "./trace.js";
-import type { Alert, Evidence, ExitReason, Spent } from "./types.js";
+import { ACCOUNT_KINDS, type Alert, type Evidence, type ExitReason, type Spent } from "./types.js";
 
 const pct = (x: number) => x.toFixed(2);
 // An account the logs name (ad:, aws:, github:, k8s:..., an address or an email), as opposed to a description.
 const NAMED = /^(ad|aws|azure|gcp|github|k8s|okta|email|ip|user):|^[\w.+-]+@[\w.-]+$|^\d{1,3}(\.\d{1,3}){3}$/i;
 const UNNAMED = "the attacker (an operator the logs do not name)";
 const DOMAIN = /\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:com|net|org|io|ai|co|test|example|info|biz|xyz|ru|cn|top|site|online)\b/gi;
-const IOC_KINDS = new Set(["ip", "domain-name", "url", "file-hash", "image-digest", "access-key", "arn", "commit-sha", "process", "host", "user"]);
+const IOC_KINDS = new Set(["ip", "domain-name", "url", "file-hash", "image-digest", "access-key", "arn", "commit-sha", "process", "host", ...ACCOUNT_KINDS]);
 const cut = (s: string, n: number) => (s.length > n ? s.slice(0, n) + ` …[+${s.length - n} chars]` : s);
 
 // The report's sentence and the six-word verdict are one rule. benign and needs_review are not this rule's.
@@ -368,11 +368,11 @@ export function renderReport(g0: Graph, trace: TraceWriter, exit: ExitReason | n
   // logon lists ordinary workstations and an admin's own host (a dozen office addresses and an admin
   // workstation were once listed from a 0.39 link and an unlinked logon).
   const loose = new Set(islands(g, 0.5).map((n) => n.id));
-  const legitVals = new Set(Object.values(g.nodes).filter((x) => x.kind === "action" && x.status !== "ruled-out" && x.legitimate).flatMap((x) => x.artifacts.filter((a) => a.kind === "ip" || a.kind === "user").map((a) => a.value.trim().toLowerCase())));
+  const legitVals = new Set(Object.values(g.nodes).filter((x) => x.kind === "action" && x.status !== "ruled-out" && x.legitimate).flatMap((x) => x.artifacts.filter((a) => a.kind === "ip" || ACCOUNT_KINDS.has(a.kind)).map((a) => a.value.trim().toLowerCase())));
   const iocs = new Map<string, Set<string>>();
   for (const n of Object.values(g.nodes)) {
     if (n.status === "ruled-out" || n.kind !== "action" || n.legitimate || (!raw && n.unverified)) continue;
-    for (const a of n.artifacts) if (IOC_KINDS.has(a.kind) && (raw || (!(a.kind === "user" && legitName(a.value)) && !legitVals.has(a.value.trim().toLowerCase()) && !(loose.has(n.id) && (a.kind === "ip" || a.kind === "user"))))) (iocs.get(a.kind) ?? iocs.set(a.kind, new Set()).get(a.kind)!).add(a.value);
+    for (const a of n.artifacts) if (IOC_KINDS.has(a.kind) && (raw || (!(ACCOUNT_KINDS.has(a.kind) && legitName(a.value)) && !legitVals.has(a.value.trim().toLowerCase()) && !(loose.has(n.id) && (a.kind === "ip" || ACCOUNT_KINDS.has(a.kind)))))) (iocs.get(a.kind) ?? iocs.set(a.kind, new Set()).get(a.kind)!).add(a.value);
   }
   out.push("## Indicators (from confirmed and suspected events)", "");
   for (const [k, vs] of iocs) out.push(`- ${k}: ${[...vs].join(", ")}`);
