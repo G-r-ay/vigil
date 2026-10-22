@@ -38,7 +38,15 @@ How a run goes (`engine.ts`):
   graph patch among them) and `rootcause_exit`. The graph is folded back from patches, so
   a resume continues at the next turn with its graph, trace and calls as they were.
 - An operator's stop is polled between and during turns, a lost lease leaves no terminal,
-  and the pool refusing a call ends the run `budget_exhausted`.
+  and the pool refusing a call ends the moves `budget_exhausted`.
+- A move the provider or gateway fails (the kernel returns it as a failed turn, after the
+  limiter's own 3 tries) runs again after 30s when its error reads as the network (the
+  reference's list plus the gateway's 5xx), 20 times at most. Any other failure, or one past
+  those retries, is a failed turn: one attempt on its target, as the reference counts it.
+  Three in a row stop the moves and the run ends `failed`. However the moves stop (three
+  failed turns, the pool, the budget), the closing conclude turn is tried before the report;
+  one that fails leaves the report without the model's conclusion, and `rootcause_exit`
+  says so in `conclude_failed` (three failed turns: `failed`).
 
 What the port changed:
 - No files. `run` hands the graph to `onTurn` after every turn and returns the report,

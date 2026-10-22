@@ -87,7 +87,10 @@ export type ExitReason = "root-cause-found" | "false-positive" | "inconclusive" 
 
 export interface RunResult {
   runId: string;
-  exit: ExitReason;
+  exit: ExitReason | null; // null: the moves stopped on failed turns before an exit was reached
   rootPath: Path | null;
   report: string; // report.md
+  failed?: string; // the moves stopped on three failed turns in a row: the last one's error
+  cut?: string; // the pool or the gateway refused a move's call: its reason
+  concludeFailed?: string; // the closing conclude turn failed (its error): the report has no conclusion of the model's
 }

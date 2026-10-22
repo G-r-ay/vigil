@@ -153,6 +153,87 @@ describe("a run the pool cuts off mid-move", () => {
   }, 20_000);
 });
 
+describe("failed model turns, on the real kernel with a failing provider", () => {
+  const BAD_GATEWAY = "502 failed to execute HTTP request to provider API";
+  const providerError = (message: string, status: number) => Object.assign(new Error(message), { status });
+  const said = { conclusion: "The beacon is all there is.", chain: [], openQuestions: [], reasoning: "the graph" };
+  type Request = Parameters<Parameters<typeof modelOf>[0]>[0];
+  // Framed and mapped as usual; every move and the closing turn answered by `move` and `conclude`.
+  const modelWith = (move: (request: Request) => ReturnType<Parameters<typeof modelOf>[0]>, conclude: () => ReturnType<Parameters<typeof modelOf>[0]> = () => ({ emit: said })) => modelOf((request) => {
+    if (properties(request).includes("observed_at")) return { emit: framed() };
+    if (properties(request).includes("map")) return { emit: { map: "One source, edr.", reasoning: "mapped" } };
+    if (properties(request).includes("conclusion")) return conclude();
+    // Scope's own search rounds come before any move.
+    return request.messages.some((m) => m.content.includes("<graph_snapshot>")) ? move(request) : { content: "done" };
+  });
+  const exitOf = (events: readonly AgentEvent<V3Kinds>[]) => events.find((e) => e.kind === "rootcause_exit")!.payload as { exit: unknown; report: string; failed?: string; conclude_failed?: string };
+  const turnEntries = (events: readonly AgentEvent<V3Kinds>[], turn: number) => events.filter((e) => e.kind === "rootcause_turn" && (e.payload as { turn: number }).turn === turn).flatMap((e) => (e.payload as { entries: { type: string; payload: unknown }[] }).entries);
+
+  it("a transient 502 runs the same move again, and the run goes on", async () => {
+    const state = new InProcessState<V3Kinds>();
+    const spec = specOf({ budgets: { max_calls: 12, max_cost_usd: 10, max_wall_ms: 600_000, max_park_ms: 60_000 } });
+    let broke = false;
+    const model = modelWith(() => {
+      if (!broke) { broke = true; throw providerError(BAD_GATEWAY, 502); }
+      return { emit: { evidence: [], reasoning: "nothing found" } };
+    });
+    const done = await runRootCauseV3(harnessOf(spec, model, splunk(), state), { run_id: "r1", spec, retryWaitMs: 0 });
+    expect(done.status).not.toBe("failed");
+    const events = await state.read("r1");
+    const first = turnEntries(events, 1);
+    expect(first.filter((x) => x.type === "decision")).toHaveLength(1);
+    expect(first.find((x) => x.type === "provider-failure")!.payload).toEqual({ reason: BAD_GATEWAY });
+    expect(first.find((x) => x.type === "rejected-submission")!.payload).toEqual({ networkRetry: 1, error: BAD_GATEWAY });
+    // The retry answered: the turn's patch is the move's own, not a failed turn's bump.
+    expect(first.filter((x) => x.type === "rejected-submission")).toHaveLength(1);
+    expect(exitOf(events).failed).toBeUndefined();
+  }, 20_000);
+
+  it("three failed turns stop the moves, the closing turn still runs, and the run ends failed with its conclusion", async () => {
+    const state = new InProcessState<V3Kinds>();
+    const spec = specOf();
+    const model = modelWith(() => { throw providerError("400 the request was not valid", 400); });
+    const done = await runRootCauseV3(harnessOf(spec, model, splunk(), state), { run_id: "r1", spec, retryWaitMs: 0 });
+    expect(done).toMatchObject({ status: "failed", reason: expect.stringMatching(/^three turns in a row failed: 400 the request was not valid/) });
+    const events = await state.read("r1");
+    const exit = exitOf(events);
+    expect(exit).toMatchObject({ exit: null, failed: expect.stringContaining("400") });
+    expect(exit.conclude_failed).toBeUndefined();
+    expect(exit.report).toContain("## Investigator's conclusion");
+    expect(await state.terminal("r1")).toMatchObject({ outcome: "failed", summary: "The beacon is all there is." });
+    const decisions = events.filter((e) => e.kind === "rootcause_turn").flatMap((e) => (e.payload as { entries: { type: string; payload: unknown }[] }).entries).filter((x) => x.type === "decision").map((x) => x.payload as { move: string; reason: string });
+    expect(decisions.map((d) => d.move)).toHaveLength(4);
+    expect(decisions.at(-1)!.move).toBe("conclude");
+    expect(decisions.at(-1)!.reason).toMatch(/^the run ends: 3 turns in a row failed/);
+  }, 20_000);
+
+  it("a closing turn that fails too leaves today's report and summary, and the exit says so", async () => {
+    const state = new InProcessState<V3Kinds>();
+    const spec = specOf();
+    const down = () => { throw providerError("400 the request was not valid", 400); };
+    const model = modelWith(down, down);
+    const done = await runRootCauseV3(harnessOf(spec, model, splunk(), state), { run_id: "r1", spec, retryWaitMs: 0 });
+    expect(done.status).toBe("failed");
+    const exit = exitOf(await state.read("r1"));
+    expect(exit).toMatchObject({ exit: null, failed: expect.stringContaining("400"), conclude_failed: expect.stringContaining("400") });
+    expect(exit.report).not.toContain("## Investigator's conclusion");
+    // With no conclusion the summary is the report's opening, as before.
+    expect((await state.terminal("r1"))!.summary).toBe(conclusionOf(exit.report));
+    expect((await state.terminal("r1"))!.summary).toMatch(/^# RCA report/);
+  }, 20_000);
+
+  it("a pool cutoff still tries the closing turn; refused too, the exit says so", async () => {
+    const state = new InProcessState<V3Kinds>();
+    const spec = specOf({ budgets: { max_calls: 4, max_cost_usd: 10, max_wall_ms: 600_000, max_park_ms: 60_000 } });
+    const model = modelWith(() => ({ emit: { evidence: [], reasoning: "nothing found" } }));
+    const done = await runRootCauseV3(harnessOf(spec, model, splunk(), state), { run_id: "r1", spec, retryWaitMs: 0 });
+    expect(done).toMatchObject({ status: "budget_exhausted", reason: expect.stringContaining("calls_exhausted") });
+    const exit = exitOf(await state.read("r1"));
+    expect(exit).toMatchObject({ exit: "budget-exhausted", conclude_failed: expect.stringContaining("calls_exhausted") });
+    expect(exit.failed).toBeUndefined();
+  }, 20_000);
+});
+
 describe("a resumed run", () => {
   it("continues at the turn after the last journaled one, with its setup, spend and calls as they were", async () => {
     const state = new InProcessState<V3Kinds>();

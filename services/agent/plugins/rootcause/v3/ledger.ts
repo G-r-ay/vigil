@@ -46,6 +46,8 @@ export interface ExitPayload {
   exit: ExitReason | null; // null: stopped or failed before an exit was reached
   report: string;
   entries: TraceEntry[];
+  failed?: string; // the moves stopped on three failed turns in a row: the last one's error
+  conclude_failed?: string; // the closing conclude turn failed (its error), so the report has no conclusion of the model's
 }
 
 export type V3Kinds = {
