@@ -797,6 +797,9 @@ export interface Subturn {
   // The model this step runs on in place of the spec's, through the same provider and gateway.
   // Every call in it is asked of this model and priced and journaled as it.
   model?: string;
+  // TurnConfig's: Claude caches the whole conversation and thinks on open rounds. Off unless set.
+  cache_conversation?: boolean;
+  think?: boolean;
 }
 
 export async function runSubturn<T>(ctx: PluginContext, sub: Subturn): Promise<Outcome<T>> {
@@ -829,6 +832,8 @@ export async function runSubturn<T>(ctx: PluginContext, sub: Subturn): Promise<O
     ...(sub.cite === true ? { refs: { prefix: CALL_REF, offset: count } } : {}),
     ...(sub.check === undefined ? {} : { check: sub.check }),
     ...(sub.corrections === undefined ? {} : { corrections: sub.corrections }),
+    ...(sub.cache_conversation === true ? { cache_conversation: true } : {}),
+    ...(sub.think === true ? { think: true } : {}),
     ...(options.signal === undefined ? {} : { signal: options.signal }),
   };
   const framer = await Framer.open(harness.state, options.run_id, options.run_kind, [], []);

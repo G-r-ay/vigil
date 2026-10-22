@@ -87,6 +87,20 @@ describe("a move as a kernel turn", () => {
     expect(t.trace.chronological().some((e) => e.type === "rejected-submission" && JSON.stringify(e.payload).includes("r9"))).toBe(true);
   });
 
+  // The reference's two settings for Claude: the conversation cached to its last message, and thinking on open rounds.
+  // The kernel asks; the wire sends them to Claude only, and never thinking on the forced round.
+  it("asks every call of a move to cache its conversation and to think", async () => {
+    const t = setup(
+      (request) => (request.force === SUBMIT_TOOL ? { emit: { candidates: [cand("curl wrote /tmp/x", ["r1"])], reasoning: "r" } } : { calls: [{ tool: "splunk_query", args: SEARCH }] }),
+      { [SEARCH.spl]: "3 events matched\ncurl wrote /tmp/x" },
+    );
+    await t.client.runTurn(t.request({ maxSearches: 1 }));
+    expect(t.provider.requests.map((r) => [r.force, r.cache_conversation, r.think])).toEqual([
+      [undefined, true, true],
+      [SUBMIT_TOOL, true, true],
+    ]);
+  });
+
   // A move that searches to its cap one search a round gets every search, then answers on the forced round.
   it("takes a move's answer on the round after its last search, with no further call", async () => {
     const t = setup(
