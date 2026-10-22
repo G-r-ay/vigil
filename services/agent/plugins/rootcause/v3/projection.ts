@@ -5,10 +5,10 @@ import type { RootCauseProjection, SearchView } from "../projection.js";
 import type { RootCauseReplay, RootCauseReplayStep } from "../replay.js";
 import { RECENT_SEARCHES } from "../projection.js";
 import type { Proof, StepPayload } from "../proof.js";
-import { bestPathFromSymptom, getParents, type Graph, type GraphEdge, type GraphNode } from "./graph.js";
+import { bestPathFromSymptom, type Graph, type GraphEdge } from "./graph.js";
 import { fold, type V3Kinds, type V3Step } from "./ledger.js";
 import { correction, neverRan } from "./tools/registry.js";
-import { disposition, forReport, reportRows, unconfirmedNote, type AccountRow, type ChainEvent, type Rejected, type ReportRows, type TimelineRow } from "./report.js";
+import { disposition, forReport, ranAs, reportRows, tieText, unconfirmedNote, type AccountRow, type ChainEvent, type Rejected, type ReportRows, type TimelineRow } from "./report.js";
 
 // A v3 run in the shape the console already reads a root-cause run in: its chain as
 // steps, symptom first, each tied to the event before it. Beside that, the run's own
@@ -47,12 +47,11 @@ export interface V3Account {
 const proofOf = (x: { status: string } | undefined): Proof =>
   x === undefined ? "none" : x.status === "confirmed" ? "proven" : x.status === "ruled-out" ? "rejected" : "unproven";
 
-function actorOf(g: Graph, node: GraphNode): string {
-  const by = getParents(g, node.id, "attributed-to").filter((e) => !e.retired).sort((a, b) => b.confidence - a.confidence)[0];
-  return by === undefined ? "" : (g.nodes[by.source]?.label ?? "");
-}
-
-function chainOf(g: Graph): StepPayload[] {
+// The chain as report.md shows it: labels as forReport tags them (an unverified event says so), who it ran as
+// as the report's timeline names it (a ruled-out account is exonerated, not who ran it), and each link worded as
+// the report words it (inferred when no record joins its ends), never the model's own text about the link.
+function chainOf(raw: Graph): StepPayload[] {
+  const g = forReport(raw);
   const path = bestPathFromSymptom(g);
   if (path === null) return [];
   return path.nodeIds.map((id, i) => {
@@ -62,9 +61,9 @@ function chainOf(g: Graph): StepPayload[] {
     return {
       step_id: id,
       event: node.label,
-      who: actorOf(g, node),
+      who: ranAs(g, node)[0] ?? "",
       at: node.observedAt ?? "",
-      link: tie === undefined ? "" : (tie.evidence[0]?.summary ?? tie.kind),
+      link: tie === undefined ? "" : tieText({ edgeId: tie.id, confidence: tie.confidence, inferred: !!tie.inferred }),
       artifact: artifact === undefined ? "" : `${artifact.kind}:${artifact.value}`,
       cause_id: path.nodeIds[i + 1] ?? null,
       origin: node.isRoot === true,

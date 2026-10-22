@@ -4,6 +4,7 @@ import type { AgentConfig } from "./config.js";
 import type { Move } from "./frontier.js";
 import { applyPatch, createGraph, getChildren, type Graph, type GraphPatch } from "./graph.js";
 import { seedFromAlert } from "./orchestrator.js";
+import { forReport } from "./report.js";
 import type { Survey } from "./survey.js";
 import type { TraceEntry } from "./trace.js";
 import type { Alert, ExitReason } from "./types.js";
@@ -140,8 +141,10 @@ function stepOf(turn: number, entries: readonly TraceEntry[]): V3Step | null {
 const LABEL_MAX = 120;
 const clip = (s: string) => (s.length > LABEL_MAX ? `${s.slice(0, LABEL_MAX - 1)}…` : s);
 
-// The target's label and the nodes and links this turn created, read off the graph it left.
-function describe(step: V3Step, g: Graph): V3Step {
+// The target's label and the nodes and links this turn created, read off the graph it left as the report reads
+// it (forReport): an unverified event's label is the report's, never the model's accusing one.
+function describe(step: V3Step, raw: Graph): V3Step {
+  const g = forReport(raw);
   const edge = g.edges[step.targetId];
   const prediction = (g.theories ?? []).flatMap((t) => t.predictions).find((p) => p.id === step.targetId);
   const target = g.nodes[step.targetId]?.label ?? (edge ? `${edge.source} → ${edge.target}` : prediction?.expect ?? "");
