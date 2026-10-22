@@ -18,7 +18,7 @@ import {
   type Status,
   type TurnConfig,
 } from "./loop.js";
-import { ProviderError, type Message, type ToolCall, type ToolSchema, type Turn, type TurnRequest } from "./provider.js";
+import { ModelRefused, ProviderError, type Message, type ToolCall, type ToolSchema, type Turn, type TurnRequest } from "./provider.js";
 import { assemble, canonical, DEFAULT_FOLD, prefixOf, windowCeiling, type FoldPolicy, type Prefix } from "./context.js";
 import { createHash } from "node:crypto";
 import { scannerFor, wrap } from "./security.js";
@@ -142,7 +142,7 @@ class Run<T, Kinds extends Record<string, unknown>> {
     } catch (error) {
       if (this.cfg.signal?.aborted === true || hardStop(error)) throw error;
       const reason = error instanceof Error ? error.message : String(error);
-      return yield* announce(this.done("failed", null, reason));
+      return yield* announce({ ...this.done("failed", null, reason), ...(error instanceof ModelRefused ? { model_refused: true as const } : {}) });
     }
   }
 
@@ -252,7 +252,7 @@ class Run<T, Kinds extends Record<string, unknown>> {
         // The answer round stands in for the emission, so it gets the emission's recourse:
         // a failed one is asked again by emit() over a folded transcript.
         const tighter = FOLD_LADDER[this.folds];
-        if (!closing || error instanceof ModelSilent || error instanceof OutputCapReached || tighter === undefined || this.cfg.signal?.aborted === true || hardStop(error)) throw error;
+        if (!closing || error instanceof ModelSilent || error instanceof OutputCapReached || error instanceof ModelRefused || tighter === undefined || this.cfg.signal?.aborted === true || hardStop(error)) throw error;
         this.tightened = tighter;
         this.folds += 1;
         this.rejected.push(`the answer call failed (${error instanceof Error ? error.message : String(error)}); asked again over a folded transcript`);
@@ -509,7 +509,7 @@ class Run<T, Kinds extends Record<string, unknown>> {
         // again over less would only spend the empty replies again. Nor does folding
         // give a model that thought through the whole output cap any more of it.
         const tighter = FOLD_LADDER[this.folds];
-        if (error instanceof ModelSilent || error instanceof OutputCapReached || tighter === undefined || this.cfg.signal?.aborted === true) throw error;
+        if (error instanceof ModelSilent || error instanceof OutputCapReached || error instanceof ModelRefused || tighter === undefined || this.cfg.signal?.aborted === true) throw error;
         this.tightened = tighter;
         this.folds += 1;
         this.rejected.push(`the emission call failed (${(error as Error).message}); asked again over a folded transcript`);

@@ -24,7 +24,7 @@ export async function scope(deps: Deps, cfg: AgentConfig, range: [string, string
   let text: string | null = held || null;
   if (!text) {
     const userContent = [instructions.scope(), constraints(cfg, range, deps.domains, deps.domains, coverageLine(deps.domains, {}, deps.sizes), SCOPE_SEARCHES)].join("\n\n");
-    const r = await deps.model.runTurn({ move: "scope", correlationId: "environment", submitTool: "submit_environment", allowedDomains: deps.domains, maxSearches: SCOPE_SEARCHES, maxPerBatch: SCOPE_BATCH, minCount: SCOPE_MIN_COUNT, trace: deps.trace.forTurn(0, undefined, "environment"), userContent });
+    const r = await deps.model.runTurn({ move: "scope", correlationId: "environment", submitTool: "submit_environment", allowedDomains: deps.domains, maxSearches: SCOPE_SEARCHES, maxPerBatch: SCOPE_BATCH, minCount: SCOPE_MIN_COUNT, model: cfg.scopeModel, trace: deps.trace.forTurn(0, undefined, "environment"), userContent });
     const sub = r.submission as SubmitEnvironment | null;
     if (!sub) return null;
     text = renderEnvironment(sub);

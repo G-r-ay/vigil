@@ -68,3 +68,7 @@ export class ProviderError extends Error {
     super(message);
   }
 }
+
+// The model declined to answer (finish_reason "refusal", Bifrost's pass-through of Anthropic's
+// stop_reason, or OpenAI's "content_filter"): its own answer, not a fault of the gateway.
+export class ModelRefused extends ProviderError {}

@@ -3,6 +3,7 @@ import OpenAI from "openai";
 import type { TokenCounts } from "../contracts/budget.js";
 import { estimateTokens, Limiter, statusOf } from "./limiter.js";
 import {
+  ModelRefused,
   ProviderError,
   type Message,
   type Provider,
@@ -383,6 +384,10 @@ class OpenAiSurface implements Provider {
     let wasted: TokenCounts = { input: 0, output: 0, cache_read: 0, cache_write: 0 };
     for (let attempt = 0; ; attempt += 1) {
       const { response, reported } = await this.sendOnce(body, cap, signal);
+      const finish: string | undefined = response.choices[0]?.finish_reason;
+      if (finish === "refusal" || finish === "content_filter") {
+        throw new ModelRefused(`the model refused to answer (finish_reason=${finish}) from ${this.wire_model}`, tokensOf(plus(response.usage, wasted)));
+      }
       if (response.choices[0]?.finish_reason === "length" && !said(response)) {
         const spent = tokensOf(plus(response.usage, wasted));
         throw new OutputCapReached(

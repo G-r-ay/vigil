@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { approvalId, commitTurn, TOOL_APPROVAL, type Harness, type Outcome, type TurnConfig } from "../../core/loop.js";
 import { drain, streamTurn, SUBMIT_TOOL, type StreamEvent } from "../../core/stream.js";
-import type { Message } from "../../core/provider.js";
+import { ModelRefused, type Message } from "../../core/provider.js";
 import { budgetOf, FRESH, unmeteredQuota } from "../../core/budget.js";
 import { noPrices, type Prices } from "../../core/prices.js";
 import { registryOf } from "../../core/registry.js";
@@ -943,6 +943,37 @@ describe("what the stream reports", () => {
     expect(outcome.reason).not.toContain("not valid JSON");
     expect(outcome.rejected).toEqual([]);
     expect(calls).toBe(2);
+  });
+
+  // A refusal is the model's answer, not a transcript too big: it is not asked again over a folded one, and the
+  // outcome says it was refused, which the budget's refusal field does not.
+  it("fails a refused turn at once, as model_refused", async () => {
+    for (const refusesAt of [1, 2]) {
+      let calls = 0;
+      const provider = {
+        model: "scripted/model",
+        provider_type: "scripted",
+        stream: async function* () {
+          calls += 1;
+          if (calls < refusesAt) {
+            yield { type: "usage" as const, tokens: ZERO_TOKENS };
+            return;
+          }
+          throw new ModelRefused("the model refused to answer (finish_reason=refusal) from scripted/model");
+        },
+      };
+      const harness = { ...harnessOf([]), provider } as unknown as Harness;
+      const history = Array.from({ length: 30 }, (_, index) => ({ role: "user" as const, content: `turn ${index}` }));
+      const { outcome } = await watch(config({ history }), harness);
+
+      expect(outcome.status).toBe("failed");
+      expect(outcome.model_refused).toBe(true);
+      expect(outcome.refusal).toBeNull();
+      expect(outcome.rejected).toEqual([]);
+      expect(calls).toBe(refusesAt);
+    }
+    const { outcome } = await watch(config(), harnessOf([{ fail: "upstream 502" }]));
+    expect(outcome.model_refused).toBeUndefined();
   });
 
   // An abort is not an answer, and a run handed back on a lost lease must not read

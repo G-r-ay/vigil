@@ -516,3 +516,86 @@ describe("what a move's prompt tells the model to call", () => {
     expect(all.conclude).not.toContain("splunk_query");
   });
 });
+
+describe("a move's model: scope on the scope model, a refused move asked again as the reference does", () => {
+  const MAP = { map: `**Systems**\n- ws-7 seen 12 times\n${"- host seen 10 times\n".repeat(12)}`, reasoning: "r" };
+  const SNAPSHOT = "Find the cause.\n<graph_snapshot>\nN1 curl wrote /tmp/x\nSTORIES (competing explanations of the whole incident; latest round live)\nR1.H1 an attacker ran curl\n</graph_snapshot>";
+  const sent = (request: { messages: readonly { content: string }[] }) => request.messages.map((m) => m.content).join("\n");
+  const spends = async (state: InProcessState<V3Kinds>) => (await state.read("r1")).filter((e) => e.kind === "spend").map((e) => e.payload as { model_id: string; role: string });
+  const refusals = (trace: MemoryTrace) => trace.chronological().filter((e) => e.type === "refusal").map((e) => e.payload);
+  const answered = (request: Parameters<Parameters<typeof modelOf>[0]>[0]) => (request.emit !== undefined ? { emit: { candidates: [], reasoning: "r" } } : { content: "done" });
+
+  it("runs scope's every call on cfg.scopeModel, and journals its spend as that model; a move without one runs on the run's", async () => {
+    const t = setup((request) => (request.emit !== undefined || request.force === SUBMIT_TOOL ? { emit: MAP } : { content: "done" }));
+    const deps = { model: t.client, tools: t.tools, trace: t.trace, domains: ["edr"], sizes: { edr: 10 } } as never;
+    expect(cfg.scopeModel).toBe("claude-sonnet-5");
+    expect(await scope(deps, cfg, range)).toContain("ws-7 seen 12 times");
+    expect(t.provider.models.length).toBeGreaterThan(0);
+    expect(new Set(t.provider.models)).toEqual(new Set(["claude-sonnet-5"]));
+    expect(await spends(t.state)).toEqual(t.provider.models.map(() => expect.objectContaining({ model_id: "claude-sonnet-5", role: "scope" })));
+
+    const before = t.provider.models.length;
+    await t.client.runTurn(t.request());
+    expect(new Set(t.provider.models.slice(before))).toEqual(new Set(["scripted/model"]));
+  });
+
+  it("asks a refused move again without the STORIES section, on the same model", async () => {
+    const t = setup((request, n) => (n === 1 ? { refuse: true } : answered(request)));
+    const out = await t.client.runTurn(t.request({ userContent: SNAPSHOT }));
+
+    expect(out.submission).toEqual({ candidates: [], reasoning: "r" });
+    expect(sent(t.provider.requests[0]!)).toContain("STORIES (competing");
+    for (const r of t.provider.requests.slice(1)) {
+      expect(sent(r)).not.toContain("STORIES");
+      expect(sent(r)).toContain("N1 curl wrote /tmp/x\n</graph_snapshot>");
+    }
+    expect(new Set(t.provider.models)).toEqual(new Set(["scripted/model"]));
+    expect(refusals(t.trace)).toEqual([{ attempt: 1, model: "scripted/model", retry: "without STORIES" }]);
+    expect(t.trace.chronological().map((e) => e.type)).not.toContain("provider-failure");
+  });
+
+  it("refused again, asks it on cfg.refusalFallbackModel with the whole snapshot", async () => {
+    const t = setup((request, _n, model) => (model !== cfg.refusalFallbackModel ? { refuse: true } : answered(request)));
+    const out = await t.client.runTurn(t.request({ userContent: SNAPSHOT }));
+
+    expect(out.submission).toEqual({ candidates: [], reasoning: "r" });
+    expect(t.provider.models.slice(0, 2)).toEqual(["scripted/model", "scripted/model"]);
+    expect(new Set(t.provider.models.slice(2))).toEqual(new Set(["claude-sonnet-5"]));
+    expect(sent(t.provider.requests[2]!)).toContain("STORIES (competing");
+    expect(refusals(t.trace)).toEqual([
+      { attempt: 1, model: "scripted/model", retry: "without STORIES" },
+      { attempt: 2, model: "scripted/model", retry: "fallback model claude-sonnet-5" },
+    ]);
+    expect((await spends(t.state)).slice(2).every((s) => s.model_id === "claude-sonnet-5" && s.role === "expand")).toBe(true);
+  });
+
+  it("refused a third time, gives up on the move: no submission, no searches, the run goes on", async () => {
+    const t = setup(() => ({ refuse: true }));
+    const out = await t.client.runTurn(t.request({ userContent: SNAPSHOT }));
+
+    expect(out).toEqual({ submission: null, toolCalls: [] });
+    expect(t.provider.models).toEqual(["scripted/model", "scripted/model", "claude-sonnet-5"]);
+    expect(refusals(t.trace)).toEqual([
+      { attempt: 1, model: "scripted/model", retry: "without STORIES" },
+      { attempt: 2, model: "scripted/model", retry: "fallback model claude-sonnet-5" },
+      { attempt: 3, gaveUp: true },
+    ]);
+    expect(t.trace.chronological().map((e) => e.type)).not.toContain("submission");
+  });
+
+  it("keeps the pool refusing a call apart: it ends the run, and no model is asked again", async () => {
+    const spec = specOf({ budgets: { max_calls: 0, max_cost_usd: 10, max_wall_ms: 600_000, max_park_ms: 60_000 } });
+    const t = setup(() => ({ refuse: true }), {}, spec);
+    await expect(t.client.runTurn(t.request({ userContent: SNAPSHOT }))).rejects.toBeInstanceOf(Refused);
+    expect(t.provider.requests).toHaveLength(0);
+    expect(refusals(t.trace)).toEqual([]);
+  });
+
+  it("does not take a provider failure for a refusal: it is not asked again", async () => {
+    const t = setup(() => { throw new Error("502 failed to execute HTTP request to provider API"); });
+    const out = await t.client.runTurn(t.request({ userContent: SNAPSHOT }));
+    expect(out.failed).toContain("502");
+    expect(new Set(t.provider.models)).toEqual(new Set(["scripted/model"]));
+    expect(refusals(t.trace)).toEqual([]);
+  });
+});

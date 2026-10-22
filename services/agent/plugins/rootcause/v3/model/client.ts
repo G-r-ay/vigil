@@ -32,6 +32,7 @@ export interface TurnRequest {
   maxSearches?: number; // this move's search cap, below cfg.maxToolCallsPerTurn (strengthen needs few)
   minCount?: number; // mapping mode for the search tool
   maxPerBatch?: number; // searches run per model response; the rest wait for the results
+  model?: string; // a model of its own for this move (scope's, a refusal's fallback); the spec's when unset
   trace: TurnTrace;
 }
 
@@ -50,8 +51,13 @@ export interface ModelClient {
 
 export interface ClientDeps { cfg: AgentConfig; tools: ToolRegistry; domains: Domain[]; survey: string; range: [string, string] }
 
-// The pool refused another model call: the run's allowance (calls, dollars, wall clock) is spent.
+// The pool refused another model call: the run's allowance (calls, dollars, wall clock) is spent. Not the model
+// refusing a move, which runTurn retries.
 export class Refused extends Error {}
+
+// What a refused move is asked again without: the snapshot's STORIES section, the attack narrative a refusal most
+// often rests on.
+const STORIES = /\nSTORIES \(competing[\s\S]*?(?=\n<\/graph_snapshot>)/;
 
 // Runs one evidence tool call the code makes (a script's, a sweep's) and traces it: the query, then the output.
 export async function runTool(d: ClientDeps, req: TurnRequest, tool: string, input: unknown): Promise<ToolCallOut> {
@@ -251,6 +257,8 @@ export class KernelTurns {
     this.ctx = { harness, options, turn: () => 0 };
   }
   turn<T>(sub: Subturn): Promise<Outcome<T>> { return runSubturn<T>(this.ctx, sub); }
+  // The run's model, as its spend is journaled: what a move without a model of its own runs on.
+  get model(): string { return this.ctx.harness.provider.model; }
   async calls(): Promise<CallPayload[]> {
     return (await this.ctx.harness.state.read(this.ctx.options.run_id)).filter((e) => e.kind === "call").map((e) => e.payload as CallPayload);
   }
@@ -324,7 +332,27 @@ export class KernelModelClient implements ModelClient {
     );
   }
 
+  // A refusal (the safety filter misfiring on attack narrative built up in the snapshot) is retried: once without
+  // the STORIES section, then once on the fallback model. Searches already run in a refused attempt stay citable
+  // (they are on the ledger) but the retry runs its own.
   async runTurn(req: TurnRequest): Promise<TurnResult> {
+    const { cfg } = this.d;
+    const first = await this.runTurnOnce(req);
+    if (!first.refused) return first;
+    req.trace.write("refusal", { attempt: 1, model: req.model ?? this.turns.model, retry: "without STORIES" });
+    const lean = { ...req, userContent: req.userContent.replace(STORIES, "") };
+    const second = await this.runTurnOnce(lean);
+    if (!second.refused) return second;
+    req.trace.write("refusal", { attempt: 2, model: lean.model ?? this.turns.model, retry: `fallback model ${cfg.refusalFallbackModel}` });
+    const third = await this.runTurnOnce({ ...req, model: cfg.refusalFallbackModel });
+    if (third.refused) {
+      req.trace.write("refusal", { attempt: 3, gaveUp: true });
+      return { submission: null, toolCalls: [] };
+    }
+    return third;
+  }
+
+  private async runTurnOnce(req: TurnRequest): Promise<TurnResult & { refused?: true }> {
     const { cfg, tools } = this.d;
     const searches = req.maxSearches ?? cfg.maxToolCallsPerTurn;
     const before = (await this.turns.calls()).length;
@@ -356,6 +384,7 @@ export class KernelModelClient implements ModelClient {
           return v.success ? null : v.msg;
         },
         corrections: CORRECTIONS,
+        ...(req.model === undefined ? {} : { model: req.model }),
       });
     } catch (error) {
       failure = error;
@@ -366,6 +395,7 @@ export class KernelModelClient implements ModelClient {
     const toolCalls = await this.settle(req, before);
     if (failure !== undefined) throw failure;
     if (outcome!.refusal !== null) throw new Refused(outcome!.reason);
+    if (outcome!.model_refused === true) return { submission: null, toolCalls, refused: true };
 
     // The answer the turn ended on is checked: what is sound is kept, what is not is dropped, and a turn with no
     // valid submission is one attempt on its target. One the check still failed after the corrections, and an
