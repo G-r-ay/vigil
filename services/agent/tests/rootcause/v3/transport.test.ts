@@ -343,6 +343,21 @@ describe("an answer that fails its check goes back to the model, twice at most",
     expect(rootCauseV3Projection("r1", (await t.state.read("r1")) as never).searches).toBe(1);
   });
 
+  it("sends an answer its gate refuses back once, as a correction, and takes the next one whatever the gate says", async () => {
+    const said = (n: number) => ({ conclusion: `answer ${n} names mallory`, chain: [], openQuestions: [], reasoning: "r" });
+    const t = setup((request, n) => (request.force === SUBMIT_TOOL ? { emit: said(n) } : submit(said(n))));
+    const gate = (a: unknown) => (/mallory/.test((a as { conclusion: string }).conclusion) ? "the conclusion names \"mallory\"" : null);
+    const out = await t.client.runTurn(t.request({ move: "conclude", submitTool: "submit_conclusion", maxSearches: 0, gate }));
+
+    expect(t.provider.requests).toHaveLength(2);
+    const calls = await t.calls();
+    expect(calls.map((c) => [c.tool, c.failure])).toEqual([[SUBMIT_TOOL, "invalid_args"]]);
+    expect(calls[0]!.result).toContain("the conclusion names \"mallory\"");
+    expect((out.submission as { conclusion: string }).conclusion).toBe("answer 2 names mallory");
+    expect(t.trace.chronological().filter((e) => e.type === "reasoning").map((e) => e.payload)).toEqual([{ sentBack: "the conclusion names \"mallory\"" }]);
+    expect(kinds(t)).not.toContain("rejected-submission");
+  });
+
   it("salvages the last answer after two corrections", async () => {
     const unseen = { candidates: [cand("curl wrote /tmp/x", ["r1"]), cand("token minted outside captured telemetry", ["r1"])], reasoning: "r" };
     const t = setup((_, n) => (n === 1 ? { calls: [{ tool: "splunk_query", args: SEARCH }] } : submit(unseen)), { [SEARCH.spl]: "3 events matched" });

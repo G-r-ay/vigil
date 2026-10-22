@@ -36,6 +36,12 @@ How a run goes (`engine.ts`):
   schema (an unknown key, say), goes back to the model to fix, twice at most between them (each time a `submit_answer` call on the ledger, numbered but no search);
   then salvage drops the items the failure rests on and keeps the rest. A turn with no
   valid answer is one attempt on its target.
+- `unlinked.ts`: the report names an account, user, email, principal or address as attacker,
+  origin or operator only when the alert's proven chain reaches it (the alert and what reaches
+  it over confirmed links). The conclude answer goes back once while it names another; what is
+  left the report, the run summary and the console show as `[unlinked actor]` /
+  `[unlinked address]`, except in a sentence that clears the name (legitimate, ruled out, not
+  the attacker...). Loose or strict, the same.
 - `ledger.ts` journals `rootcause_setup`, `rootcause_turn` (the turn's trace entries, its
   graph patch among them) and `rootcause_exit`. The graph is folded back from patches, so
   a resume continues at the next turn with its graph, trace and calls as they were.
