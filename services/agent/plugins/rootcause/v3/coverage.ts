@@ -1,5 +1,6 @@
-// Coverage gaps: an empty search is evidence against an event only if the source searched records the event's
-// entities at all. When every search a refuting item cites came back empty (0 events, 0 rows), code looks up each
+// Coverage gaps: an empty search is evidence against the alert itself only if the source searched records the
+// alert's entities at all (only evidence about the symptom is checked; refutations of other events and links count
+// as cited). When every search a refuting item cites came back empty (0 events, 0 rows), code looks up each
 // of the node's entity values over the whole data range (the sweep's presence lookup, one search per value per run);
 // a sourcetype that holds none of them has a gap. The gap is per sourcetype: a cited search that read only such
 // sources is dropped from the item, and the item is dropped when no cited search is left (a host with no Sysmon
@@ -54,5 +55,5 @@ export function entitiesOf(g: Graph, ...ids: string[]): string[] {
 export function gapNote(ctx: LoopContext): string {
   const gaps = runs.get(ctx.tools);
   if (!gaps?.size) return "";
-  return `Coverage gaps (checked by code): ${[...gaps].map(([st, es]) => `${st} holds no events on ${[...es].slice(0, 4).join(", ")}`).join("; ")}. An empty search there says nothing about whether the event happened; do not repeat it.`;
+  return `Coverage gaps (checked by code): ${[...gaps].map(([st, es]) => `${st} holds no events on ${[...es].slice(0, 4).join(", ")}`).join("; ")}. An empty search there says nothing about whether the alert happened; do not repeat it.`;
 }
