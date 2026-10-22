@@ -153,6 +153,9 @@ export interface Outcome<T> {
   // With emission_rejected: set when the answer met the schema but failed the caller's check, to
   // what the check said of the last one.
   check_failed?: string;
+  // Set when the model declined to answer (ModelRefused): failed by its own stop reason, which
+  // the budget's refusal above is not.
+  model_refused?: true;
   // True when the tool loop was stopped by the cap rather than by the model, so
   // a workflow knows the answer was reached over a truncated set of calls.
   capped: boolean;

@@ -4,7 +4,7 @@ import type { ToolResult } from "../../contracts/tool.js";
 import { budgetOf, FRESH, unmeteredQuota, type Seed } from "../../core/budget.js";
 import type { Harness } from "../../core/loop.js";
 import { nullMemory } from "../../core/memory.js";
-import type { Provider, ProviderEvent, TurnRequest } from "../../core/provider.js";
+import { ModelRefused, type Provider, type ProviderEvent, type TurnRequest } from "../../core/provider.js";
 import { registryOf } from "../../core/registry.js";
 import type { ToolDispatch } from "../../core/seams.js";
 import type { RunSpec } from "../../core/spec.js";
@@ -46,20 +46,25 @@ export function splunk(asked: Record<string, unknown>[] = []): ToolDispatch {
   };
 }
 
-// wait: how long the model takes, so a stop can arrive while it does.
-export type Answer = { calls?: readonly { tool: string; args: unknown }[]; content?: string; emit?: unknown; wait?: number };
+// wait: how long the model takes, so a stop can arrive while it does. refuse: the model declines to answer.
+export type Answer = { calls?: readonly { tool: string; args: unknown }[]; content?: string; emit?: unknown; wait?: number; refuse?: true };
 
-// Answers each call by what it was asked: the schema of an emission, else the tool turn in hand.
-export function modelOf(answer: (request: TurnRequest, n: number) => Answer, model = "scripted/model"): Provider & { requests: TurnRequest[] } {
+// Answers each call by what it was asked: the schema of an emission, else the tool turn in hand. models: the model
+// each request was asked of, the spec's or one a subturn named (through the harness's provider_for).
+export function modelOf(answer: (request: TurnRequest, n: number, model: string) => Answer, model = "scripted/model"): Provider & { requests: TurnRequest[]; models: string[] } {
   const requests: TurnRequest[] = [];
+  const models: string[] = [];
   return {
     model,
     provider_type: "scripted",
     requests,
-    stream: async function* (request: TurnRequest): AsyncGenerator<ProviderEvent> {
+    models,
+    stream: async function* (this: Provider, request: TurnRequest): AsyncGenerator<ProviderEvent> {
       requests.push(request);
-      const said = answer(request, requests.length);
+      models.push(this.model);
+      const said = answer(request, requests.length, this.model);
       if (said.wait !== undefined) await new Promise((done) => setTimeout(done, said.wait));
+      if (said.refuse === true) throw new ModelRefused(`the model refused to answer (finish_reason=refusal) from ${this.model}`);
       const asked = schemaAsked(request) !== undefined;
       const [given] = asked ? answerEvents(request, said.emit ?? {}) : [];
       if (given?.type === "text_delta") yield given;
@@ -74,7 +79,9 @@ export function modelOf(answer: (request: TurnRequest, n: number) => Answer, mod
 export const properties = (request: TurnRequest): string[] => Object.keys((schemaAsked(request)?.["properties"] ?? {}) as Record<string, unknown>);
 
 export function harnessOf(spec: RunSpec, provider: Provider, dispatch: ToolDispatch = splunk(), state = new InProcessState<V3Kinds>(), seed: Seed = FRESH): Harness<V3Kinds> {
-  return { provider, registry: registryOf([], {}), dispatch, budget: budgetOf(spec.budgets, unmeteredQuota, Date.now, seed), memory: nullMemory, state };
+  // Another model is the same fake under that model's name.
+  const provider_for = (model: string): Provider => Object.assign(Object.create(provider) as Provider, { model });
+  return { provider, provider_for, registry: registryOf([], {}), dispatch, budget: budgetOf(spec.budgets, unmeteredQuota, Date.now, seed), memory: nullMemory, state };
 }
 
 export const framed = (over: Record<string, unknown> = {}) => ({ title: "beacon", observed_at: "2026-01-05T10:00:00Z", source: "network", artifacts: [{ kind: "host", value: "ws-7" }], index: "lab", ...over });

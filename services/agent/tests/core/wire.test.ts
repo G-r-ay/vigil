@@ -4,7 +4,7 @@ import { Limiter } from "../../core/limiter.js";
 import { costOf } from "../../core/prices.js";
 import { EMIT_TOOL, ModelSilent, OutputCapReached, openAiSurface, resetEmitMode, resetOutputCap, setSilentPauses } from "../../core/wire.js";
 import { ZERO_TOKENS, type TokenCounts } from "../../contracts/budget.js";
-import type { Message, Provider, ToolCall, Turn, TurnRequest } from "../../core/provider.js";
+import { ModelRefused, type Message, type Provider, type ToolCall, type Turn, type TurnRequest } from "../../core/provider.js";
 
 type Body = OpenAI.Chat.ChatCompletionCreateParams;
 
@@ -812,6 +812,21 @@ describe("the output cap", () => {
       tokens: { input: 100, output: 12_000 },
     });
     expect(calls).toBe(1);
+  });
+
+  // Bifrost passes Anthropic's stop_reason "refusal" through as the finish_reason; OpenAI says "content_filter".
+  it("fails a refused reply as ModelRefused at once, billing the spend", async () => {
+    for (const finish of ["refusal", "content_filter"]) {
+      let calls = 0;
+      const surface = surfaceOf(async () => {
+        calls += 1;
+        return completion({ role: "assistant", content: "I can't help with that." }, { prompt_tokens: 100, completion_tokens: 8, total_tokens: 108 }, finish);
+      });
+      const failed = turn(surface, { messages: [{ role: "user", content: "go" }], tools: [] });
+      await expect(failed).rejects.toBeInstanceOf(ModelRefused);
+      await expect(failed).rejects.toMatchObject({ message: expect.stringContaining(`finish_reason=${finish}`), tokens: { input: 100, output: 8 } });
+      expect(calls).toBe(1);
+    }
   });
 
   it("leaves a reply cut off mid-answer to the caller", async () => {
