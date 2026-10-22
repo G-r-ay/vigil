@@ -81,9 +81,10 @@ export const clip = (v: unknown, key = ""): unknown =>
   : v && typeof v === "object" ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, clip(x, k)])) : v;
 
 // Why a clipped value does not meet the move's schema (what the kernel's ajv holds an emission to, plus the length
-// caps), with the list items the failure rests on, from the paths ajv reports: the deepest list item on each path
-// (`effects/0/artifacts/1`, not `effects/0`), so the rest of the answer survives. null when it does meet it.
-const itemOf = (p: string[]) => p.slice(0, p.findLastIndex((x) => /^\d+$/.test(x)) + 1);
+// caps), with the list items the failure rests on, from the paths ajv reports: the top-level item on each path
+// (`effects/0` for `effects/0/artifacts/1`), dropped whole as the reference drops it. A failure outside any
+// top-level item leaves nothing to drop, and salvage nothing to keep. null when it does meet it.
+const itemOf = (p: string[]) => (p.length >= 2 && /^\d+$/.test(p[1]!) ? p.slice(0, 2) : []);
 function schemaProblem(name: SubmitName, value: unknown): { msg: string; drop: Path[] } | null {
   const msg = schemaErrors(SUBMIT[name], value);
   if (msg === null) return null;
@@ -115,23 +116,18 @@ const TAKEOVER_TEST = /\b(sign-?in|login|logon|token|key|password|mfa|credential
 export const UNSEEN = /\b(outside (?:the )?(?:captured |available |collected )?(?:telemetry|logs?|logging|data|visibility)|(?:not|never|un) ?(?:captured|logged|recorded|observed|visible) (?:in|by) (?:the )?(?:telemetry|logs?|data|any source)|unlogged|unobserved|out[- ]of[- ]band (?:mint|issu)\w*|no visible (?:mint|issu|origin|source)\w*)\b/i;
 export interface CheckCtx { inputOf?: InputOf; range?: [string, string] }
 type Path = (string | number)[];
-// drop: the paths of the list items a failure rests on (["effects", "0", "artifacts", "1"]), so a last salvage can keep the rest of the submission.
+// drop: the top-level list items a failure rests on (["effects", 0]), so a last salvage can keep the rest of the submission.
 export type CheckResult = { success: true; data: unknown } | { success: false; msg: string; drop: Path[] };
 
 type Citable = Parameters<typeof issued>[0];
 export function check(name: SubmitName, input: unknown, calls: number | Citable, cx: CheckCtx = {}): CheckResult {
   const tools = typeof calls === "number" ? { callCount: calls } : calls;
   const v = { data: clip(input) };
-  // A list item citing a ref the run never issued fails the check and salvage drops it, the rest kept; a bad
-  // citation outside any list fails the submission whole.
+  // A ref the run never issued, anywhere in the submission, fails it whole: nothing is dropped, so salvage keeps
+  // nothing, as the reference.
   const unissued = (x: unknown): string[] => Array.isArray(x) ? x.flatMap(unissued) : x && typeof x === "object" ? Object.entries(x).flatMap(([k, y]) => (k === "toolCallIds" && Array.isArray(y) ? y.map(String).filter((id) => !issued(tools, id)) : unissued(y))) : [];
-  const top = Object.entries(v.data as Record<string, unknown>);
-  const dropped: Path[] = top.flatMap(([k, x]) => (Array.isArray(x) ? x.flatMap((item, i) => (unissued(item).length ? [[k, i]] : [])) : []));
-  const loose = top.flatMap(([, x]) => (Array.isArray(x) ? [] : unissued(x)));
-  if (dropped.length || loose.length) {
-    const ids = new Set([...loose, ...dropped.flatMap(([k, i]) => unissued((v.data as unknown as Record<string, unknown[]>)[k as string]![i as number]))]);
-    return { success: false, msg: `toolCallIds never issued in this run: ${[...ids].join(", ")}. Cite only refs from your searches or from the snapshot.`, drop: loose.length ? [] : dropped };
-  }
+  const ids = new Set(unissued(v.data));
+  if (ids.size) return { success: false, msg: `toolCallIds never issued in this run: ${[...ids].join(", ")}. Cite only refs from your searches or from the snapshot.`, drop: [] };
   // The environment map records what exists and how often, never a judgment about it.
   if (name === "submit_environment") {
     const m = String((v.data as { map?: string }).map ?? "").match(/\b(suspicious|malicious|anomal\w*|outliers?|unusual|attack\w*|attacker|c2|command[- ]and[- ]control|phish\w*|not normal|abnormal|compromise\w*|exfiltrat\w*|backdoor\w*|indicator\w*)\b/gi);
@@ -163,7 +159,7 @@ export function check(name: SubmitName, input: unknown, calls: number | Citable,
 }
 
 
-// v without the list items at the paths in gone ("effects/0/artifacts/1"); the rest keep their place.
+// v without the list items at the paths in gone ("effects/0"); the rest keep their place.
 const prune = (v: unknown, at: string[], gone: Set<string>): unknown =>
   Array.isArray(v) ? v.flatMap((x, j) => (gone.has([...at, j].join("/")) ? [] : [prune(x, [...at, String(j)], gone)]))
   : v && typeof v === "object" ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, prune(x, [...at, k], gone)])) : v;
@@ -181,9 +177,8 @@ const follow = (p: string[], gone: Set<string>): string[] | null => {
   return out;
 };
 
-// A key the schema does not know is removed, not a reason to drop the item or the submission. The deepest list item
-// holding a real error is dropped whole by the caller, so nothing is stripped from it; the item around it (a
-// candidate around a bad nodeEvidence entry) is stripped as any other. One that is a field of the submission itself
+// A key the schema does not know is removed, not a reason to drop the item or the submission (the reference's zod
+// strips it). A top-level item holding a real error is dropped whole by the caller, so nothing is stripped from it. One that is a field of the submission itself
 // (a candidate's `boundary`) is returned with where it was, for the caller to lift once it knows that item is kept.
 // Mutates `cur`.
 function stripStray(name: SubmitName, cur: Record<string, unknown>): { stripped: number; lifts: { at: string[]; key: string; value: unknown }[] } {
@@ -204,8 +199,9 @@ function stripStray(name: SubmitName, cur: Record<string, unknown>): { stripped:
   return { stripped: live.length, lifts };
 }
 
-// A failed check drops the list items it rests on and keeps the rest, so one bad event does not throw away
-// the others (a run once lost a correct finding with its whole submission).
+// A failed check drops the top-level items it rests on (a whole candidate, effect, cause or event) and keeps the
+// rest, so one bad event does not throw away the others; up to three passes. A failure that names no item (a ref
+// never issued, a bad field of the submission itself) salvages nothing.
 export function salvage(name: SubmitName, input: unknown, calls: number | Citable, cx: CheckCtx, first: CheckResult): { data: unknown; dropped: number; repaired?: string } | null {
   let cur = clip(input) as Record<string, unknown[]>, r = first, dropped = 0;
   let { stripped, lifts } = stripStray(name, cur);
