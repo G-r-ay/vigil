@@ -121,13 +121,15 @@ export async function candidatePatch(c: CandidateT, v: Vetter, g: Graph, ctx: Lo
   // first call on timing alone, and the run spent turns on the developer's CI).
   const edgeEv = target ? await v.evidence(c.edgeEvidence, domain) : [];
   const unproven = !!target && !!node.legitimate && !g.nodes[target]?.legitimate && !edgeEv.some((e) => e.strength === "direct" && e.polarity === "supports");
-  // The link is kept as inferred (circumstantial) instead of dropping the step.
-  if (unproven) {
+  // Loose: the link is kept as inferred (circumstantial) instead of dropping the step.
+  if (unproven && ctx.cfg.loose) {
     for (const e of edgeEv) e.strength = "circumstantial";
     const edges: EdgeIn[] = [{ tempId: tempId("edge"), kind: "explains", source: id, target: target!, prior: c.prior, evidence: edgeEv, inferred: true }];
     const attr = buildAttributionPatch(id, v.signals(c.identitySignals), g, { turn: ctx.turn, domain, traceIds: v.traceIds });
     return { patch: { addNodes: [node, ...attr.addNodes], addEdges: [...edges, ...attr.addEdges] }, id, node };
   }
+  if (unproven) ctx.trace.write("rejected-evidence", { label: c.label, target, reason: "legitimate step with no direct evidence that it caused the target; not added" });
+  if (unproven) return { patch: {}, id, node };
   const edges: EdgeIn[] = target ? [{ tempId: tempId("edge"), kind: "explains", source: id, target, prior: c.prior, evidence: edgeEv, ...(c.jointCause ? { joint: true } : {}) }] : [];
   const attr = buildAttributionPatch(id, v.signals(c.identitySignals), g, { turn: ctx.turn, domain, traceIds: v.traceIds });
   return { patch: { addNodes: [node, ...attr.addNodes], addEdges: [...edges, ...attr.addEdges] }, id, node };
@@ -153,19 +155,22 @@ const routine = (c: CandidateT, ctx: LoopContext) => {
 // activity: cited, and unusual. Kept ones gain that comparison as corroborating evidence.
 // With keepLegitimate (pivot, test), routine activity that leads toward the origin is kept, marked legitimate.
 export function withBaseline<C extends CandidateT>(cands: C[], v: Vetter, ctx: LoopContext, keepLegitimate = false): { kept: C[]; evidenceFor: (c: CandidateT) => EvidenceDraft[] } {
-  for (const c of cands) {
+  const kept = cands.filter((c) => {
     const legit = keepLegitimate && (c.legitimate || (c.baseline && !c.baseline.unusual));
     // "Normal activity" drops an effect only when the baseline shows it spread over the range; otherwise it is kept.
     const shownNormal = !!c.baseline && !c.baseline.unusual && routineShown(c, ctx.tools.outputOf?.bind(ctx.tools), ctx.range);
     const why = !c.baseline ? "no baseline comparison" : shownNormal && !legit ? `normal activity: ${c.baseline.summary}` : !c.baseline.toolCallIds.some((t) => issued(ctx.tools, t)) ? "baseline cites no search" : "";
-    // Kept. Shown normal: marked legitimate; no usable baseline: unverified.
-    if (why) {
+    // Loose: kept. Shown normal: marked legitimate; no usable baseline: unverified.
+    if (why && ctx.cfg.loose) {
       if (shownNormal) (c as { legitimate?: boolean }).legitimate = true;
       else { (c as { unverified?: boolean }).unverified = true; delete c.baseline; }
       ctx.trace.write("reasoning", { looseKept: c.label, was: why });
+      return true;
     }
-  }
-  return { kept: cands, evidenceFor: (c) => !c.baseline ? [] : v.vetted([{ summary: `${c.baseline!.unusual ? "differs from baseline" : "routine for its account (legitimate step)"}: ${c.baseline!.summary}`, strength: "corroborating", polarity: "supports", toolCallIds: c.baseline!.toolCallIds }], c.domain) };
+    if (why) ctx.trace.write("rejected-evidence", { effect: c.label, reason: `not added: ${why}` });
+    return !why;
+  });
+  return { kept, evidenceFor: (c) => !c.baseline ? [] : v.vetted([{ summary: `${c.baseline!.unusual ? "differs from baseline" : "routine for its account (legitimate step)"}: ${c.baseline!.summary}`, strength: "corroborating", polarity: "supports", toolCallIds: c.baseline!.toolCallIds }], c.domain) };
 }
 
 // Two events about the same process or container: a shared process id or container id on the same host.

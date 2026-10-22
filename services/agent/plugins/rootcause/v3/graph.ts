@@ -377,16 +377,24 @@ export function applyPatch(g: Graph, patch: GraphPatch, turn: number, cfg: Agent
   for (const e of patch.addEdges) { const before = new Set(Object.keys(g.edges)); const id = addEdge(e); if (id) { idMap[e.tempId] = id; if (!before.has(id)) created.push(id); } }
   // A new link between two events needs a value both carry. Checked after the patch's attributions are in,
   // since whether a host or an account counts depends on who each event ran as.
-  const inferUnjoined = (id: string) => {
+  const unjoined = (id: string) => {
     const e = g.edges[id];
-    if (!cfg.linkNeedsSharedValue || e?.kind !== "explains" || e.createdTurn !== turn || e.evidence.length !== e.evidence.filter((v) => v.turn === turn).length) return;
+    if (!cfg.linkNeedsSharedValue || e?.kind !== "explains" || e.createdTurn !== turn || e.evidence.length !== e.evidence.filter((v) => v.turn === turn).length) return false;
     const a = g.nodes[e.source], b = g.nodes[e.target];
-    if (a?.kind !== "action" || b?.kind !== "action" || sharedValue(g, a, b, true)) return;
-    // Kept as an inferred link; its evidence counts as circumstantial (timing, naming), never as a join.
-    e.inferred = true;
-    for (const v of e.evidence) v.strength = "circumstantial";
+    if (a?.kind !== "action" || b?.kind !== "action" || sharedValue(g, a, b, true)) return false;
+    // Loose: kept as an inferred link; its evidence counts as circumstantial (timing, naming), never as a join.
+    if (cfg.loose) {
+      e.inferred = true;
+      for (const v of e.evidence) v.strength = "circumstantial";
+      return false;
+    }
+    rejected.push({ item: { source: e.source, target: e.target }, reason: `no shared value: ${e.source} and ${e.target} carry no common process, session, container, token, key, file or address (a host counts only within one source for one account)` });
+    delete g.edges[id];
+    touched.delete(id);
+    for (const [k, v] of Object.entries(idMap)) if (v === id) delete idMap[k];
+    return true;
   };
-  for (const id of created) inferUnjoined(id);
+  for (const id of created) unjoined(id);
   // Routine work by one account leads to more of its routine work: a step that causes its own account's legitimate
   // step is legitimate too, unless someone else operated it or it is labelled malicious (a developer's
   // routine step from their usual address was once left unmarked upstream of their legitimate one and became the chain top).
@@ -429,8 +437,8 @@ export function applyPatch(g: Graph, patch: GraphPatch, turn: number, cfg: Agent
     else {
       const had = new Set(Object.keys(g.edges));
       const join = addEdge({ tempId: `join:${markerId}`, kind: "explains", source: cand, target: m.originNodeId, prior: 0.3, evidence: joinEvidence });
-      if (join) {
-        if (!had.has(join)) inferUnjoined(join);
+      // A join with no shared value is refused (strict) and the boundary stays open; loose keeps it inferred.
+      if (join && !(had.has(join) ? false : unjoined(join))) {
         idMap[`join:${markerId}`] = join;
         resolveMarker(markerId, cand);
       }

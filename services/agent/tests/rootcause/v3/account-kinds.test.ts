@@ -13,11 +13,11 @@ import { cfg, ev, node, seeded } from "./helpers.js";
 
 const on = { ...cfg, linkNeedsSharedValue: true };
 const art = (kind: string, value: string) => ({ kind: kind as any, value });
-const add = (g: Graph, p: any) => applyPatch(g, { ...emptyPatch(), ...p }, 1, on);
+const add = (g: Graph, p: any, c = on) => applyPatch(g, { ...emptyPatch(), ...p }, 1, c);
 const ranAs = (g: Graph, id: string, v: string) => add(g, buildAttributionPatch(id, [{ layer: "machine-facing", relation: "ran-as", kind: "account", value: v, resolvesTo: `ad:${v}`, toolCallIds: ["r1"] }], g, { turn: 1, domain: "o365", traceIds: () => [] }));
 
 // Two mailbox events naming one account value, run as `a` and `b`; then a link N1 -> N2.
-function twoEvents(kind: string, value: string, a: string, b: string) {
+function twoEvents(kind: string, value: string, a: string, b: string, c = on) {
   const g = createGraph("t");
   add(g, { addNodes: [
     node("rule", { label: "inbox rule created", domain: "o365", artifacts: [art(kind, value)] }),
@@ -25,15 +25,21 @@ function twoEvents(kind: string, value: string, a: string, b: string) {
   ] });
   ranAs(g, "N1", a); ranAs(g, "N2", b);
   const join = sharedValue(g, g.nodes.N1!, g.nodes.N2!);
-  add(g, { addEdges: [{ tempId: "x", kind: "explains", source: "N1", target: "N2", prior: 0.4, evidence: [ev("direct")] }] });
-  const e = Object.values(g.edges).find((x) => x.kind === "explains")!;
-  return { join, inferred: e.inferred === true };
+  add(g, { addEdges: [{ tempId: "x", kind: "explains", source: "N1", target: "N2", prior: 0.4, evidence: [ev("direct")] }] }, c);
+  const e = Object.values(g.edges).find((x) => x.kind === "explains");
+  return { join, inferred: e?.inferred === true, ...(e ? {} : { refused: true }) };
 }
 
 describe("an email address joins events the way a user does", () => {
-  it("across different accounts it is no join: the link is kept inferred, as for a user", () => {
-    const email = twoEvents("email-address", "alice@corp.example", "alice", "mallory");
+  it("across different accounts it is no join: the link is kept inferred, as for a user (loose)", () => {
+    const loose = { ...on, loose: true };
+    const email = twoEvents("email-address", "alice@corp.example", "alice", "mallory", loose);
     expect(email).toEqual({ join: null, inferred: true });
+    expect(email).toEqual(twoEvents("user", "alice@corp.example", "alice", "mallory", loose));
+  });
+  it("across different accounts it is no join: strict refuses the link, as for a user", () => {
+    const email = twoEvents("email-address", "alice@corp.example", "alice", "mallory");
+    expect(email).toEqual({ join: null, inferred: false, refused: true });
     expect(email).toEqual(twoEvents("user", "alice@corp.example", "alice", "mallory"));
   });
   it("under one account it is a join, as for a user", () => {

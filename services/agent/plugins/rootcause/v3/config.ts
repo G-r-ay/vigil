@@ -16,6 +16,7 @@ export interface AgentConfig {
   lookbackDays: number;
   stitchWindowMinutes: number;
   linkNeedsSharedValue: boolean;
+  loose: boolean; // record freely: findings that fail a check are tagged (unverified / inferred link), not refused; the report is strict
   chooseTurn: boolean; // with no runnable `next`, ask the model in a choose turn instead of taking the frontier's pick
   wrapUpAt: number; // share of maxUsd left when the model is told to wrap up
   concludeAt: number; // share left when the run stops for the closing conclude turn
@@ -44,6 +45,7 @@ export const defaultConfig: AgentConfig = {
   lookbackDays: 14,
   stitchWindowMinutes: 30,
   linkNeedsSharedValue: true, // a new cause/effect link needs a value both events carry
+  loose: false, // a finding that fails a check is refused, as the reference with loose off; true keeps it tagged
   chooseTurn: false, // the frontier picks, at no model cost (the reference loop); true restores the paid choose turn
   wrapUpAt: 0.10,
   concludeAt: 0.03, // at least $0.50: one conclude turn costs about that

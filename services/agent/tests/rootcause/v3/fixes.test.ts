@@ -334,10 +334,16 @@ describe("baselines are checked, not taken on the model's word", () => {
   const cx = { inputOf: (id: string) => calls[id], range };
   const cand = (ids: string[], unusual = true) => ({ label: "register_self_hosted_runner by dev-a", domain: "github", prior: 0.4, artifacts: [{ kind: "user", value: "dev-a" }], nodeEvidence: [], edgeEvidence: [], baseline: { summary: "s", unusual, toolCallIds: ids } });
   const sub = (c: object) => ({ effects: [c], reasoning: "r" });
-  it("needs a whole-range search naming the account, both for unusual and for routine; a baseline that fails is dropped and the event tagged unverified", () => {
+  it("needs a whole-range search naming the account, both for unusual and for routine", () => {
+    expect(check("submit_effects", sub(cand(["r1"])), 3, cx)).toMatchObject({ success: true });
+    expect(check("submit_effects", sub(cand(["r2"])), 3, cx)).toMatchObject({ success: false, drop: [["effects", 0]] });
+    expect(check("submit_effects", sub(cand(["r3"], false)), 3, cx)).toMatchObject({ success: false });
+  });
+  it("needs a whole-range search naming the account, both for unusual and for routine; a baseline that fails is dropped and the event tagged unverified (loose)", () => {
     const kept = (r: ReturnType<typeof check>) => (r as { data: { effects: { baseline?: unknown; unverified?: boolean }[] } }).data.effects[0]!;
-    expect(kept(check("submit_effects", sub(cand(["r1"])), 3, cx))).toMatchObject({ baseline: { unusual: true } });
-    for (const e of [kept(check("submit_effects", sub(cand(["r2"])), 3, cx)), kept(check("submit_effects", sub(cand(["r3"], false)), 3, cx))]) {
+    const lx = { ...cx, loose: true };
+    expect(kept(check("submit_effects", sub(cand(["r1"])), 3, lx))).toMatchObject({ baseline: { unusual: true } });
+    for (const e of [kept(check("submit_effects", sub(cand(["r2"])), 3, lx)), kept(check("submit_effects", sub(cand(["r3"], false)), 3, lx))]) {
       expect(e.unverified).toBe(true);
       expect(e.baseline).toBeUndefined();
     }

@@ -167,8 +167,9 @@ export function fold(events: readonly AgentEvent<V3Kinds>[]): Folded {
   const out: Folded = { setup: null, graph: null, entries: [], lastTurn: -1, exit: null, report: null, steps: [] };
   for (const event of events) {
     if (event.kind === "rootcause_setup") {
-      out.setup = event.payload;
-      out.graph = seedFromAlert(createGraph(event.run_id), event.payload.alert, event.payload.cfg);
+      // A ledger written before loose was a setting ran loose: it replays, and resumes, the way it ran.
+      out.setup = event.payload.cfg.loose === undefined ? { ...event.payload, cfg: { ...event.payload.cfg, loose: true } } : event.payload;
+      out.graph = seedFromAlert(createGraph(event.run_id), event.payload.alert, out.setup.cfg);
     } else if (event.kind === "rootcause_turn" && out.setup !== null && out.graph !== null) {
       const { turn, rare, entries } = event.payload;
       if (rare !== undefined) out.graph.rare = rare;
