@@ -2,7 +2,7 @@
 // On an attributed-to edge the identity signals settle who performed the action.
 import { buildAttributionPatch } from "../attribution.js";
 import type { GraphPatch } from "../graph.js";
-import { entitiesOf } from "../coverage.js";
+import { entitiesOf, gapNote } from "../coverage.js";
 import { instructions } from "../model/prompts.js";
 import type { SubmitAssessment } from "../model/schemas.js";
 import { boundaryPatch, candidatePatch, merge, noteSuspicious, userContent, Vetter, type Handler } from "./common.js";
@@ -11,21 +11,22 @@ export const strengthen: Handler = async (d, g, ctx) => {
   const id = d.targetId;
   const edge = g.edges[id];
   const node = g.nodes[id] ?? g.nodes[edge!.target]!;
+  // The alert is checked for whether it happened, not whether it was benign: that is what the causes decide
+  // (a run once ruled the alert out in 2 turns as "routine for its role" before any cause search). On the
+  // symptom only a direct record refutes, it cannot be flagged legitimate, and an empty search in a source that
+  // records none of its entities does not refute it (coverage.ts).
+  const symptom = !edge && !!g.nodes[id]?.isSymptom;
   const r = await ctx.model.runTurn({
     move: "strengthen", correlationId: id, submitTool: "submit_assessment", allowedDomains: ctx.domains, focusTime: node.observedAt, trace: ctx.trace,
     maxSearches: ctx.cfg.strengthenSearches,
-    userContent: userContent(g, id, instructions.strengthen(g, id), ctx, ctx.domains, "", ctx.cfg.strengthenSearches),
+    userContent: userContent(g, id, instructions.strengthen(g, id), ctx, ctx.domains, symptom ? gapNote(ctx) : "", ctx.cfg.strengthenSearches),
   });
   const bump = { incrementAttempts: [id] };
   const sub = r.submission as SubmitAssessment | null;
   if (!sub) return merge(bump);
   noteSuspicious(sub, ctx);
   const v = new Vetter(ctx, r.toolCalls);
-  // The alert is checked for whether it happened, not whether it was benign: that is what the causes decide
-  // (a run once ruled the alert out in 2 turns as "routine for its role" before any cause search). On the
-  // symptom only a direct record refutes, and it cannot be flagged legitimate.
-  const symptom = !edge && !!g.nodes[id]?.isSymptom;
-  const all = await v.evidence(sub.evidence, edge ? g.nodes[edge.source]!.domain : node.domain, entitiesOf(g, id));
+  const all = await v.evidence(sub.evidence, edge ? g.nodes[edge.source]!.domain : node.domain, symptom ? entitiesOf(g, id) : []);
   const kept = symptom ? all.filter((e) => e.polarity === "supports" || e.strength === "direct") : all;
   if (kept.length < all.length) ctx.trace.write("rejected-evidence", { target: id, dropped: all.length - kept.length, reason: "only a direct record refutes the alert itself" });
   const evidence = kept.map((e) => ({ targetId: id, evidence: e }));

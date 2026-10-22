@@ -9,15 +9,14 @@ import type { BoundaryT, CandidateT, EvidenceInT, IdentitySignalT } from "../mod
 import { snapshot } from "../model/snapshot.js";
 import { vetEvidence } from "../scoring.js";
 import { routineShown } from "../baseline.js";
-import { coverageGap, entitiesOf, gapNote } from "../coverage.js";
-import { sweepValues } from "../sweep.js";
+import { coverageGap } from "../coverage.js";
 import { issued } from "../tools/registry.js";
 import type { Domain, LoopContext } from "../types.js";
 
 export type Handler = (decision: FrontierDecision, graph: Readonly<Graph>, ctx: LoopContext) => Promise<GraphPatch>;
 
 export function userContent(g: Graph, targetId: string, instructions: string, ctx: LoopContext, allowed: Domain[], extra = "", cap?: number): string {
-  return [snapshot(g), currentTarget(g, targetId), instructions, constraints(ctx.cfg, ctx.range, allowed, ctx.domains, [extra, gapNote(ctx)].filter(Boolean).join("\n"), cap, ctx.tools.coverage, ctx.sizes)].join("\n\n");
+  return [snapshot(g), currentTarget(g, targetId), instructions, constraints(ctx.cfg, ctx.range, allowed, ctx.domains, extra, cap, ctx.tools.coverage, ctx.sizes)].join("\n\n");
 }
 
 // Evidence from the model, checked against this turn's tool calls. Rejected items go to the trace.
@@ -56,7 +55,8 @@ export class Vetter {
   }
   // Refuting items whose cited searches all came back empty: a search in a source with no record of the entities
   // is a coverage gap, not refutation, and is dropped from the item; an item left citing nothing is dropped. Both
-  // are traced (see coverage.ts). Sequential: each lookup takes the next ref.
+  // are traced (see coverage.ts). Sequential: each lookup takes the next ref. Only evidence about the alert itself is
+  // checked this way; refutations of other events and links count as cited.
   async gated(list: EvidenceDraft[], entities: string[]): Promise<EvidenceDraft[]> {
     const out: EvidenceDraft[] = [];
     for (const e of list) {
@@ -68,6 +68,7 @@ export class Vetter {
     }
     return out;
   }
+  // entities: the alert's own, for evidence about the symptom (strengthen on it); empty elsewhere, so nothing is gated.
   async evidence(list: EvidenceInT[], source: Domain, entities: string[] = []): Promise<EvidenceDraft[]> {
     return this.gated(this.vetted(list, source), entities);
   }
@@ -103,10 +104,9 @@ export const tempId = (prefix: string) => `${prefix}#${++tempSeq}`;
 export async function candidatePatch(c: CandidateT, v: Vetter, g: Graph, ctx: LoopContext, target?: string): Promise<{ patch: Partial<GraphPatch>; id: string; node: NodeIn }> {
   const id = tempId("cand");
   const domain = ctx.domains.includes(c.domain) ? c.domain : c.domain || "unknown";
-  const own = sweepValues(g, { id, artifacts: c.artifacts });
   const node: NodeIn = {
     tempId: id, kind: "action", label: c.label, domain, prior: c.prior,
-    evidence: await v.evidence(c.nodeEvidence, domain, own), artifacts: c.artifacts,
+    evidence: await v.evidence(c.nodeEvidence, domain), artifacts: c.artifacts,
     observedAt: v.checkTime(c.observedAt, [...c.nodeEvidence, ...c.edgeEvidence].flatMap((e) => e.toolCallIds), c.label),
     ...(c.isRootCause && !rootTooEarly(c, g, ctx) ? { isRoot: true, rootJustification: c.rootJustification } : {}),
     ...(c.deadEnd ? { deadEnd: true } : {}),
@@ -119,7 +119,7 @@ export async function candidatePatch(c: CandidateT, v: Vetter, g: Graph, ctx: Lo
   // Routine work joins the attack's chain only on a record of the join: as a cause of a non-legitimate event it
   // needs direct edge evidence (a developer's routine registration once became the cause of a stolen role's
   // first call on timing alone, and the run spent turns on the developer's CI).
-  const edgeEv = target ? await v.evidence(c.edgeEvidence, domain, [...new Set([...own, ...entitiesOf(g, target)])]) : [];
+  const edgeEv = target ? await v.evidence(c.edgeEvidence, domain) : [];
   const unproven = !!target && !!node.legitimate && !g.nodes[target]?.legitimate && !edgeEv.some((e) => e.strength === "direct" && e.polarity === "supports");
   // The link is kept as inferred (circumstantial) instead of dropping the step.
   if (unproven) {

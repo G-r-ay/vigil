@@ -1,9 +1,12 @@
-// An empty search refutes an event only when its source records the entity at all (coverage.ts): otherwise it is
-// a coverage gap, dropped before the patch, whatever the model labelled it.
+// An empty search refutes the alert only when its source records the alert's entities at all (coverage.ts):
+// otherwise it is a coverage gap, dropped before the patch, whatever the model labelled it. Refutations of other
+// events and links are not checked: they count as cited.
 import { describe, expect, it } from "vitest";
-import { Vetter } from "../../../plugins/rootcause/v3/handlers/common.js";
+import { candidatePatch, Vetter } from "../../../plugins/rootcause/v3/handlers/common.js";
+import { strengthen } from "../../../plugins/rootcause/v3/handlers/strengthen.js";
+import { test as testMove } from "../../../plugins/rootcause/v3/handlers/test.js";
 import { gapNote } from "../../../plugins/rootcause/v3/coverage.js";
-import { createGraph } from "../../../plugins/rootcause/v3/graph.js";
+import { createGraph, type Theory } from "../../../plugins/rootcause/v3/graph.js";
 import { sweep } from "../../../plugins/rootcause/v3/sweep.js";
 import { type ModelClient } from "../../../plugins/rootcause/v3/model/client.js";
 import { run } from "../../../plugins/rootcause/v3/orchestrator.js";
@@ -13,7 +16,7 @@ import { splunkTool } from "../../../plugins/rootcause/v3/tools/splunk-tool.js";
 import { MemoryTrace } from "../../../plugins/rootcause/v3/trace.js";
 import type { Alert } from "../../../plugins/rootcause/v3/types.js";
 import { SpendingScript } from "./support.js";
-import { apply, cfg, node, seeded } from "./helpers.js";
+import { apply, cfg, ev, node, seeded } from "./helpers.js";
 
 const range: [string, string] = ["2026-03-11T00:00:00Z", "2026-03-14T00:00:00Z"];
 const EMPTY = "0 events matched, 0 results (showing 0 of 0)";
@@ -159,5 +162,66 @@ describe("coverage gaps", () => {
     expect(g!.nodes["N1"]).toMatchObject({ status: "suspected", confidence: 0.5 });
     expect(b.probes.length).toBeGreaterThan(0);
     expect(trace.chronological().some((e) => e.type === "rejected-evidence" && /coverage gap: sysmon holds no events on FYODOR-L/.test(JSON.stringify(e.payload)))).toBe(true);
+  });
+
+  // The alert N1 and a cause N2 on the same host, linked by E1; sysmon holds nothing on the host, winlog does.
+  const onHost = () => {
+    const g = createGraph("t");
+    const host = [{ kind: "host" as const, value: "FYODOR-L" }];
+    apply(g, { addNodes: [node("S", { isSymptom: true, label: "symptom", domain: "sysmon", artifacts: host, evidence: [ev("direct", "supports", ["rs"])] })] });
+    apply(g, { addNodes: [node("c", { label: "stager dropped", domain: "sysmon", prior: 0.5, artifacts: host })], addEdges: [{ tempId: "e", kind: "explains", source: "c", target: "N1", prior: 0.5, evidence: [] }] });
+    return g;
+  };
+  const moving = (sub: unknown, prompts: string[] = []) => {
+    const s = setup({ winlog: ["FYODOR-L"] });
+    s.ctx.model = { runTurn: async (t: { userContent: string }) => { prompts.push(t.userContent); return { submission: sub, toolCalls: [] }; } };
+    return s;
+  };
+
+  it("gates only the alert itself: strengthen on the symptom drops the refutation, on another event or a link keeps it", async () => {
+    const g = onHost();
+    const sub = { evidence: [] as unknown[], reasoning: "" };
+    const prompts: string[] = [];
+    const { b, ctx, search } = moving(sub, prompts);
+    sub.evidence = refutes([await search("sysmon")]);
+    expect((await strengthen({ move: "strengthen", targetId: "N1", turn: 3, reason: "" }, g, ctx)).addEvidence).toEqual([]);
+    expect(b.probes).toHaveLength(1);
+    expect(gapNote(ctx)).toMatch(/sysmon holds no events on FYODOR-L.*whether the alert happened/);
+    for (const targetId of ["N2", "E1"]) {
+      const p = await strengthen({ move: "strengthen", targetId, turn: 3, reason: "" }, g, ctx);
+      expect(p.addEvidence).toMatchObject([{ targetId, evidence: { polarity: "refutes", toolCallIds: sub.evidence.flatMap((e: any) => e.toolCallIds) } }]);
+    }
+    expect(b.probes).toHaveLength(1); // no lookup for evidence about other events
+    // The gap note goes only to turns on the alert itself.
+    await strengthen({ move: "strengthen", targetId: "N1", turn: 3, reason: "" }, g, ctx);
+    expect(prompts.map((x) => /Coverage gaps/.test(x))).toEqual([false, false, false, true]);
+  });
+
+  it("keeps a new event's refuting evidence and its link's, from empty searches in an uncovered source", async () => {
+    const g = onHost();
+    const { b, ctx, search } = moving(null);
+    const id = await search("sysmon");
+    const c: any = { label: "beacon", domain: "sysmon", prior: 0.4, artifacts: [{ kind: "host", value: "FYODOR-L" }], nodeEvidence: refutes([id]), edgeEvidence: refutes([id]) };
+    const x = await candidatePatch(c, new Vetter(ctx, []), g, ctx, "N1");
+    expect(x.node.evidence).toMatchObject([{ polarity: "refutes", toolCallIds: [id] }]);
+    expect(x.patch.addEdges![0]!.evidence).toMatchObject([{ polarity: "refutes", toolCallIds: [id] }]);
+    expect(b.probes).toEqual([]);
+  });
+
+  it("keeps a test's contradiction of a graph event or link, from empty searches in an uncovered source", async () => {
+    const g = onHost();
+    const theory: Theory = { id: "R1.H1", round: 1, story: "s", accountsFor: [], gaps: "", status: "live", support: 0, against: 0,
+      predictions: [{ id: "R1.P1", sourcetype: "sysmon", expect: "e", spl: "index=lab", separates: [], next: true, status: "open" }] };
+    g.theories = [theory];
+    const sub: any = { outcome: "unclear", summary: "no Sysmon record of the stager", toolCallIds: [], supports: [], weakens: [], events: [], contradicts: ["N2", "E1"] };
+    const prompts: string[] = [];
+    const { b, ctx, search } = moving(sub, prompts);
+    const id = await search("sysmon");
+    sub.toolCallIds = [id];
+    await new Vetter(ctx, []).evidence(refutes([id]), "sysmon", ["FYODOR-L"]); // a gap on the alert is known
+    const p = await testMove({ move: "test", targetId: "R1.P1", turn: 3, reason: "" }, g, ctx);
+    expect(p.addEvidence).toMatchObject([{ targetId: "N2", evidence: { polarity: "refutes", toolCallIds: [id] } }, { targetId: "E1", evidence: { polarity: "refutes", toolCallIds: [id] } }]);
+    expect(b.probes).toHaveLength(1);
+    expect(prompts[0]).not.toMatch(/Coverage gaps/);
   });
 });

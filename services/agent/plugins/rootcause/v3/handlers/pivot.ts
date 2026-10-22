@@ -2,7 +2,6 @@
 // entry events; each later step asks what the best lead produced. Every new node is run through the
 // stitch matcher against the marker's origin.
 import type { GraphNode, GraphPatch, NodeIn } from "../graph.js";
-import { entitiesOf } from "../coverage.js";
 import { instructions } from "../model/prompts.js";
 import type { SubmitEffects, SubmitEntryPoints } from "../model/schemas.js";
 import { matchBoundary, sameEvent } from "../stitch.js";
@@ -88,7 +87,7 @@ export const pivot: Handler = async (d, g, ctx) => {
   for (const c of kept) {
     const x = await candidatePatch(c, v, g, ctx);
     x.node.evidence.push(...evidenceFor(c));
-    x.patch.addEdges!.unshift({ tempId: tempId("fwd"), kind: "explains", source: leaf.id, target: x.id, prior: c.prior, evidence: await v.evidence(c.edgeEvidence, c.domain, entitiesOf(g, leaf.id)) });
+    x.patch.addEdges!.unshift({ tempId: tempId("fwd"), kind: "explains", source: leaf.id, target: x.id, prior: c.prior, evidence: await v.evidence(c.edgeEvidence, c.domain) });
     made.push(x);
   }
   return merge(...made.map((x) => x.patch), stitch(made.map((x) => x.node)), { updateMarkers: [{ markerId: m.id, pivotSteps: steps + 1, forwardLeaves: [...rest, ...made.map((x) => x.id)] }] });

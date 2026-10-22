@@ -3,7 +3,6 @@
 // reports the steps in between and the links. A link into a node with an open boundary resolves that boundary:
 // its cause has been found.
 import type { EdgeIn, GraphPatch } from "../graph.js";
-import { entitiesOf } from "../coverage.js";
 import { toConnect } from "../frontier.js";
 import { instructions } from "../model/prompts.js";
 import type { SubmitLinks } from "../model/schemas.js";
@@ -43,7 +42,7 @@ export const connect: Handler = async (d, g, ctx) => {
   let resolve: GraphPatch["resolveBoundary"];
   for (const l of sub.links) {
     const a = end(l.from), b = end(l.to);
-    const evidence = await v.evidence(l.evidence, a && g.nodes[a.id] ? g.nodes[a.id]!.domain : ctx.domains[0]!, entitiesOf(g, ...[a?.id, b?.id].filter((x): x is string => !!x)));
+    const evidence = await v.evidence(l.evidence, a && g.nodes[a.id] ? g.nodes[a.id]!.domain : ctx.domains[0]!);
     const why = !a || !b ? `unknown end ${!a ? l.from : l.to}`
       : a.id === b.id ? "a link joins two different events"
       : a.at && b.at && Date.parse(a.at) > Date.parse(b.at) + SKEW_MS ? `${l.from} (${a.at}) is after ${l.to} (${b.at}); a cause comes first`
