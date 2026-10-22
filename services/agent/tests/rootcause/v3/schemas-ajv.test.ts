@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { schemaErrors } from "../../../core/stream.js";
-import { clip, salvage } from "../../../plugins/rootcause/v3/model/client.js";
+import { clip, salvage, stripUnknown } from "../../../plugins/rootcause/v3/model/client.js";
 import { lengthLimits, SUBMIT, type SubmitName } from "../../../plugins/rootcause/v3/model/schemas.js";
 import { splunkTool } from "../../../plugins/rootcause/v3/tools/splunk-tool.js";
 
@@ -42,6 +42,36 @@ describe("v3 tool schemas", () => {
     const input = { theories: [theory("H1"), theory("H2")], nextTests: ["P1"], reasoning: "r" };
     expect(salvage("submit_theories", input, 0, {}, { success: false, msg: "m", drop: [["theories", 0]] })).toBeNull();
     expect(salvage("submit_theories", { ...input, theories: [theory("H1"), theory("H2"), theory("H3")] }, 0, {}, { success: false, msg: "m", drop: [["theories", 0]] })?.dropped).toBe(1);
+  });
+});
+
+// As the reference's zod (a plain object) parses a submission: what its schema has no field for is dropped at every
+// depth, and the rest is left for the schema to judge.
+describe("a submission stripped of keys its schema has no field for", () => {
+  it("drops them at every depth, in list items and nested objects, and says where each was", () => {
+    const ev = { summary: "s", strength: "direct", polarity: "supports", toolCallIds: ["r1"], edge: "E1" };
+    const input = { ...causes, candidates: [{ ...cand, boundary: { targetDomain: "x" }, nodeEvidence: [ev], baseline: { summary: "s", unusual: true, toolCallIds: ["r1"], window: "30d" } }], source: "edr", next: { move: "expand", why: "w", hint: "h" } };
+    const { value, stripped } = stripUnknown(SUBMIT.submit_causes, input);
+    expect(stripped.sort()).toEqual(["candidates.0.baseline.window", "candidates.0.boundary", "candidates.0.nodeEvidence.0.edge", "next.hint", "source"]);
+    expect(schemaErrors(SUBMIT.submit_causes, value)).toBeNull();
+    const { edge: _, ...kept } = ev;
+    expect(value).toEqual({ ...causes, candidates: [{ ...cand, nodeEvidence: [kept], baseline: { summary: "s", unusual: true, toolCallIds: ["r1"] } }], next: { move: "expand", why: "w" } });
+    // The input is not changed.
+    expect(input.candidates[0]).toHaveProperty("boundary");
+  });
+  it("leaves a value of the wrong type for the schema to refuse, as zod does", () => {
+    const { value, stripped } = stripUnknown(SUBMIT.submit_causes, { ...causes, next: "expand", candidates: "[]" });
+    expect(stripped).toEqual([]);
+    expect(schemaErrors(SUBMIT.submit_causes, value)).toContain("/next must be object");
+  });
+  it("leaves an object whose schema allows other keys as it is", () => {
+    const open = { type: "object", properties: { a: { type: "string" } } };
+    expect(stripUnknown(open, { a: "x", b: 1 })).toEqual({ value: { a: "x", b: 1 }, stripped: [] });
+  });
+  it("is what a salvage starts from: a failure that rested on a stray key is judged again without it, and costs no item", () => {
+    const input = { ...causes, candidates: [{ ...cand, notes: "x" }, { ...cand, label: "b" }] };
+    const first = { success: false as const, msg: 'candidates.0: unrecognized key "notes"', drop: [["candidates", 0]] };
+    expect(salvage("submit_causes", input, 0, {}, first)).toEqual({ data: { ...causes, candidates: [cand, { ...cand, label: "b" }] }, dropped: 0 });
   });
 });
 

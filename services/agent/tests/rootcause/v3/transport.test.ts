@@ -193,64 +193,50 @@ describe("a move as a kernel turn", () => {
       expect((await u.client.runTurn(u.request({ submitTool: "submit_theories" }))).submission).toBeNull();
     });
 
+    // As the reference's zod parses it: a key the schema has no field for is dropped, at any depth, and is never an
+    // error. Nothing is lifted from where it was put to where the schema has a field of that name.
     describe("a key the schema does not know", () => {
       const boundary = { targetDomain: "email", reason: "the mail gateway would record the sender", inDomainExhausted: true };
       const emit = async (submission: unknown, submitTool: TurnRequest["submitTool"] = "submit_causes") => {
         const t = setup((request) => (request.emit !== undefined ? { emit: submission } : { content: "done" }));
         const out = await t.client.runTurn(t.request({ submitTool }));
-        return { t, got: out.submission as { candidates: { label: string }[]; boundary?: unknown } | null, note: t.trace.chronological().find((e) => e.type === "rejected-submission")?.payload as Record<string, string> | undefined };
+        const entry = (type: string) => t.trace.chronological().find((e) => e.type === type)?.payload as Record<string, unknown> | undefined;
+        return { t, got: out.submission as { candidates: { label: string }[]; boundary?: unknown } | null, note: entry("rejected-submission"), taken: entry("submission"), emits: t.provider.requests.filter((r) => r.emit !== undefined).length };
       };
 
-      it("is removed from a candidate that is kept, and a boundary in it moves up to the top level", async () => {
-        const { got, note } = await emit({ candidates: [{ ...cand("phishing email delivered", []), boundary }, cand("also good", [])], reasoning: "r" });
-        expect(got!.candidates.map((c) => c.label)).toEqual(["phishing email delivered", "also good"]);
-        expect(got!.candidates[0]).not.toHaveProperty("boundary");
-        expect(got!.boundary).toEqual(boundary);
-        expect(note!["salvaged"]).toBe("kept the rest, dropped 0 item(s)");
-        expect(note!["repaired"]).toBe("stripped 1 unknown key(s), lifted boundary to the top level");
+      it("is dropped from a candidate on the first emission, and a boundary in it is not lifted to the top level", async () => {
+        const { got, note, taken, emits } = await emit({ candidates: [{ ...cand("phishing email delivered", []), boundary }, cand("also good", [])], reasoning: "r" });
+        expect(emits).toBe(1);
+        expect(got).toEqual({ candidates: [cand("phishing email delivered", []), cand("also good", [])], reasoning: "r" });
+        expect(note).toBeUndefined();
+        expect(taken!["stripped"]).toEqual(["candidates.0.boundary"]);
       });
 
-      it("is dropped, not lifted, when the top level already has that field or the value does not fit it", async () => {
-        const top = { ...boundary, reason: "set at the top" };
-        const held = await emit({ candidates: [{ ...cand("kept", []), boundary }], boundary: top, reasoning: "r" });
-        expect(held.got!.candidates[0]).not.toHaveProperty("boundary");
-        expect(held.got!.boundary).toEqual(top);
-        expect(held.note!["repaired"]).toBe("stripped 1 unknown key(s)");
-        const misfit = await emit({ candidates: [{ ...cand("kept", []), boundary: { targetDomain: "email" } }], reasoning: "r" });
-        expect(misfit.got!.candidates.map((c) => c.label)).toEqual(["kept"]);
-        expect(misfit.got).not.toHaveProperty("boundary");
-        expect(misfit.note!["repaired"]).toBe("stripped 1 unknown key(s)");
-      });
-
-      it("is removed from the candidate, whatever it is called, and from the submission itself", async () => {
-        const inner = await emit({ candidates: [{ ...cand("kept", []), notes: "x" }], reasoning: "r" });
+      it("is dropped whatever it is called, from the candidate and from the submission itself", async () => {
+        const inner = await emit({ candidates: [{ ...cand("kept", []), notes: "x", nodeEvidence: [{ ...cand("", []).nodeEvidence[0], edge: "E1" }] }], reasoning: "r" });
         expect(inner.got!.candidates).toEqual([cand("kept", [])]);
-        expect(inner.note!["repaired"]).toBe("stripped 1 unknown key(s)");
-        const root = await emit({ candidates: [cand("kept", [])], reasoning: "r", confidence: 0.9 });
+        expect(inner.taken!["stripped"]).toEqual(["candidates.0.nodeEvidence.0.edge", "candidates.0.notes"]);
+        const root = await emit({ candidates: [cand("kept", [])], reasoning: "r", confidence: 0.9, source: "edr", why: "w" });
         expect(root.got).toEqual({ candidates: [cand("kept", [])], reasoning: "r" });
-        expect(root.note!["repaired"]).toBe("stripped 1 unknown key(s)");
+        expect(root.taken!["stripped"]).toEqual(["confidence", "source", "why"]);
+        const entry = await emit({ candidates: [{ ...cand("kept", []), boundary }], reasoning: "r" }, "submit_entry_points");
+        expect(entry.got).toEqual({ candidates: [cand("kept", [])], reasoning: "r" });
       });
 
-      it("does not save a candidate with a real error: it is dropped, and what it carried is not lifted", async () => {
+      it("does not save a candidate with a real error: it is dropped whole, and the rest kept without their stray keys", async () => {
         const { label: _, ...unlabelled } = cand("", []);
-        const { got, note } = await emit({ candidates: [{ ...unlabelled, boundary }, cand("kept", [])], reasoning: "r" });
-        expect(got!.candidates.map((c) => c.label)).toEqual(["kept"]);
-        expect(got).not.toHaveProperty("boundary");
+        const { got, note, emits } = await emit({ candidates: [{ ...unlabelled, boundary }, { ...cand("kept", []), notes: "x" }], reasoning: "r" });
+        expect(emits).toBe(2);
+        expect(got).toEqual({ candidates: [cand("kept", [])], reasoning: "r" });
         expect(note!["salvaged"]).toBe("kept the rest, dropped 1 item(s)");
-        expect(note).not.toHaveProperty("repaired");
+        expect(note!["error"]).not.toContain("boundary");
+        expect(note!["stripped"]).toEqual(["candidates.0.boundary", "candidates.1.notes"]);
       });
 
-      it("is lifted only from a candidate the check keeps, and only the dropped candidate is counted", async () => {
-        const lost = await emit({ candidates: [{ ...cand("token minted outside captured telemetry", []), boundary }, { ...cand("kept", []), notes: "x" }], reasoning: "r" });
-        expect(lost.got!.candidates.map((c) => c.label)).toEqual(["kept"]);
-        expect(lost.got).not.toHaveProperty("boundary");
-        expect(lost.note!["salvaged"]).toBe("kept the rest, dropped 1 item(s)");
-        expect(lost.note!["repaired"]).toBe("stripped 2 unknown key(s)");
-        const kept = await emit({ candidates: [cand("token minted outside captured telemetry", []), { ...cand("kept", []), boundary }], reasoning: "r" });
-        expect(kept.got!.candidates).toEqual([cand("kept", [])]);
-        expect(kept.got!.boundary).toEqual(boundary);
-        expect(kept.note!["salvaged"]).toBe("kept the rest, dropped 1 item(s)");
-        expect(kept.note!["repaired"]).toBe("stripped 1 unknown key(s), lifted boundary to the top level");
+      it("drops a candidate the check refuses, and only that one", async () => {
+        const { got, note } = await emit({ candidates: [{ ...cand("token minted outside captured telemetry", []), boundary }, { ...cand("kept", []), notes: "x" }], reasoning: "r" });
+        expect(got).toEqual({ candidates: [cand("kept", [])], reasoning: "r" });
+        expect(note!["salvaged"]).toBe("kept the rest, dropped 1 item(s)");
       });
 
       it("does not fill a missing required field from an item: the submission still fails", async () => {
@@ -262,12 +248,6 @@ describe("a move as a kernel turn", () => {
         const { got, note } = await emit({ candidates: [cand("cites a search never run", ["r9"]), { ...cand("kept", []), notes: "x" }], reasoning: "r" });
         expect(got).toBeNull();
         expect(note).not.toHaveProperty("salvaged");
-      });
-
-      it("is dropped, not lifted, when the submission has no such field (entry points carry no boundary)", async () => {
-        const { got, note } = await emit({ candidates: [{ ...cand("kept", []), boundary }], reasoning: "r" }, "submit_entry_points");
-        expect(got).toEqual({ candidates: [cand("kept", [])], reasoning: "r" });
-        expect(note!["repaired"]).toBe("stripped 1 unknown key(s)");
       });
     });
 
@@ -425,37 +405,62 @@ describe("an answer that fails its check goes back to the model, twice at most",
 describe("an answer that fails its schema goes back to the model like one that fails its check", () => {
   const submit = (answer: unknown) => ({ calls: [{ tool: SUBMIT_TOOL, args: answer }] });
   const good = { candidates: [cand("curl wrote /tmp/x", ["r1"]), cand("bash ran curl", ["r1"])], reasoning: "r" };
-  // The live failure: a key the schema does not know on the second candidate.
-  const stray = { candidates: [cand("curl wrote /tmp/x", ["r1"]), { ...cand("bash ran curl", ["r1"]), boundary: { source: "proxy" } }], reasoning: "r" };
+  // The live failures: a key the schema does not know inside a candidate, and the next move's fields flattened to the top.
+  const stray = { candidates: [cand("curl wrote /tmp/x", ["r1"]), { ...cand("bash ran curl", ["r1"]), boundary: { source: "proxy" }, edge: "E1" }], reasoning: "r" };
   const labels = (out: { submission: unknown }) => (out.submission as { candidates: { label: string }[] }).candidates.map((c) => c.label);
-  const fix = `Invalid submission: candidates.1: unrecognized key "boundary". Fix it and call ${SUBMIT_TOOL} again.`;
+  const taken = (t: ReturnType<typeof setup>) => t.trace.chronological().find((e) => e.type === "submission")?.payload as Record<string, unknown>;
 
-  it("takes the fixed answer after one correction, with nothing salvaged", async () => {
-    const t = setup((_, n) => (n === 1 ? { calls: [{ tool: "splunk_query", args: SEARCH }] } : n === 2 ? submit(stray) : submit(good)), { [SEARCH.spl]: "3 events matched" });
+  // As the reference's zod: a key the schema has no field for is dropped, not an error, so it costs no correction.
+  it("takes an answer whose only fault is a key the schema does not know the first time, without that key", async () => {
+    const t = setup((_, n) => (n === 1 ? { calls: [{ tool: "splunk_query", args: SEARCH }] } : submit(stray)), { [SEARCH.spl]: "3 events matched" });
+    const out = await t.client.runTurn(t.request());
+
+    expect(t.provider.requests).toHaveLength(2);
+    expect(out.submission).toEqual(good);
+    expect((await t.calls()).map((c) => [c.ref, c.tool])).toEqual([["r1", "splunk_query"]]);
+    expect(t.trace.chronological().map((e) => e.type)).not.toContain("rejected-submission");
+    expect(taken(t)["stripped"]).toEqual(["candidates.1.boundary", "candidates.1.edge"]);
+  });
+
+  it("still corrects a next move sent as a string, dropping the next move's fields flattened beside it", async () => {
+    const flat = { ...good, source: "edr", target: "N1", why: "the parent process", next: "expand" };
+    const t = setup((_, n) => (n === 1 ? { calls: [{ tool: "splunk_query", args: SEARCH }] } : n === 2 ? submit(flat) : submit({ ...good, next: { move: "expand", target: "N1", why: "the parent process" } })), { [SEARCH.spl]: "3 events matched" });
     const out = await t.client.runTurn(t.request());
 
     expect(t.provider.requests).toHaveLength(3);
-    expect(t.provider.requests.some((r) => r.emit !== undefined)).toBe(false);
-    expect(labels(out)).toEqual(["curl wrote /tmp/x", "bash ran curl"]);
-    expect(t.trace.chronological().map((e) => e.type)).not.toContain("rejected-submission");
     const calls = await t.calls();
-    expect(calls.map((c) => [c.ref, c.tool, c.ok, c.failure])).toEqual([["r1", "splunk_query", true, null], ["r2", SUBMIT_TOOL, false, "invalid_args"]]);
-    expect(calls[1]!.result).toContain(fix);
-    expect(out.toolCalls.map((c) => c.id)).toEqual(["r1"]);
-    expect(issued(t.tools, "r2")).toBe(false);
+    expect(calls.map((c) => [c.ref, c.tool, c.failure])).toEqual([["r1", "splunk_query", null], ["r2", SUBMIT_TOOL, "invalid_args"]]);
+    expect(calls[1]!.result).toContain(`Invalid submission: next: must be object. Fix it and call ${SUBMIT_TOOL} again.`);
+    expect(calls[1]!.result).not.toContain("unrecognized key");
+    expect(labels(out)).toEqual(["curl wrote /tmp/x", "bash ran curl"]);
+    expect((out.submission as { next: unknown }).next).toEqual({ move: "expand", target: "N1", why: "the parent process" });
   });
 
-  it("salvages the last answer as before once both corrections are spent", async () => {
-    const t = setup((request, n) => (n === 1 ? { calls: [{ tool: "splunk_query", args: SEARCH }] } : request.emit !== undefined ? { emit: stray } : submit(stray)), { [SEARCH.spl]: "3 events matched" });
+  it("still corrects a value outside its enum, and says only that", async () => {
+    const off = { candidates: [cand("curl wrote /tmp/x", ["r1"]), { ...cand("bash ran curl", ["r1"]), edge: "E1", nodeEvidence: [{ summary: "s", strength: "strong", polarity: "supports", toolCallIds: ["r1"] }] }], reasoning: "r" };
+    const t = setup((_, n) => (n === 1 ? { calls: [{ tool: "splunk_query", args: SEARCH }] } : n === 2 ? submit(off) : submit(good)), { [SEARCH.spl]: "3 events matched" });
+    const out = await t.client.runTurn(t.request());
+
+    const calls = await t.calls();
+    expect(calls.map((c) => [c.ref, c.tool, c.failure])).toEqual([["r1", "splunk_query", null], ["r2", SUBMIT_TOOL, "invalid_args"]]);
+    expect(calls[1]!.result).toContain("Invalid submission: candidates.1.nodeEvidence.0.strength: must be equal to one of the allowed values: direct, corroborating, circumstantial. Fix it");
+    expect(calls[1]!.result).not.toContain("unrecognized key");
+    expect(labels(out)).toEqual(["curl wrote /tmp/x", "bash ran curl"]);
+  });
+
+  it("salvages the last answer as before once both corrections are spent, without its stray keys", async () => {
+    const off = { candidates: [{ ...cand("curl wrote /tmp/x", ["r1"]), edge: "E1" }, { ...cand("bash ran curl", ["r1"]), domain: 7 }], reasoning: "r", why: "w" };
+    const t = setup((request, n) => (n === 1 ? { calls: [{ tool: "splunk_query", args: SEARCH }] } : request.emit !== undefined ? { emit: off } : submit(off)), { [SEARCH.spl]: "3 events matched" });
     const out = await t.client.runTurn(t.request());
 
     // Two sent back, the third to the emission turn and its retry, as a schema-invalid submit always went.
     expect(t.provider.requests.map((r) => r.emit !== undefined)).toEqual([false, false, false, false, true, true]);
     expect((await t.calls()).map((c) => [c.ref, c.tool])).toEqual([["r1", "splunk_query"], ["r2", SUBMIT_TOOL], ["r3", SUBMIT_TOOL]]);
-    expect(labels(out)).toEqual(["curl wrote /tmp/x", "bash ran curl"]);
-    const note = t.trace.chronological().filter((e) => e.type === "rejected-submission").map((e) => e.payload as Record<string, string>);
+    expect(out.submission).toEqual({ candidates: [cand("curl wrote /tmp/x", ["r1"])], reasoning: "r" });
+    const note = t.trace.chronological().filter((e) => e.type === "rejected-submission").map((e) => e.payload as Record<string, unknown>);
     expect(note).toHaveLength(1);
-    expect(note[0]!["repaired"]).toBe("stripped 1 unknown key(s)");
+    expect(note[0]!["salvaged"]).toBe("kept the rest, dropped 1 item(s)");
+    expect(note[0]!["stripped"]).toEqual(["candidates.0.edge", "why"]);
     expect(out.failed).toBeUndefined();
   });
 });

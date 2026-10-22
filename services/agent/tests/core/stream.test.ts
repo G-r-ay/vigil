@@ -793,6 +793,54 @@ describe("a submit that misses the schema, with corrections", () => {
   });
 });
 
+// A caller whose schema is a parser's that drops keys it has no field for (root cause, as the reference's zod) prepares
+// each parsed answer before the schema holds it. Every other caller sets none, and an unknown key is an error as before.
+describe("a caller's prepare of the parsed answer", () => {
+  const submit = (verb: string, more: Record<string, unknown> = {}): ScriptedTurn => ({ calls: [{ tool: SUBMIT_TOOL, args: JSON.stringify({ verb, ...more }) }] });
+  const requests = (harness: Harness) => (harness.provider as ScriptedProvider).requests;
+  const told = (harness: Harness) => requests(harness).at(-1)!.messages.filter((message) => message.role === "tool").map((message) => message.content);
+  const LOOSE = { type: "object", required: ["verb"], additionalProperties: false, properties: { verb: { type: "string", enum: ["TALLY", "HALT"] } } };
+  const known = (answer: unknown) => ({ verb: (answer as { verb: unknown }).verb });
+
+  it("holds the answer as prepared: a key it drops is no error, and nothing is sent back", async () => {
+    const harness = harnessOf([submit("HALT", { note: "x" })]);
+    const outcome = await outcomeOf<{ verb: string }>(config({ schema: LOOSE, corrections: 2, prepare: known }), harness);
+
+    expect(outcome).toMatchObject({ status: "completed", value: { verb: "HALT" }, rejected: [] });
+    expect(requests(harness)).toHaveLength(1);
+    expect(outcome.calls).toEqual([]);
+  });
+
+  it("still sends back what the prepared answer gets wrong, and only that", async () => {
+    const harness = harnessOf([submit("SHOUT", { note: "x" }), submit("HALT")]);
+    const outcome = await outcomeOf<{ verb: string }>(config({ schema: LOOSE, corrections: 2, prepare: known }), harness);
+
+    expect(outcome.value).toEqual({ verb: "HALT" });
+    expect(outcome.calls).toHaveLength(1);
+    expect(told(harness)[0]).toContain("Invalid submission: verb: must be equal to one of the allowed values: TALLY, HALT. Fix it");
+    expect(told(harness)[0]).not.toContain("unrecognized key");
+    // The model is shown its call as it made it.
+    expect(requests(harness)[1]!.messages.at(-2)).toMatchObject({ tool_calls: [{ args: '{"verb":"SHOUT","note":"x"}' }] });
+  });
+
+  it("prepares an emission too, and hands on a rejected one as prepared", async () => {
+    const taken = harnessOf([{ content: "nothing to submit" }, { emit: { verb: "HALT", note: "x" } }]);
+    expect(await outcomeOf(config({ schema: LOOSE, prepare: known }), taken)).toMatchObject({ status: "completed", value: { verb: "HALT" } });
+
+    const refused = harnessOf([{ content: "nothing to submit" }, { emit: { verb: "SHOUT", note: "x" } }, { emit: { verb: "SHOUT", note: "x" } }]);
+    const out = await outcomeOf(config({ schema: LOOSE, prepare: known }), refused);
+    expect(out).toMatchObject({ status: "failed", emission_rejected: true });
+    expect(out.rejected_value).toEqual({ verb: "SHOUT" });
+  });
+
+  it("leaves a run with no prepare as it was: the unknown key is sent back", async () => {
+    const harness = harnessOf([submit("HALT", { note: "x" }), submit("HALT")]);
+    const outcome = await outcomeOf<{ verb: string }>(config({ schema: LOOSE, corrections: 2 }), harness);
+    expect(outcome.calls).toHaveLength(1);
+    expect(told(harness)[0]).toContain('Invalid submission: unrecognized key "note".');
+  });
+});
+
 describe("what the stream reports", () => {
   it("relays every text delta and hands the model the text it accumulated", async () => {
     const harness = harnessOf([{ deltas: ["think", "ing about it"], calls: [{ tool: "bump", args: "{}" }] }, { calls: [] }, HALT]);
