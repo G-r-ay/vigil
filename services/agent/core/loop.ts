@@ -68,6 +68,11 @@ export interface TurnConfig {
   // is what its step may spend, so the answer comes inside it, a call fewer at the cap. An
   // agent's cap counts its working turns, which a plugin budgets by, so its answer comes after.
   answer_within_cap?: boolean;
+  // Asked before every round but the first, while the answer can be a submit: true makes that round
+  // and every one after it the answer round, forced to the submit, as the round past the cap is. For a
+  // caller whose cap is not on rounds (root cause counts searches): once it is spent, the next round
+  // answers. Absent, only the round count forces the answer.
+  answer_now?: () => boolean;
   // Turns the caller already holds, seeded before the loop. A stateless client
   // posts the whole conversation each time and the run is one turn of it.
   history?: readonly Message[];

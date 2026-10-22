@@ -236,8 +236,12 @@ class Run<T, Kinds extends Record<string, unknown>> {
   private async *toolLoop(submit: boolean): AsyncGenerator<StreamEvent<T>, Outcome<T> | null> {
     // When the answer can be a tool call, the round after the search rounds is forced to the
     // submit tool where the wire allows. Inside the cap, a capped role pays for no round past it.
+    // A caller's answer_now forces it sooner; once forced, every round after is too.
+    let round = 0;
+    let forced = false;
     while (this.turns < this.searches + (submit ? 1 : 0)) {
-      const closing = this.turns >= this.searches;
+      forced ||= submit && round++ > 0 && this.cfg.answer_now?.() === true;
+      const closing = forced || this.turns >= this.searches;
       if (closing) this.capped = true;
       const fold = await this.folder.advance();
       // The answer round is the emission's stand-in, which never looked at the store.
