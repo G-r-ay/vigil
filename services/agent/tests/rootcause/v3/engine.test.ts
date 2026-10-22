@@ -294,6 +294,11 @@ describe("the run's range", () => {
     return (await state.read("r1")).find((e) => e.kind === "rootcause_setup")!.payload as SetupPayload;
   };
 
+  it("journals which intake mode the run ran in: strict, loose off", async () => {
+    const setup = await setupOf(splunk([]));
+    expect(setup.cfg.loose).toBe(false);
+  }, 20_000);
+
   it("is the data's own span in whole days, measured over all time, and the survey reads that range", async () => {
     const asked: Record<string, unknown>[] = [];
     // The fake index holds 2026-01-05T00:00 to 2026-01-06T00:00; the alert is at 2026-01-05T10:00.

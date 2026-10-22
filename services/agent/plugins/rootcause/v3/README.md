@@ -28,9 +28,11 @@ How a run goes (`engine.ts`):
   journals the search as a `call` event with it; the model cites refs. The registry keeps
   what each ref ran and returned for the baseline checks. A search the code makes itself
   (the rare sweep, a story's sweep, a presence lookup) takes the next ref and is journaled the same way.
-- A move's answer is held to `check()` inside the turn: an accusing label with no baseline is
-  tagged unverified, a link with no shared value is kept as inferred, and an item citing a
-  ref the ledger never journaled fails it. A failed answer, or one that misses the move's
+- A move's answer is held to `check()` inside the turn: an accusing label with no baseline, a
+  baseline that fails its checks, or an item citing a ref the ledger never journaled fails it,
+  and a link with no shared value is refused. `cfg.loose` (off by default, journaled in
+  `rootcause_setup`) is the reference's loose mode: such a finding is kept, tagged unverified,
+  and such a link kept as inferred. A failed answer, or one that misses the move's
   schema (an unknown key, say), goes back to the model to fix, twice at most between them (each time a `submit_answer` call on the ledger, numbered but no search);
   then salvage drops the items the failure rests on and keeps the rest. A turn with no
   valid answer is one attempt on its target.
