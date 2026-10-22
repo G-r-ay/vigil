@@ -28,6 +28,14 @@ export interface SourceScope {
   range: [string, string];
 }
 
+// The first and last event an index holds, whatever window a run would search: the data's own span, and the
+// search that measured it.
+export interface DataSpan {
+  query: string;
+  first: string;
+  last: string;
+}
+
 export interface SourceAdapter {
   backend: string;
   // The tool ids, as the binding flattens them, this adapter knows how to call.
@@ -36,6 +44,8 @@ export interface SourceAdapter {
   // The indexes (or their equivalent) the tool can search, largest first: what a run
   // picks its scope from when nothing configured names one.
   indexes(invoke: Invoke): Promise<string[]>;
+  // The span of the index's data, all of its tables together; null when it holds nothing. Throws when the search fails.
+  span(invoke: Invoke, index: string): Promise<DataSpan | null>;
 }
 
 export class UnsupportedSource extends Error {}

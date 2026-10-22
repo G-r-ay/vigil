@@ -1,10 +1,12 @@
 // The v3 loop as a worker run: what it journals and how it ends, on the real kernel with a scripted model.
 import { describe, expect, it } from "vitest";
 import type { AgentEvent, CallPayload } from "../../../contracts/events.js";
+import type { ToolResult } from "../../../contracts/tool.js";
+import type { ToolDispatch } from "../../../core/seams.js";
 import { seedFrom } from "../../../core/budget.js";
 import { InProcessState } from "../../../core/state.js";
-import { conclusionOf, runRootCauseV3 } from "../../../plugins/rootcause/v3/engine.js";
-import { engineOf, type V3Kinds } from "../../../plugins/rootcause/v3/ledger.js";
+import { conclusionOf, rangeOf, runRootCauseV3 } from "../../../plugins/rootcause/v3/engine.js";
+import { engineOf, type SetupPayload, type V3Kinds } from "../../../plugins/rootcause/v3/ledger.js";
 import { rootCauseV3Projection, rootCauseV3Replay } from "../../../plugins/rootcause/v3/projection.js";
 import { SUBMIT_TOOL } from "../../../core/stream.js";
 import { framed, harnessOf, modelOf, properties, specOf, splunk, telemetry } from "../../support/v3-run.js";
@@ -187,6 +189,79 @@ describe("a resumed run", () => {
     const refs = after.filter((e) => e.kind === "call").map((e) => (e.payload as CallPayload).ref);
     expect(new Set(refs).size).toBe(refs.length);
   }, 20_000);
+});
+
+describe("the run's range", () => {
+  // Framed and mapped, then stopped: the setup is journaled and nothing more is searched.
+  const setupOf = async (dispatch: ToolDispatch): Promise<SetupPayload> => {
+    const state = new InProcessState<V3Kinds>();
+    const spec = specOf();
+    let mapped = false;
+    const model = modelOf((request) => {
+      if (properties(request).includes("observed_at")) return { emit: framed() };
+      if (properties(request).includes("map")) { mapped = true; return { emit: { map: "One source, edr.", reasoning: "mapped" } }; }
+      return { content: "done" };
+    });
+    const stop = async () => (mapped ? { directive_id: "d1", actor: "ana", kind: "abort", text: "", created_at: "2026-01-05T00:00:00Z" } : null);
+    await runRootCauseV3(harnessOf(spec, model, dispatch, state), { run_id: "r1", spec, stop });
+    return (await state.read("r1")).find((e) => e.kind === "rootcause_setup")!.payload as SetupPayload;
+  };
+
+  it("is the data's own span in whole days, measured over all time, and the survey reads that range", async () => {
+    const asked: Record<string, unknown>[] = [];
+    // The fake index holds 2026-01-05T00:00 to 2026-01-06T00:00; the alert is at 2026-01-05T10:00.
+    const setup = await setupOf(splunk(asked));
+    expect(setup).toMatchObject({
+      range: ["2026-01-05T00:00:00.000Z", "2026-01-07T00:00:00.000Z"],
+      range_source: "data",
+      data_span: ["2026-01-05T00:00:00.000Z", "2026-01-06T00:00:00.000Z"],
+      span_query: "| tstats min(_time) as first max(_time) as last where index=lab",
+    });
+    const span = asked.find((a) => a["spl_query"] === setup.span_query)!;
+    expect(span).toMatchObject({ earliest: "0", latest: "2000000000" });
+    const survey = asked.find((a) => String(a["spl_query"]).includes("by sourcetype"))!;
+    expect(survey).toMatchObject({ earliest: String(Date.parse(setup.range[0]) / 1000), latest: String(Date.parse(setup.range[1]) / 1000) });
+  }, 20_000);
+
+  it("falls back to the alert's window when the span search fails, and says so", async () => {
+    const base = splunk();
+    const failing: ToolDispatch = {
+      invoke: async (tool, args, signal): Promise<ToolResult> =>
+        String(args["spl_query"] ?? "").includes("where index=lab") && !String(args["spl_query"]).includes("by sourcetype")
+          ? { ok: false, failure: { kind: "backend_error", detail: "Splunk: tstats is not allowed" } }
+          : base.invoke(tool, args, signal),
+    };
+    const setup = await setupOf(failing);
+    expect(setup).toMatchObject({ range: ["2025-12-22T10:00:00.000Z", "2026-01-06T10:00:00.000Z"], range_source: "alert-window", data_span: null });
+    expect(setup.range_note).toMatch(/tstats is not allowed.*alert's window: 14 days before it to a day after/);
+  }, 20_000);
+});
+
+describe("rangeOf", () => {
+  const span = { query: "q", first: "2026-08-11T03:12:00.000Z", last: "2026-08-13T21:40:00.000Z" };
+
+  it("rounds the data's span out to the midnights around it, as the reference's scenarios do", () => {
+    expect(rangeOf("2026-08-12T12:34:40Z", span, 14, "")).toMatchObject({ range: ["2026-08-11T00:00:00.000Z", "2026-08-14T00:00:00.000Z"], range_source: "data" });
+  });
+
+  it("keeps a last event at midnight inside the range: Splunk's latest is exclusive", () => {
+    expect(rangeOf("2026-08-12T00:00:00Z", { ...span, last: "2026-08-13T00:00:00.000Z" }, 14, "").range[1]).toBe("2026-08-14T00:00:00.000Z");
+  });
+
+  it("widens the range to an alert after the data's last event, or before its first", () => {
+    const after = rangeOf("2026-08-15T08:00:00Z", span, 14, "");
+    expect(after.range).toEqual(["2026-08-11T00:00:00.000Z", "2026-08-16T00:00:00.000Z"]);
+    expect(after.range_note).toMatch(/after the data's last event/);
+    const before = rangeOf("2026-08-09T23:00:00Z", span, 14, "");
+    expect(before.range).toEqual(["2026-08-09T00:00:00.000Z", "2026-08-14T00:00:00.000Z"]);
+    expect(before.range_note).toMatch(/before the data's first event/);
+  });
+
+  it("is the alert's window when the index holds nothing", () => {
+    expect(rangeOf("2026-08-12T12:34:40Z", null, 14, "the index holds no events")).toMatchObject({
+      range: ["2026-07-29T12:34:40.000Z", "2026-08-13T12:34:40.000Z"], range_source: "alert-window", data_span: null, range_note: expect.stringContaining("holds no events"),
+    });
+  });
 });
 
 describe("a ledger the engine did not open", () => {

@@ -1,7 +1,7 @@
 import { domainsIn, sizesIn, type Survey } from "../survey.js";
 import type { Job, JobOpts, JobRunner, Row } from "./job.js";
 import { LiveSearch } from "./search.js";
-import type { Invoke, Source, SourceAdapter, SourceScope } from "./source.js";
+import type { DataSpan, Invoke, Source, SourceAdapter, SourceScope } from "./source.js";
 import { splunkTool } from "./splunk-tool.js";
 
 // Splunk through Vigil's own server, splunk-selfhosted's splunk_execute. It answers one
@@ -51,6 +51,11 @@ export function splunkRunner(invoke: Invoke): JobRunner {
   };
 }
 
+// The index's first and last event, every sourcetype together, read from the index's own time index.
+export const spanQuery = (index: string) => `| tstats min(_time) as first max(_time) as last where index=${index}`;
+// All time, events stamped in the future too: the span is what sets the run's window, so nothing may bound it.
+const ALL_TIME = { earliest: 0, latest: 2e9, limit: 1 };
+
 const day = (v: unknown) => new Date(Number(v) * 1000).toISOString().slice(0, 16).replace("T", " ");
 
 // Every sourcetype in the index with its event count, span and real field names. Built
@@ -77,6 +82,15 @@ export const splunkAdapter: SourceAdapter = {
     const job = await splunkRunner(invoke).runJob("| eventcount summarize=false index=* | stats sum(count) as count by index | where count > 0 | sort - count", { earliest: 0, latest: Date.now() / 1000, limit: 200 });
     if (job.errors.length) throw new Error(`could not list the indexes: ${job.errors.join("; ")}`);
     return job.rows.map((r) => String(r["index"])).filter((i) => i !== "" && i !== "undefined");
+  },
+  async span(invoke: Invoke, index: string): Promise<DataSpan | null> {
+    const query = spanQuery(index);
+    const job = await splunkRunner(invoke).runJob(query, ALL_TIME);
+    if (job.errors.length) throw new Error(`the span of index ${index} could not be measured: ${job.errors.join("; ")}`);
+    const row = job.rows[0];
+    const at = (v: unknown) => (v === undefined || v === null || v === "" || !Number.isFinite(Number(v)) ? null : new Date(Number(v) * 1000).toISOString());
+    const first = at(row?.["first"]), last = at(row?.["last"]);
+    return first === null || last === null ? null : { query, first, last };
   },
   open(invoke: Invoke, scope: SourceScope): Source {
     const runner = splunkRunner(invoke);
