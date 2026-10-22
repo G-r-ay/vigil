@@ -262,7 +262,7 @@ async function open(options: V3Options, adapter: SourceAdapter, invoke: Invoke, 
   }
   const ranged = rangeOf(framed.alert.observedAt, span, defaultConfig.lookbackDays, unmeasured);
   const survey = await adapter.open(invoke, { index, range: ranged.range }).survey();
-  return { cfg: configFor(spec), alert: framed.alert, index, ...ranged, survey, environment: null };
+  return { cfg: configFor(spec), alert: framed.alert, index, ...ranged, ...(framed.note === null ? {} : { frame_note: framed.note }), survey, environment: null };
 }
 
 const dayOf = (ms: number) => Math.floor(ms / DAY_MS) * DAY_MS;

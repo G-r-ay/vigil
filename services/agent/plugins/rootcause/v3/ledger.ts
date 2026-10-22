@@ -26,6 +26,9 @@ export interface SetupPayload {
   data_span?: [string, string] | null;
   span_query?: string;
   range_note?: string;
+  // Set when the frame model's first title for the alert judged the event (the words the loop refuses in an event
+  // label): whether a second ask named it neutrally, or the title was named in code. Absent when it did not.
+  frame_note?: string;
   survey: Survey;
   // The environment map (scope.ts), or null when mapping failed and the run went on without it.
   environment: string | null;
