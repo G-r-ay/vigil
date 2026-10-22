@@ -163,6 +163,12 @@ describe("failed model turns, on the real kernel with a failing provider", () =>
     if (properties(request).includes("observed_at")) return { emit: framed() };
     if (properties(request).includes("map")) return { emit: { map: "One source, edr.", reasoning: "mapped" } };
     if (properties(request).includes("conclusion")) return conclude();
+    // The closing turn has no searches: its first round is free and answers with the submit, as the reference's.
+    const submitted = request.tools.find((tool) => tool.id === SUBMIT_TOOL)?.parameters as { properties?: Record<string, unknown> } | undefined;
+    if (request.force === undefined && submitted?.properties?.["conclusion"] !== undefined) {
+      const answer = conclude();
+      return { calls: [{ tool: SUBMIT_TOOL, args: answer.emit }] };
+    }
     // Scope's own search rounds come before any move.
     return request.messages.some((m) => m.content.includes("<graph_snapshot>")) ? move(request) : { content: "done" };
   });

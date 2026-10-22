@@ -121,7 +121,7 @@ describe("a move as a kernel turn", () => {
 
   it("a move with no searches asks nothing of the tool, and a failed search comes back as a failed call", async () => {
     const t = setup(
-      (request) => (request.emit !== undefined ? { emit: { candidates: [], reasoning: "r" } } : request.messages.some((m) => m.role === "tool") ? { content: "done" } : { calls: [{ tool: "splunk_query", args: { ...SEARCH, spl: "index=lab nope" } }] }),
+      (request) => (request.emit !== undefined ? { emit: { candidates: [], reasoning: "r" } } : request.messages.some((m) => m.role === "tool") || !request.tools.some((x) => x.id === "splunk_query") ? { content: "done" } : { calls: [{ tool: "splunk_query", args: { ...SEARCH, spl: "index=lab nope" } }] }),
     );
     const searched = await t.client.runTurn(t.request());
     expect(searched.toolCalls).toMatchObject([{ id: "r1", ok: false }]);
@@ -408,11 +408,14 @@ describe("an answer that fails its check goes back to the model, twice at most",
     expect((await t.tools.call("splunk_query", SEARCH, { allowedDomains: ["edr"], allDomains: ["edr"], timeoutMs: 1000, range })).toolCallId).toBe("r4");
   });
 
-  it("corrects a move with no searches too", async () => {
+  // As the reference: a move with no searches opens on a round free to think, and once that round has answered,
+  // its searches are spent, so the correction is forced.
+  it("corrects a move with no searches too: its first round free, the correction forced", async () => {
     const fixed = { evidence: [{ summary: "s", strength: "direct", polarity: "supports", toolCallIds: [] }], reasoning: "r" };
-    const t = setup((_, n) => ({ emit: n === 1 ? { evidence: [{ ...fixed.evidence[0], toolCallIds: ["r9"] }], reasoning: "r" } : fixed }));
+    const t = setup((_, n) => (n === 1 ? submit({ evidence: [{ ...fixed.evidence[0], toolCallIds: ["r9"] }], reasoning: "r" }) : { emit: fixed }));
     const out = await t.client.runTurn(t.request({ move: "strengthen", submitTool: "submit_assessment", maxSearches: 0 }));
-    expect(t.provider.requests.map((r) => r.force)).toEqual([SUBMIT_TOOL, SUBMIT_TOOL]);
+    expect(t.provider.requests.map((r) => r.force)).toEqual([undefined, SUBMIT_TOOL]);
+    expect(t.provider.requests[0]!.tools.map((x) => x.id)).toEqual([SUBMIT_TOOL]);
     expect((await t.calls()).map((c) => [c.ref, c.tool])).toEqual([["r1", SUBMIT_TOOL]]);
     expect(out.submission).toEqual(fixed);
     expect(out.toolCalls).toEqual([]);
@@ -465,10 +468,12 @@ describe("a turn's search cap counts searches, not rounds", () => {
 
   it("runs the first 3 of 5 searches one response asks for under a cap of 3 and refuses the other 2, uncitable", async () => {
     const t = setup(
-      (request) => (request.emit !== undefined ? { emit: { candidates: [], reasoning: "r" } } : request.messages.some((m) => m.role === "tool") ? { content: "done" } : { calls: [1, 2, 3, 4, 5].map((i) => ({ tool: "splunk_query", args: search(i) })) }),
+      (request) => (request.emit !== undefined || request.force === SUBMIT_TOOL ? { emit: { candidates: [], reasoning: "r" } } : request.messages.some((m) => m.role === "tool") ? { content: "done" } : { calls: [1, 2, 3, 4, 5].map((i) => ({ tool: "splunk_query", args: search(i) })) }),
       table(5),
     );
     const out = await t.client.runTurn(t.request({ maxSearches: 3 }));
+    // The cap spent in the first response, the second is the answer, forced.
+    expect(t.provider.requests.map((r) => r.force)).toEqual([undefined, SUBMIT_TOOL]);
 
     const calls = await t.calls();
     expect(calls.map((c) => [c.ref, c.ok])).toEqual([["r1", true], ["r2", true], ["r3", true], ["r4", false], ["r5", false]]);
@@ -506,8 +511,7 @@ describe("a turn's search cap counts searches, not rounds", () => {
       (request, n) => (request.emit !== undefined || request.force === SUBMIT_TOOL ? { emit: { map: `**Systems**\n- ws-7 seen 12 times\n${"- host seen 10 times\n".repeat(12)}`, reasoning: "r" } }
         : n === 1 ? { calls: Array.from({ length: 9 }, (_, i) => ({ tool: "splunk_query", args: search(i + 1) })) }
         : n === 2 ? { calls: Array.from({ length: 8 }, (_, i) => ({ tool: "splunk_query", args: search(i + 8) })) }
-        : n === 3 ? { calls: [{ tool: "splunk_query", args: search(16) }] }
-        : { content: "done" }),
+        : { calls: [{ tool: "splunk_query", args: search(16) }] }),
       table(16),
     );
     const deps = { model: t.client, tools: t.tools, trace: t.trace, domains: ["edr"], sizes: { edr: 10 } } as never;
@@ -518,10 +522,60 @@ describe("a turn's search cap counts searches, not rounds", () => {
     const calls = await t.calls();
     const ran = calls.filter((c) => c.failure !== "refused").map((c) => JSON.parse(c.arguments).purpose);
     expect(ran).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14].map((i) => `search ${i}`));
-    // First response: 7 run, 2 wait. Second: 7 run (the cap), the 8th is past the cap. Third: past the cap.
+    // First response: 7 run, 2 wait. Second: 7 run (the cap), the 8th is past the cap. Third: the answer, forced,
+    // so the model is never free to ask for more.
     expect(refusedCalls(calls).map((c) => [JSON.parse(c.arguments).purpose, c.result.includes(BATCH), c.result.includes(NO_MORE)])).toEqual([
-      ["search 8", true, false], ["search 9", true, false], ["search 15", false, true], ["search 16", false, true],
+      ["search 8", true, false], ["search 9", true, false], ["search 15", false, true],
     ]);
+    expect(t.provider.requests.map((r) => r.force)).toEqual([undefined, undefined, SUBMIT_TOOL]);
+  });
+});
+
+// The reference forces the submit, with no thinking, from the round after the one that spent the move's searches, and
+// keeps every round after it forced. The round count alone would leave those rounds free, and thinking.
+describe("a move that has spent its searches answers on the next round, forced, as the reference", () => {
+  const search = (i: number) => ({ purpose: `search ${i}`, spl: `index=lab sourcetype=edr q=${i}` });
+  const table = Object.fromEntries([1, 2, 3, 4].map((i) => [search(i).spl, `${i} events matched`]));
+  const good = { candidates: [cand("curl wrote /tmp/x", ["r1"])], reasoning: "r" };
+  const bad = { candidates: [cand("curl wrote /tmp/x", ["r1"]), cand("ghost event", ["r9"])], reasoning: "r" };
+  const pair = (a: number, b: number) => ({ calls: [a, b].map((i) => ({ tool: "splunk_query", args: search(i) })) });
+
+  it("forces the round after the cap is reached mid-round, with rounds still left on the count", async () => {
+    const t = setup((request, n) => (request.force === SUBMIT_TOOL ? { emit: good } : n === 1 ? pair(1, 2) : n === 2 ? pair(3, 4) : { calls: [{ tool: "splunk_query", args: search(5) }] }), table);
+    const out = await t.client.runTurn(t.request({ maxSearches: 3 }));
+
+    // Searches 1-3 run, the 4th is past the cap; the third round is the answer, though the count allows a fourth.
+    expect((await t.calls()).map((c) => [c.ref, c.ok])).toEqual([["r1", true], ["r2", true], ["r3", true], ["r4", false]]);
+    expect(t.provider.requests.map((r) => r.force)).toEqual([undefined, undefined, SUBMIT_TOOL]);
+    // The kernel asks every round to think; the wire never sends thinking on a forced one (tests/core/claude-wire).
+    expect(t.provider.requests.every((r) => r.think === true)).toBe(true);
+    expect(out.submission).toEqual(good);
+  });
+
+  it("keeps a correction after a forced answer forced", async () => {
+    const t = setup((request, n) => (request.force === SUBMIT_TOOL ? { emit: n === 2 ? bad : good } : { calls: [{ tool: "splunk_query", args: search(1) }] }), table);
+    const out = await t.client.runTurn(t.request({ maxSearches: 1 }));
+
+    expect(t.provider.requests.map((r) => r.force)).toEqual([undefined, SUBMIT_TOOL, SUBMIT_TOOL]);
+    expect((await t.calls()).map((c) => [c.ref, c.tool])).toEqual([["r1", "splunk_query"], ["r2", SUBMIT_TOOL]]);
+    expect(out.submission).toEqual(good);
+  });
+
+  it("leaves every round free while searches are left", async () => {
+    const submit = { calls: [{ tool: SUBMIT_TOOL, args: good }] };
+    const t = setup((_, n) => (n === 1 ? pair(1, 2) : submit), table);
+    const out = await t.client.runTurn(t.request({ maxSearches: 6 }));
+
+    expect(t.provider.requests.map((r) => r.force)).toEqual([undefined, undefined]);
+    expect(out.submission).toEqual(good);
+  });
+
+  it("opens a move with no searches on a free round that offers only the submit, and answers there", async () => {
+    const t = setup(() => ({ calls: [{ tool: SUBMIT_TOOL, args: { evidence: [], reasoning: "r" } }] }));
+    const out = await t.client.runTurn(t.request({ move: "strengthen", submitTool: "submit_assessment", maxSearches: 0 }));
+
+    expect(t.provider.requests.map((r) => [r.force, r.tools.map((x) => x.id)])).toEqual([[undefined, [SUBMIT_TOOL]]]);
+    expect(out.submission).toEqual({ evidence: [], reasoning: "r" });
   });
 });
 

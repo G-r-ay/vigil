@@ -369,8 +369,12 @@ export class KernelModelClient implements ModelClient {
         schema: wire(req.submitTool),
         tools: searches > 0 ? this.turns.local.map((t) => t.id) : [],
         // The cap is on searches, which the evidence tool counts and refuses past it. Rounds are only bounded: one
-        // per search at most, and the answer's.
-        max_turns: searches + 1,
+        // per search at most, and the answer's. A move with no searches still opens on a round free to think, as
+        // the reference's does.
+        max_turns: Math.max(searches, 1) + 1,
+        // As the reference: once the move's searches are spent, every round after is forced to the submit, without
+        // thinking, its corrections included. The first round is never forced, so a move with no searches thinks once.
+        answer_now: () => this.searched >= searches,
         cite: true,
         // Held to the move's check over what the move has searched so far; a failed answer is answered with what
         // is wrong and the model goes again. An answer kept to the end is checked once more below.

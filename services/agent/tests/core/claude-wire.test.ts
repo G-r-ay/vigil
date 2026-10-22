@@ -40,12 +40,13 @@ const ROUNDS = [
 // A gateway streaming each round as Bifrost streams Claude's: the thinking a fragment at a time
 // under reasoning_details, its signature alone after it, then the call. It keeps every body.
 // The thinking comes back whatever was asked, so a turn that did not ask is seen to drop it.
-function gateway() {
+type Round = { tool: string; args: string; thought?: string[]; signature?: string };
+function gateway(rounds: readonly Round[] = ROUNDS) {
   const bodies: Body[] = [];
   let step = 0;
   const create = async (body: Body): Promise<AsyncIterable<Chunk>> => {
     bodies.push(structuredClone(body));
-    const round = ROUNDS[step++];
+    const round = rounds[step++];
     if (round === undefined) throw new Error(`the gateway ran out at call ${step}`);
     const chunk = (fields: Record<string, unknown>) => ({ id: "c", created: 1, model: body.model, object: "chat.completion.chunk", ...fields }) as unknown as Chunk;
     const delta = (d: Record<string, unknown>) => chunk({ choices: [{ index: 0, delta: d, finish_reason: null }] });
@@ -65,8 +66,8 @@ function gateway() {
   return { client: { chat: { completions: { create } } } as unknown as OpenAI, bodies };
 }
 
-function contextOf(model: string) {
-  const { client, bodies } = gateway();
+function contextOf(model: string, rounds: readonly Round[] = ROUNDS) {
+  const { client, bodies } = gateway(rounds);
   const limiter = new Limiter({ rpm: 10_000, tpm: 10_000_000 }, 4, 1);
   const surfaceFor = (id: string): Provider => openAiSurface(client, id, limiter, "vertex", `vertex/${id}`);
   const state = new InProcessState();
@@ -199,5 +200,61 @@ describe("a turn that does not opt in, or a model that is not Claude", () => {
     const { bodies } = await bodiesOf("claude-sonnet-4-5", ON);
     expect(bodies.every((body) => !("reasoning" in body))).toBe(true);
     expect(markers(bodies[1]!)).toEqual([0, bodies[1]!.messages.length - 1]);
+  });
+});
+
+// A caller whose cap is not on rounds (root cause counts searches) says when it is spent: from the next round on,
+// every round is the answer, forced to the submit and not thinking, its corrections included. The first round is
+// never forced, so a step with nothing to search still thinks once.
+describe("a turn whose caller says when to answer", () => {
+  const SEARCH = { tool: "bump", args: "{}", thought: ["look"], signature: "sig-1" };
+  const answer = (verb: string): Round => ({ tool: SUBMIT_TOOL, args: JSON.stringify({ verb }), thought: ["answer"], signature: "sig-a" });
+  const free = (body: Body) => body.tool_choice === undefined && "reasoning" in body;
+  const forced = (body: Body) => JSON.stringify(body.tool_choice) === JSON.stringify({ type: "function", function: { name: SUBMIT_TOOL } }) && !("reasoning" in body);
+
+  async function run(rounds: readonly Round[], over: Partial<Subturn>) {
+    const { ctx, bodies, state } = contextOf("claude-opus-4-8", rounds);
+    const outcome = await runSubturn<{ verb: string }>(ctx, step({ ...ON, ...over }));
+    const frames = (await state.read(RUN)).filter((one) => one.kind === "frame").map((one) => (one.payload as FramePayload).sampling["think"]);
+    return { outcome, bodies, frames };
+  }
+
+  it("forces the round after the one that spent the cap, though the round count would leave it free", async () => {
+    let asked = 0;
+    let searched = 0;
+    const counted: RegisteredTool = defineTool(
+      { id: "bump", description: "bump", parameters: {}, execute: async () => { searched += 1; return { ok: true, rows: [{ n: 1 }], rowCount: 1, capped: false, sourceSystem: "test" }; } },
+      { maxRows: 10, timeoutMs: 500 },
+      true,
+    );
+    const { ctx, bodies } = contextOf("claude-opus-4-8", [SEARCH, answer("HALT")]);
+    (ctx.options as { tools: readonly RegisteredTool[] }).tools = [counted];
+    const outcome = await runSubturn<{ verb: string }>(ctx, step({ ...ON, max_turns: 6, answer_now: () => { asked += 1; return searched >= 1; } }));
+    expect(outcome.value).toEqual({ verb: "HALT" });
+    expect(bodies.map(free)).toEqual([true, false]);
+    expect(forced(bodies[1]!)).toBe(true);
+    // Asked before the second round, never before the first.
+    expect(asked).toBe(1);
+  });
+
+  it("keeps a correction after a forced answer forced", async () => {
+    const { outcome, bodies, frames } = await run([SEARCH, answer("TALLY"), answer("HALT")], { max_turns: 6, corrections: 1, check: (v) => ((v as { verb: string }).verb === "HALT" ? null : "say HALT"), answer_now: () => true });
+    expect(outcome.value).toEqual({ verb: "HALT" });
+    expect([free(bodies[0]!), forced(bodies[1]!), forced(bodies[2]!)]).toEqual([true, true, true]);
+    expect(frames).toEqual(["adaptive", undefined, undefined]);
+  });
+
+  it("leaves the first round free, so a step with nothing to search thinks once, then answers forced", async () => {
+    const { outcome, bodies } = await run([answer("TALLY"), answer("HALT")], { tools: [], max_turns: 2, corrections: 1, check: (v) => ((v as { verb: string }).verb === "HALT" ? null : "say HALT"), answer_now: () => true });
+    expect(outcome.value).toEqual({ verb: "HALT" });
+    expect([free(bodies[0]!), forced(bodies[1]!)]).toEqual([true, true]);
+  });
+
+  it("changes nothing while it says no: the same bodies as a turn that never asks", async () => {
+    const asks = await run(ROUNDS, { answer_now: () => false });
+    const never = await run(ROUNDS, {});
+    expect(asks.outcome.value).toEqual({ verb: "HALT" });
+    expect(JSON.stringify(asks.bodies)).toBe(JSON.stringify(never.bodies));
+    expect(never.bodies.map(free)).toEqual([true, true, false]);
   });
 });
