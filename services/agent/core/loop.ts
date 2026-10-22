@@ -26,6 +26,10 @@ export interface Harness<Kinds extends Record<string, unknown> = Record<never, n
   // Experimental (core/guards.ts): the guarded reader's model, when it is
   // not the run's own. A reader only extracts and labels, so a cheaper one serves.
   guards_provider?: Provider;
+  // The run's provider asked for another model: the same gateway, client, limiter and key,
+  // the id resolved as the spec's is. What a subturn on a model of its own runs on, and so is
+  // priced and journaled as. Absent, no subturn can name a model.
+  provider_for?: (model: string) => Provider;
 }
 
 export interface TurnConfig {

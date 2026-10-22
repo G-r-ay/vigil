@@ -6,6 +6,7 @@ import { httpPrices } from "./core/prices.js";
 import { Limiter } from "./core/limiter.js";
 import type { Harness } from "./core/loop.js";
 import { nullMemory } from "./core/memory.js";
+import type { Provider } from "./core/provider.js";
 import { httpRecall } from "./core/recall.js";
 import { registryOf } from "./core/registry.js";
 import { remoteDispatch } from "./core/remote.js";
@@ -69,6 +70,10 @@ export function harnessFor<K extends Record<string, unknown>>(
   principal?: ToolPrincipal,
 ): Harness<K> {
   const tools = process.env["VIGIL_TOOLS_URL"] ?? "http://localhost:6987/internal/tools/invoke";
+  // One resolution for the spec's model and any other a subturn names: the spec's provider,
+  // gateway and effort, so a second model differs from the first in its id alone.
+  const surfaceFor = (model: string): Provider =>
+    openAiSurface(client, model, limiter, spec.provider ?? "bifrost", wireModel({ ...spec, model }), vk, spec.effort);
   return {
     // Bare id for pricing, namespaced id on the wire — see openAiSurface. Without
     // the namespace the gateway matched "gemini-2.5-flash" to whichever provider
@@ -76,7 +81,8 @@ export function harnessFor<K extends Record<string, unknown>>(
     // a different account entirely. The same provider is handed to pricing: the
     // gateway bills nothing of its own, and a catalog left to guess from the
     // model's name priced a paid "llama" on a commercial host at $0.
-    provider: openAiSurface(client, spec.model, limiter, spec.provider ?? "bifrost", wireModel(spec), vk, spec.effort),
+    provider: surfaceFor(spec.model),
+    provider_for: surfaceFor,
     // Grants nobody here: every run is a plugin on the kernel, which registers the
     // deployment's tools itself and grants them by the plugin's needs.
     registry: registryOf(toolsFrom(spec.tools), {}),
