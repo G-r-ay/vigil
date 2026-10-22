@@ -6,11 +6,21 @@ export interface ToolCall {
   args: string;
 }
 
+// What a model thought before it answered, as the gateway handed it over: Bifrost's
+// reasoning_details, one per thinking block. Opaque to the harness and passed back as it
+// came, signature and all, because Anthropic checks a thinking block it is sent back.
+export interface Reasoning {
+  type: string;
+  text?: string;
+  signature?: string;
+  data?: string;
+}
+
 // The harness's own message shape rather than a vendor's, so the loop imports no
 // SDK and a second surface or a scripted provider is a drop-in.
 export type Message =
   | { role: "system" | "user"; content: string }
-  | { role: "assistant"; content: string; tool_calls: readonly ToolCall[] }
+  | { role: "assistant"; content: string; tool_calls: readonly ToolCall[]; reasoning?: readonly Reasoning[] }
   | { role: "tool"; call_id: string; content: string };
 
 export interface ToolSchema {
@@ -29,6 +39,13 @@ export interface TurnRequest {
   // forced choice offers only that tool instead; one that refuses tools at all asks for the
   // tool's arguments as an emission. The run's emission turn covers a miss.
   force?: string;
+  // Claude only, both; another model is sent what it always was. cache_conversation moves a
+  // second cache breakpoint onto the last message of every call, so each round reads the
+  // conversation so far from cache rather than only the system prompt. think asks for adaptive
+  // thinking on a round whose tool choice is not forced: Anthropic refuses a forced tool with
+  // thinking on, so a forced round never thinks.
+  cache_conversation?: boolean;
+  think?: boolean;
   signal?: AbortSignal;
 }
 
@@ -38,6 +55,7 @@ export interface Turn {
   content: string;
   tool_calls: readonly ToolCall[];
   tokens: TokenCounts;
+  reasoning?: readonly Reasoning[];
 }
 
 // Usage arrives before the stream ends, so a call that dies afterwards has still
@@ -45,6 +63,8 @@ export interface Turn {
 export type ProviderEvent =
   | { type: "text_delta"; text: string }
   | { type: "usage"; tokens: TokenCounts }
+  // Only when the model thought: what it thought, whole, before the calls it asked for.
+  | { type: "reasoning"; reasoning: readonly Reasoning[] }
   | { type: "tool_call"; call: ToolCall };
 
 // Exactly one model call, streamed. The loop belongs to the harness, which keeps

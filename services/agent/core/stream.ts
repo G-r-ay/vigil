@@ -18,7 +18,7 @@ import {
   type Status,
   type TurnConfig,
 } from "./loop.js";
-import { ModelRefused, ProviderError, type Message, type ToolCall, type ToolSchema, type Turn, type TurnRequest } from "./provider.js";
+import { ModelRefused, ProviderError, type Message, type Reasoning, type ToolCall, type ToolSchema, type Turn, type TurnRequest } from "./provider.js";
 import { assemble, canonical, DEFAULT_FOLD, prefixOf, windowCeiling, type FoldPolicy, type Prefix } from "./context.js";
 import { createHash } from "node:crypto";
 import { scannerFor, wrap } from "./security.js";
@@ -70,9 +70,16 @@ export interface FrameSeen {
 }
 
 // The one hash every reader of a frame agrees on: messages, tools and the
-// emission schema, key-sorted.
+// emission schema, key-sorted. A turn's thinking is left out: the ledger never holds it,
+// so a rebuild from the ledger could not hash it, and a call is what it was asked over.
 export function inputHash(messages: readonly Message[], tools: readonly ToolSchema[], emit: Record<string, unknown> | null): string {
-  return contentHash(JSON.stringify(canonical({ messages, tools, emit })));
+  const asked = messages.map((message) => (message.role === "assistant" && message.reasoning !== undefined ? unthought(message) : message));
+  return contentHash(JSON.stringify(canonical({ messages: asked, tools, emit })));
+}
+
+function unthought(message: Message & { role: "assistant" }): Message {
+  const { reasoning: _, ...rest } = message;
+  return rest;
 }
 
 export function contentHash(text: string): string {
@@ -247,7 +254,7 @@ class Run<T, Kinds extends Record<string, unknown>> {
 
       let turn;
       try {
-        turn = yield* this.burn({ messages, tools: this.prefix.tools, ...(closing ? { force: SUBMIT_TOOL } : {}) }, tail);
+        turn = yield* this.burn({ messages, tools: this.prefix.tools, ...(closing ? { force: SUBMIT_TOOL } : {}), ...this.claudeWire() }, tail);
       } catch (error) {
         // The answer round stands in for the emission, so it gets the emission's recourse:
         // a failed one is asked again by emit() over a folded transcript.
@@ -263,9 +270,10 @@ class Run<T, Kinds extends Record<string, unknown>> {
       // A search asked for beside the answer is what the answer waits on; one asked for
       // past the cap is not run. Any further submit is an answer too, not a search.
       const asked = turn.tool_calls.filter((call) => !submit || call.tool !== SUBMIT_TOOL);
+      const thought = this.cfg.think === true && turn.reasoning !== undefined && turn.reasoning.length > 0 ? { reasoning: turn.reasoning } : {};
       if (closing) {
         if (submitted === undefined) return null;
-        const answer = yield* this.accepted(submitted, turn.content);
+        const answer = yield* this.accepted(submitted, turn.content, thought);
         // Sent back to fix: the cap is still spent, so the next round is forced to the submit again.
         if (answer === AGAIN) continue;
         return answer;
@@ -288,14 +296,14 @@ class Run<T, Kinds extends Record<string, unknown>> {
           }
         }
         if (submitted === undefined) return null;
-        const answer = yield* this.accepted(submitted, turn.content);
+        const answer = yield* this.accepted(submitted, turn.content, thought);
         if (answer !== AGAIN) return answer;
         // A round that only answered is not a search round: sending the answer back costs the role none.
         this.turns -= 1;
         continue;
       }
 
-      this.transcript.push({ role: "assistant", content: turn.content, tool_calls: asked });
+      this.transcript.push({ role: "assistant", content: turn.content, tool_calls: asked, ...thought });
       for (const call of asked) {
         const tool = this.tools.find((granted) => granted.id === call.tool);
         if (tool === undefined) {
@@ -332,7 +340,7 @@ class Run<T, Kinds extends Record<string, unknown>> {
   // budget. Once it is spent, one that fails the check is handed on as failed, and one that misses
   // the schema (or never parsed, which is not sent back) asks the emission turn with what was
   // wrong, as it would of an emission.
-  private async *accepted(call: ToolCall, said: string): AsyncGenerator<StreamEvent<T>, Outcome<T> | null | typeof AGAIN> {
+  private async *accepted(call: ToolCall, said: string, thought: { reasoning?: readonly Reasoning[] } = {}): AsyncGenerator<StreamEvent<T>, Outcome<T> | null | typeof AGAIN> {
     const schema = this.cfg.schema!;
     const validate = compile(schema);
     const parsed = tryParse(call.args === "" ? "{}" : call.args);
@@ -342,14 +350,14 @@ class Run<T, Kinds extends Record<string, unknown>> {
       if (failed === null) return this.done("completed", parsed as T, "the role answered");
       if (this.corrected >= budget) return this.uncorrected(parsed, failed);
       this.rejected.push(`the answer failed its check: ${failed}`);
-      yield* this.sentBack(call, said, failed);
+      yield* this.sentBack(call, said, failed, thought);
       return AGAIN;
     }
     const reason = parsed === undefined ? "the response was not valid JSON" : errorsOf(validate);
     const issues = parsed === undefined ? reason : issuesOf(validate);
     this.rejected.push(`${reason}: ${call.args.slice(0, 400)}`);
     if (parsed !== undefined && this.corrected < budget) {
-      yield* this.sentBack(call, said, issues);
+      yield* this.sentBack(call, said, issues, thought);
       return AGAIN;
     }
     this.refusedSubmit = { content: call.args, parsed, reason };
@@ -357,9 +365,9 @@ class Run<T, Kinds extends Record<string, unknown>> {
   }
 
   // A submit answered with what is wrong with it, as one correction.
-  private async *sentBack(call: ToolCall, said: string, wrong: string): AsyncGenerator<StreamEvent<T>, void> {
+  private async *sentBack(call: ToolCall, said: string, wrong: string, thought: { reasoning?: readonly Reasoning[] }): AsyncGenerator<StreamEvent<T>, void> {
     this.corrected += 1;
-    this.transcript.push({ role: "assistant", content: said, tool_calls: [call] });
+    this.transcript.push({ role: "assistant", content: said, tool_calls: [call], ...thought });
     yield* this.record(call, { ok: false, failure: { kind: "invalid_args", detail: `Invalid submission: ${wrong}. Fix it and call ${SUBMIT_TOOL} again.` } });
   }
 
@@ -503,7 +511,7 @@ class Run<T, Kinds extends Record<string, unknown>> {
       // worth changing before asking again is how much it is asked over.
       let turn;
       try {
-        turn = yield* this.burn({ messages: this.assembled(tail), tools: [], emit: schema }, tail);
+        turn = yield* this.burn({ messages: this.assembled(tail), tools: [], emit: schema, ...this.claudeWire() }, tail);
       } catch (error) {
         // A silent model is a gateway fault, not a transcript too big to answer: asking
         // again over less would only spend the empty replies again. Nor does folding
@@ -577,6 +585,7 @@ class Run<T, Kinds extends Record<string, unknown>> {
     const signal = this.cfg.signal ? { signal: this.cfg.signal } : {};
     const tool_calls: ToolCall[] = [];
     let content = "";
+    let reasoning: readonly Reasoning[] | undefined;
     let billed = false;
     let settled = false;
     // Flagged between the record and the write, because those are two failures with
@@ -595,6 +604,7 @@ class Run<T, Kinds extends Record<string, unknown>> {
     try {
       for await (const event of this.harness.provider.stream({ ...request, ...signal })) {
         if (event.type === "tool_call") tool_calls.push(event.call);
+        else if (event.type === "reasoning") reasoning = event.reasoning;
         else if (event.type === "text_delta") {
           content += event.text;
           yield event;
@@ -614,7 +624,16 @@ class Run<T, Kinds extends Record<string, unknown>> {
       if (!settled) this.harness.budget.release();
     }
 
-    return { content, tool_calls };
+    return { content, tool_calls, ...(reasoning === undefined ? {} : { reasoning }) };
+  }
+
+  // The turn's opt-ins to Claude's cache and thinking, as the request carries them. Unset, the
+  // request is what it always was.
+  private claudeWire(): Pick<TurnRequest, "cache_conversation" | "think"> {
+    return {
+      ...(this.cfg.cache_conversation === true ? { cache_conversation: true } : {}),
+      ...(this.cfg.think === true ? { think: true } : {}),
+    };
   }
 
   private frame(request: Omit<TurnRequest, "signal">, tail: string | null): FrameSeen {
@@ -623,7 +642,13 @@ class Run<T, Kinds extends Record<string, unknown>> {
       role: this.cfg.role,
       model_id: this.harness.provider.model,
       provider_type: this.harness.provider.provider_type,
-      sampling: { ...(this.harness.provider.sampling ?? {}) },
+      // What the turn opted into rides with the rest, so a frame says the call was asked to cache
+      // its conversation, and to think when it was free to (the wire sends both to Claude alone).
+      sampling: {
+        ...(this.harness.provider.sampling ?? {}),
+        ...(request.cache_conversation === true ? { cache_conversation: true } : {}),
+        ...(request.think === true && request.force === undefined && request.emit === undefined ? { think: "adaptive" } : {}),
+      },
       system: this.prefix.system,
       task: this.cfg.task,
       recall: this.prefix.recall,

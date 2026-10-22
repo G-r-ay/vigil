@@ -107,6 +107,13 @@ export interface TurnConfig {
   // Where this turn's spend is journaled when not on its own ledger: a child's model calls
   // are its parent's spend, while its own ledger holds what it was shown and said.
   spend_to?: { run_id: string; run_kind: RunKind };
+  // Claude's cost and quality settings, as the root-cause reference runs them; off by default, and
+  // another model is sent what it always was. cache_conversation puts a cache breakpoint on the
+  // last message of every call beside the system prompt's, so each round reads the conversation so
+  // far from cache. think asks for adaptive thinking on every round the tool choice is not forced,
+  // and carries each round's thinking back with its calls.
+  cache_conversation?: boolean;
+  think?: boolean;
   // Lets this turn run against a ledger that already holds a terminal. Only for a turn
   // that describes a run rather than continues one -- never one that can reach a tool.
   after_terminal?: boolean;

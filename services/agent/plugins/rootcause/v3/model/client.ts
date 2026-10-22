@@ -384,6 +384,10 @@ export class KernelModelClient implements ModelClient {
           return v.success ? null : v.msg;
         },
         corrections: CORRECTIONS,
+        // As the reference asks Claude: the conversation cached to its last message every round, and
+        // adaptive thinking on every round that is not forced to the submit.
+        cache_conversation: true,
+        think: true,
         ...(req.model === undefined ? {} : { model: req.model }),
       });
     } catch (error) {
