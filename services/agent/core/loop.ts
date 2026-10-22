@@ -106,6 +106,12 @@ export interface TurnConfig {
   // errors, and counts against the same corrections; once they are spent it goes to the
   // emission turn as it always has. 0 sends nothing back.
   corrections?: number;
+  // The parsed answer as it is held to the schema and the check, for every submit and emission: a
+  // caller whose schema is a parser's that drops keys it has no field for (zod's plain object)
+  // gives one that drops them, so such a key is never an error and never sent back. What it
+  // returns is the answer from there on: validated, checked, handed on. Absent, the answer is held
+  // as parsed, and a key the schema forbids is an error like any other.
+  prepare?: (answer: unknown) => unknown;
   // Asked once more when the model stops with turns left and fewer than min_results
   // results: keep going or say it is done. The ask is the next frame's transient tail.
   persist?: { min_results: number };

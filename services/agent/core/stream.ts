@@ -347,7 +347,7 @@ class Run<T, Kinds extends Record<string, unknown>> {
   private async *accepted(call: ToolCall, said: string, thought: { reasoning?: readonly Reasoning[] } = {}): AsyncGenerator<StreamEvent<T>, Outcome<T> | null | typeof AGAIN> {
     const schema = this.cfg.schema!;
     const validate = compile(schema);
-    const parsed = tryParse(call.args === "" ? "{}" : call.args);
+    const parsed = this.prepared(tryParse(call.args === "" ? "{}" : call.args));
     const budget = this.cfg.corrections ?? 0;
     if (parsed !== undefined && validate(parsed)) {
       const failed = await this.failedCheck(parsed);
@@ -366,6 +366,11 @@ class Run<T, Kinds extends Record<string, unknown>> {
     }
     this.refusedSubmit = { content: call.args, parsed, reason };
     return null;
+  }
+
+  // A parsed answer as the caller holds it to the schema (TurnConfig.prepare); one that never parsed stays unparsed.
+  private prepared(parsed: unknown): unknown {
+    return parsed === undefined || this.cfg.prepare === undefined ? parsed : this.cfg.prepare(parsed);
   }
 
   // A submit answered with what is wrong with it, as one correction.
@@ -529,7 +534,7 @@ class Run<T, Kinds extends Record<string, unknown>> {
         continue;
       }
 
-      const parsed = tryParse(turn.content);
+      const parsed = this.prepared(tryParse(turn.content));
       if (parsed !== undefined && validate(parsed)) {
         // The emission is held to the caller's check too, once: its own retries are for the schema.
         const failed = await this.failedCheck(parsed);
@@ -969,7 +974,7 @@ export function schemaIssues(schema: Record<string, unknown>, value: unknown): E
 }
 
 // The same errors as a submit sent back to fix is told them: a dotted path, then what is wrong
-// there, as the reference's own schema issues read ("candidates.1: unrecognized key \"boundary\"").
+// there, as the reference's own schema issues read ("next: must be object").
 function issuesOf(validate: ValidateFunction): string {
   return (validate.errors ?? []).map((error) => {
     const at = error.instancePath.split("/").slice(1).join(".");

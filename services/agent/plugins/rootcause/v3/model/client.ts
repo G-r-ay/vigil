@@ -4,7 +4,7 @@
 // with a ref, bills the model, delimits the results and resumes. The move's own check runs inside the turn: an
 // answer that fails it or the schema goes back to the model to fix, twice at most, and then what is sound in it is salvaged.
 import { runSubturn, type PluginContext, type PluginHooks, type Subturn, type AgentKinds, type AgentOptions } from "../../../../core/agent.js";
-import { schemaErrors, schemaIssues, SUBMIT_TOOL } from "../../../../core/stream.js";
+import { schemaErrors, SUBMIT_TOOL } from "../../../../core/stream.js";
 import type { CallPayload, RunKind } from "../../../../contracts/events.js";
 import { defineTool, type RegisteredTool, type ToolResult } from "../../../../contracts/tool.js";
 import type { Harness, Outcome } from "../../../../core/loop.js";
@@ -164,70 +164,43 @@ const prune = (v: unknown, at: string[], gone: Set<string>): unknown =>
   Array.isArray(v) ? v.flatMap((x, j) => (gone.has([...at, j].join("/")) ? [] : [prune(x, [...at, String(j)], gone)]))
   : v && typeof v === "object" ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, prune(x, [...at, k], gone)])) : v;
 
-// Where the value at path p (pre-prune) is once prune has taken out gone: null when it, or a list item holding it, went.
-const follow = (p: string[], gone: Set<string>): string[] | null => {
-  const out: string[] = [];
-  for (let n = 0; n < p.length; n++) {
-    if (!/^\d+$/.test(p[n]!)) { out.push(p[n]!); continue; }
-    if (gone.has(p.slice(0, n + 1).join("/"))) return null;
-    let i = +p[n]!;
-    for (let j = +p[n]! - 1; j >= 0; j--) if (gone.has([...p.slice(0, n), j].join("/"))) i--;
-    out.push(String(i));
-  }
-  return out;
-};
-
-// A key the schema does not know is removed, not a reason to drop the item or the submission (the reference's zod
-// strips it). A top-level item holding a real error is dropped whole by the caller, so nothing is stripped from it. One that is a field of the submission itself
-// (a candidate's `boundary`) is returned with where it was, for the caller to lift once it knows that item is kept.
-// Mutates `cur`.
-function stripStray(name: SubmitName, cur: Record<string, unknown>): { stripped: number; lifts: { at: string[]; key: string; value: unknown }[] } {
-  const schema = SUBMIT[name] as { properties: Record<string, Record<string, unknown>> };
-  const errs = schemaIssues(schema, cur);
-  const dead = errs.filter((e) => e.keyword !== "additionalProperties").map((e) => itemOf(e.instancePath.split("/").slice(1)).join("/")).filter(Boolean);
-  const live = errs.flatMap((e) => {
-    const at = e.instancePath.split("/").slice(1);
-    return e.keyword === "additionalProperties" && !dead.some((d) => `${at.join("/")}/`.startsWith(`${d}/`)) ? [{ at, key: String((e.params as { additionalProperty: string }).additionalProperty) }] : [];
-  });
-  const lifts: { at: string[]; key: string; value: unknown }[] = [];
-  for (const { at, key } of live) {
-    const parent = at.reduce<any>((v, k) => v[k], cur);
-    const value = parent[key];
-    delete parent[key];
-    if (at.length && key in schema.properties && !schemaIssues(schema.properties[key]!, value).length) lifts.push({ at, key, value });
-  }
-  return { stripped: live.length, lifts };
+// A submission without the keys its schema has no field for, at every depth, as the reference's zod (a plain
+// object, not strict) parses it: such a key is dropped, never an error, and never sent back to fix. A value of the
+// wrong type is left as it is, for the schema to refuse. `stripped` names each dropped key by its dotted path.
+type Shape = { type?: unknown; properties?: Record<string, Shape>; items?: Shape; additionalProperties?: unknown };
+export function stripUnknown(schema: Record<string, unknown>, value: unknown): { value: unknown; stripped: string[] } {
+  const stripped: string[] = [];
+  const walk = (s: Shape, v: unknown, at: string[]): unknown => {
+    if (Array.isArray(v)) return s.type === "array" && s.items ? v.map((x, i) => walk(s.items!, x, [...at, String(i)])) : v;
+    if (!v || typeof v !== "object" || s.type !== "object" || !s.properties) return v;
+    const known = s.properties;
+    return Object.fromEntries(Object.entries(v).flatMap(([k, x]) => {
+      if (Object.hasOwn(known, k)) return [[k, walk(known[k]!, x, [...at, k])]];
+      if (s.additionalProperties !== false) return [[k, x]];
+      stripped.push([...at, k].join("."));
+      return [];
+    }));
+  };
+  return { value: walk(schema as Shape, value, []), stripped };
 }
 
 // A failed check drops the top-level items it rests on (a whole candidate, effect, cause or event) and keeps the
 // rest, so one bad event does not throw away the others; up to three passes. A failure that names no item (a ref
-// never issued, a bad field of the submission itself) salvages nothing.
-export function salvage(name: SubmitName, input: unknown, calls: number | Citable, cx: CheckCtx, first: CheckResult): { data: unknown; dropped: number; repaired?: string } | null {
-  let cur = clip(input) as Record<string, unknown[]>, r = first, dropped = 0;
-  let { stripped, lifts } = stripStray(name, cur);
-  if (stripped) { const bad = schemaProblem(name, cur); r = bad ? { success: false, ...bad } : check(name, cur, calls, cx); }
+// never issued, a bad field of the submission itself) salvages nothing. A key the schema has no field for is
+// dropped first, as the reference's parse drops it, and is never what an item is dropped for.
+export function salvage(name: SubmitName, input: unknown, calls: number | Citable, cx: CheckCtx, first: CheckResult): { data: unknown; dropped: number } | null {
+  const { value, stripped } = stripUnknown(SUBMIT[name], clip(input));
+  let cur = value as Record<string, unknown[]>, r = first, dropped = 0;
+  if (stripped.length) { const bad = schemaProblem(name, cur); r = bad ? { success: false, ...bad } : check(name, cur, calls, cx); }
   for (let i = 0; i < 3 && !r.success; i++) {
     if (!r.drop.length) return null;
     const gone = new Set(r.drop.map((p) => p.join("/")));
-    lifts = lifts.flatMap((l) => { const at = follow(l.at, gone); return at ? [{ ...l, at }] : []; });
     cur = prune(cur, [], gone) as typeof cur;
     dropped += gone.size;
     const bad = schemaProblem(name, cur); // dropping can leave a list under its minimum
     r = bad ? { success: false, ...bad } : check(name, cur, calls, cx);
   }
-  if (!r.success) return null;
-  // Lifted only from an item still there, into an empty slot of a submission that holds without it, and only if
-  // the submission still holds with it: a lift never fills a field the submission was refused for lacking.
-  const up = new Map<string, unknown>();
-  for (const { key, value } of lifts) if (cur[key] === undefined && !up.has(key)) up.set(key, value);
-  if (up.size) {
-    const next = { ...cur, ...Object.fromEntries(up) };
-    const lr = schemaProblem(name, next) ? null : check(name, next, calls, cx);
-    if (lr?.success) r = lr;
-    else up.clear();
-  }
-  const repaired = stripped ? `stripped ${stripped} unknown key(s)${up.size ? `, lifted ${[...up.keys()].join(", ")} to the top level` : ""}` : null;
-  return { data: r.data, dropped, ...(repaired ? { repaired } : {}) };
+  return r.success ? { data: r.data, dropped } : null;
 }
 
 // What a recorded turn looks like: replayable by ScriptedModelClient against a cassette. Tool call ids in
@@ -359,6 +332,8 @@ export class KernelModelClient implements ModelClient {
     this.seen = [];
     this.matched = 0;
     const cx: CheckCtx = { inputOf: tools.inputOf?.bind(tools), range: this.d.range };
+    // Keys the answers' schema has no field for, dropped before the kernel held them to it.
+    const stripped = new Set<string>();
     let outcome: Outcome<unknown> | undefined;
     let failure: unknown;
     try {
@@ -384,6 +359,12 @@ export class KernelModelClient implements ModelClient {
           return v.success ? null : v.msg;
         },
         corrections: CORRECTIONS,
+        // As the reference's zod parses a submission: a key its schema has no field for is dropped, not sent back.
+        prepare: (answer) => {
+          const s = stripUnknown(SUBMIT[req.submitTool], answer);
+          for (const at of s.stripped) stripped.add(at);
+          return s.value;
+        },
         // As the reference asks Claude: the conversation cached to its last message every round, and
         // adaptive thinking on every round that is not forced to the submit.
         cache_conversation: true,
@@ -405,22 +386,23 @@ export class KernelModelClient implements ModelClient {
     // valid submission is one attempt on its target. One the check still failed after the corrections, and an
     // emission the kernel rejected twice, are salvaged when they parsed: what in them is sound is kept.
     let submission: unknown = null;
+    const dropped = stripped.size ? { stripped: [...stripped] } : {};
     // A provider failure is not an answer the model got wrong: it is told apart on the ledger and in the result.
     const failed = outcome!.status === "failed" && outcome!.emission_rejected !== true ? outcome!.reason : undefined;
     const kept = outcome!.value ?? outcome!.rejected_value;
     if (failed !== undefined) req.trace.write("provider-failure", { reason: failed });
-    else if (kept === undefined || kept === null || typeof kept !== "object") req.trace.write("rejected-submission", { reason: outcome!.reason });
+    else if (kept === undefined || kept === null || typeof kept !== "object") req.trace.write("rejected-submission", { reason: outcome!.reason, ...dropped });
     else {
       const bad = outcome!.value === null ? schemaProblem(req.submitTool, clip(kept)) : null;
       const v: CheckResult = bad ? { success: false, ...bad } : check(req.submitTool, kept, tools, cx);
       if (v.success) submission = v.data;
       else {
         const s = salvage(req.submitTool, kept, tools, cx, v);
-        req.trace.write("rejected-submission", { input: kept, error: v.msg, ...(s ? { salvaged: `kept the rest, dropped ${s.dropped} item(s)`, ...(s.repaired ? { repaired: s.repaired } : {}) } : {}) });
+        req.trace.write("rejected-submission", { input: kept, error: v.msg, ...(s ? { salvaged: `kept the rest, dropped ${s.dropped} item(s)` } : {}), ...dropped });
         submission = s?.data ?? null;
       }
     }
-    finishTurn(req, submission);
+    finishTurn(req, submission, dropped);
     return { submission, toolCalls, ...(failed !== undefined ? { failed } : {}) };
   }
 
@@ -457,9 +439,9 @@ export class KernelModelClient implements ModelClient {
   }
 }
 
-// Traces the submission.
-export function finishTurn(req: TurnRequest, submission: unknown) {
-  if (submission !== null) req.trace.write("submission", { tool: req.submitTool, submission });
+// Traces the submission, with any keys its schema had no field for that were dropped on the way.
+export function finishTurn(req: TurnRequest, submission: unknown, dropped: { stripped?: string[] } = {}) {
+  if (submission !== null) req.trace.write("submission", { tool: req.submitTool, submission, ...dropped });
 }
 
 // Replays recorded or hand-written turns, matched by (move, correlationId) in order. Tool calls run for real
@@ -478,7 +460,7 @@ export class ScriptedModelClient implements ModelClient {
     for (const c of s.toolCalls) toolCalls.push(await runTool(this.d, req, c.tool, c.input));
     const raw = mapIds(s.submission, (x) => (/^\$\d+$/.test(x) ? toolCalls[Number(x.slice(1))]?.id ?? x : x));
     if (raw === null) return { submission: null, toolCalls };
-    const submission = clip(raw);
+    const submission = stripUnknown(SUBMIT[req.submitTool], clip(raw)).value;
     const bad = schemaErrors(SUBMIT[req.submitTool], submission);
     if (bad) { req.trace.write("rejected-submission", { input: raw, error: bad }); return { submission: null, toolCalls }; }
     req.trace.write("submission", { tool: req.submitTool, submission });

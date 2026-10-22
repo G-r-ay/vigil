@@ -794,6 +794,8 @@ export interface Subturn {
   // on the ledger.
   check?: TurnConfig["check"];
   corrections?: number;
+  // TurnConfig's: the parsed answer as the schema and the check hold it.
+  prepare?: TurnConfig["prepare"];
   // TurnConfig's: true forces the next round to the answer, for a step whose cap is not on rounds.
   answer_now?: TurnConfig["answer_now"];
   // The model this step runs on in place of the spec's, through the same provider and gateway.
@@ -834,6 +836,7 @@ export async function runSubturn<T>(ctx: PluginContext, sub: Subturn): Promise<O
     ...(sub.cite === true ? { refs: { prefix: CALL_REF, offset: count } } : {}),
     ...(sub.check === undefined ? {} : { check: sub.check }),
     ...(sub.corrections === undefined ? {} : { corrections: sub.corrections }),
+    ...(sub.prepare === undefined ? {} : { prepare: sub.prepare }),
     ...(sub.answer_now === undefined ? {} : { answer_now: sub.answer_now }),
     ...(sub.cache_conversation === true ? { cache_conversation: true } : {}),
     ...(sub.think === true ? { think: true } : {}),
