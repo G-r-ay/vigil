@@ -1,17 +1,21 @@
-// A move is one kernel turn: its role, its schema, its searches as calls on the run's ledger, its answer checked once.
+// A move is one kernel turn: its role, its schema, its searches as calls on the run's ledger, its answer checked and sent back to fix.
 import { describe, expect, it } from "vitest";
 import type { CallPayload } from "../../../contracts/events.js";
 import { InProcessState } from "../../../core/state.js";
 import { loadPlugin } from "../../../plugins/index.js";
 import { defaultConfig } from "../../../plugins/rootcause/v3/config.js";
 import type { V3Kinds } from "../../../plugins/rootcause/v3/ledger.js";
-import { KernelModelClient, KernelTurns, Refused, type TurnRequest } from "../../../plugins/rootcause/v3/model/client.js";
+import { CORRECTIONS, KernelModelClient, KernelTurns, Refused, type TurnRequest } from "../../../plugins/rootcause/v3/model/client.js";
 import { constraints, instructions, SYSTEM_PROMPT } from "../../../plugins/rootcause/v3/model/prompts.js";
-import { issued, neverRan, Registry, type EvidenceTool } from "../../../plugins/rootcause/v3/tools/registry.js";
+import { correction, issued, neverRan, Registry, type EvidenceTool } from "../../../plugins/rootcause/v3/tools/registry.js";
+import { rootCauseV3Projection } from "../../../plugins/rootcause/v3/projection.js";
 import { MemoryTrace } from "../../../plugins/rootcause/v3/trace.js";
 import { toolsFrom } from "../../../tools/remote.js";
 import { SUBMIT_TOOL } from "../../../core/stream.js";
 import { harnessOf, modelOf, specOf, splunk } from "../../support/v3-run.js";
+import { strengthen } from "../../../plugins/rootcause/v3/handlers/strengthen.js";
+import { scope, SCOPE_BATCH, SCOPE_SEARCHES } from "../../../plugins/rootcause/v3/scope.js";
+import type { LoopContext } from "../../../plugins/rootcause/v3/types.js";
 import { apply, node, seeded } from "./helpers.js";
 
 const cfg = { ...defaultConfig };
@@ -78,28 +82,46 @@ describe("a move as a kernel turn", () => {
     expect(t.tools.outputOf("r1")).toBe("3 events matched\ncurl wrote /tmp/x");
     expect(t.trace.chronological().filter((e) => e.type === "query").map((e) => (e.payload as { toolCallId: string }).toolCallId)).toEqual(["r1"]);
 
-    // The emitted value is checked once: the item citing a ref the kernel never journaled is dropped, the rest kept.
-    expect((out.submission as { candidates: { label: string }[] }).candidates.map((c) => c.label)).toEqual(["curl wrote /tmp/x"]);
-    expect(t.trace.chronological().some((e) => e.type === "rejected-submission" && JSON.stringify(e.payload).includes("r9"))).toBe(true);
+    // The emitted value is checked once: a ref the kernel never journaled fails the answer whole, as the reference.
+    expect(out.submission).toBeNull();
+    const rejected = t.trace.chronological().filter((e) => e.type === "rejected-submission");
+    expect(rejected.some((e) => JSON.stringify(e.payload).includes("r9"))).toBe(true);
+    expect(rejected.some((e) => "salvaged" in (e.payload as object))).toBe(false);
   });
 
-  // A move that searches to its cap made one call per round and then one more for the emission.
-  it("takes a move's answer on the round its search cap makes the last, with no further call", async () => {
+  // The reference's two settings for Claude: the conversation cached to its last message, and thinking on open rounds.
+  // The kernel asks; the wire sends them to Claude only, and never thinking on the forced round.
+  it("asks every call of a move to cache its conversation and to think", async () => {
+    const t = setup(
+      (request) => (request.force === SUBMIT_TOOL ? { emit: { candidates: [cand("curl wrote /tmp/x", ["r1"])], reasoning: "r" } } : { calls: [{ tool: "splunk_query", args: SEARCH }] }),
+      { [SEARCH.spl]: "3 events matched\ncurl wrote /tmp/x" },
+    );
+    await t.client.runTurn(t.request({ maxSearches: 1 }));
+    expect(t.provider.requests.map((r) => [r.force, r.cache_conversation, r.think])).toEqual([
+      [undefined, true, true],
+      [SUBMIT_TOOL, true, true],
+    ]);
+  });
+
+  // A move that searches to its cap one search a round gets every search, then answers on the forced round.
+  it("takes a move's answer on the round after its last search, with no further call", async () => {
     const t = setup(
       (request) => (request.force === SUBMIT_TOOL ? { emit: { candidates: [cand("curl wrote /tmp/x", ["r1"])], reasoning: "r" } } : { calls: [{ tool: "splunk_query", args: SEARCH }] }),
       { [SEARCH.spl]: "3 events matched\ncurl wrote /tmp/x" },
     );
     const out = await t.client.runTurn(t.request({ maxSearches: 2 }));
 
-    expect(t.provider.requests.map((r) => r.force)).toEqual([undefined, SUBMIT_TOOL]);
+    expect(t.provider.requests.map((r) => r.force)).toEqual([undefined, undefined, SUBMIT_TOOL]);
     expect(t.provider.requests.some((r) => r.emit !== undefined)).toBe(false);
-    expect(out.toolCalls).toMatchObject([{ id: "r1", ok: true }]);
+    expect(out.toolCalls).toMatchObject([{ id: "r1", ok: true }, { id: "r2", ok: true }]);
+    expect(out.toolCalls[1]!.text).toBe("3 events matched\ncurl wrote /tmp/x");
+    expect(t.provider.requests[2]!.messages.filter((m) => m.role === "tool").at(-1)!.content).toContain(`No searches left this turn. Submit now with ${SUBMIT_TOOL}.`);
     expect((out.submission as { candidates: { label: string }[] }).candidates.map((c) => c.label)).toEqual(["curl wrote /tmp/x"]);
   });
 
   it("a move with no searches asks nothing of the tool, and a failed search comes back as a failed call", async () => {
     const t = setup(
-      (request) => (request.emit !== undefined ? { emit: { candidates: [], reasoning: "r" } } : request.messages.some((m) => m.role === "tool") ? { content: "done" } : { calls: [{ tool: "splunk_query", args: { ...SEARCH, spl: "index=lab nope" } }] }),
+      (request) => (request.emit !== undefined ? { emit: { candidates: [], reasoning: "r" } } : request.messages.some((m) => m.role === "tool") || !request.tools.some((x) => x.id === "splunk_query") ? { content: "done" } : { calls: [{ tool: "splunk_query", args: { ...SEARCH, spl: "index=lab nope" } }] }),
     );
     const searched = await t.client.runTurn(t.request());
     expect(searched.toolCalls).toMatchObject([{ id: "r1", ok: false }]);
@@ -139,15 +161,23 @@ describe("a move as a kernel turn", () => {
     const withArtifacts = (label: string, artifacts: unknown[]) => ({ ...cand(label, []), artifacts });
     const salvaged = (t: ReturnType<typeof setup>) => t.trace.chronological().some((e) => e.type === "rejected-submission" && /dropped 1 item/.test(JSON.stringify(e.payload)));
 
-    it("keeps the sound candidates and drops the artifact that missed the enum, nested inside a candidate", async () => {
+    it("drops the whole candidate holding an artifact that missed the enum, as the reference, and keeps the others", async () => {
       const bad = { candidates: [withArtifacts("good", [art("email-address")]), withArtifacts("has a bad artifact", [art("host"), art("email-sender")]), cand("also good", [])], reasoning: "r" };
       const t = setup((request) => (request.emit !== undefined ? { emit: bad } : { content: "done" }));
       const out = await t.client.runTurn(t.request());
 
       expect(t.provider.requests.filter((r) => r.emit !== undefined)).toHaveLength(2);
       const got = (out.submission as { candidates: { label: string; artifacts: unknown[] }[] }).candidates;
-      expect(got.map((c) => c.label)).toEqual(["good", "has a bad artifact", "also good"]);
-      expect(got[1]!.artifacts).toEqual([art("host")]);
+      expect(got.map((c) => c.label)).toEqual(["good", "also good"]);
+      expect(salvaged(t)).toBe(true);
+    });
+
+    it("drops the whole candidate holding one bad identity signal, and keeps the others", async () => {
+      const signal = (layer: string) => ({ layer, kind: "account", value: "svc", toolCallIds: [] });
+      const bad = { candidates: [cand("good", []), { ...cand("has a bad signal", []), identitySignals: [signal("machine-facing"), signal("both")] }], reasoning: "r" };
+      const t = setup((request) => (request.emit !== undefined ? { emit: bad } : { content: "done" }));
+      const out = await t.client.runTurn(t.request());
+      expect((out.submission as { candidates: { label: string }[] }).candidates.map((c) => c.label)).toEqual(["good"]);
       expect(salvaged(t)).toBe(true);
     });
 
@@ -163,64 +193,50 @@ describe("a move as a kernel turn", () => {
       expect((await u.client.runTurn(u.request({ submitTool: "submit_theories" }))).submission).toBeNull();
     });
 
+    // As the reference's zod parses it: a key the schema has no field for is dropped, at any depth, and is never an
+    // error. Nothing is lifted from where it was put to where the schema has a field of that name.
     describe("a key the schema does not know", () => {
       const boundary = { targetDomain: "email", reason: "the mail gateway would record the sender", inDomainExhausted: true };
       const emit = async (submission: unknown, submitTool: TurnRequest["submitTool"] = "submit_causes") => {
         const t = setup((request) => (request.emit !== undefined ? { emit: submission } : { content: "done" }));
         const out = await t.client.runTurn(t.request({ submitTool }));
-        return { t, got: out.submission as { candidates: { label: string }[]; boundary?: unknown } | null, note: t.trace.chronological().find((e) => e.type === "rejected-submission")?.payload as Record<string, string> | undefined };
+        const entry = (type: string) => t.trace.chronological().find((e) => e.type === type)?.payload as Record<string, unknown> | undefined;
+        return { t, got: out.submission as { candidates: { label: string }[]; boundary?: unknown } | null, note: entry("rejected-submission"), taken: entry("submission"), emits: t.provider.requests.filter((r) => r.emit !== undefined).length };
       };
 
-      it("is removed from a candidate that is kept, and a boundary in it moves up to the top level", async () => {
-        const { got, note } = await emit({ candidates: [{ ...cand("phishing email delivered", []), boundary }, cand("also good", [])], reasoning: "r" });
-        expect(got!.candidates.map((c) => c.label)).toEqual(["phishing email delivered", "also good"]);
-        expect(got!.candidates[0]).not.toHaveProperty("boundary");
-        expect(got!.boundary).toEqual(boundary);
-        expect(note!["salvaged"]).toBe("kept the rest, dropped 0 item(s)");
-        expect(note!["repaired"]).toBe("stripped 1 unknown key(s), lifted boundary to the top level");
+      it("is dropped from a candidate on the first emission, and a boundary in it is not lifted to the top level", async () => {
+        const { got, note, taken, emits } = await emit({ candidates: [{ ...cand("phishing email delivered", []), boundary }, cand("also good", [])], reasoning: "r" });
+        expect(emits).toBe(1);
+        expect(got).toEqual({ candidates: [cand("phishing email delivered", []), cand("also good", [])], reasoning: "r" });
+        expect(note).toBeUndefined();
+        expect(taken!["stripped"]).toEqual(["candidates.0.boundary"]);
       });
 
-      it("is dropped, not lifted, when the top level already has that field or the value does not fit it", async () => {
-        const top = { ...boundary, reason: "set at the top" };
-        const held = await emit({ candidates: [{ ...cand("kept", []), boundary }], boundary: top, reasoning: "r" });
-        expect(held.got!.candidates[0]).not.toHaveProperty("boundary");
-        expect(held.got!.boundary).toEqual(top);
-        expect(held.note!["repaired"]).toBe("stripped 1 unknown key(s)");
-        const misfit = await emit({ candidates: [{ ...cand("kept", []), boundary: { targetDomain: "email" } }], reasoning: "r" });
-        expect(misfit.got!.candidates.map((c) => c.label)).toEqual(["kept"]);
-        expect(misfit.got).not.toHaveProperty("boundary");
-        expect(misfit.note!["repaired"]).toBe("stripped 1 unknown key(s)");
-      });
-
-      it("is removed from the candidate, whatever it is called, and from the submission itself", async () => {
-        const inner = await emit({ candidates: [{ ...cand("kept", []), notes: "x" }], reasoning: "r" });
+      it("is dropped whatever it is called, from the candidate and from the submission itself", async () => {
+        const inner = await emit({ candidates: [{ ...cand("kept", []), notes: "x", nodeEvidence: [{ ...cand("", []).nodeEvidence[0], edge: "E1" }] }], reasoning: "r" });
         expect(inner.got!.candidates).toEqual([cand("kept", [])]);
-        expect(inner.note!["repaired"]).toBe("stripped 1 unknown key(s)");
-        const root = await emit({ candidates: [cand("kept", [])], reasoning: "r", confidence: 0.9 });
+        expect(inner.taken!["stripped"]).toEqual(["candidates.0.nodeEvidence.0.edge", "candidates.0.notes"]);
+        const root = await emit({ candidates: [cand("kept", [])], reasoning: "r", confidence: 0.9, source: "edr", why: "w" });
         expect(root.got).toEqual({ candidates: [cand("kept", [])], reasoning: "r" });
-        expect(root.note!["repaired"]).toBe("stripped 1 unknown key(s)");
+        expect(root.taken!["stripped"]).toEqual(["confidence", "source", "why"]);
+        const entry = await emit({ candidates: [{ ...cand("kept", []), boundary }], reasoning: "r" }, "submit_entry_points");
+        expect(entry.got).toEqual({ candidates: [cand("kept", [])], reasoning: "r" });
       });
 
-      it("does not save a candidate with a real error: it is dropped, and what it carried is not lifted", async () => {
+      it("does not save a candidate with a real error: it is dropped whole, and the rest kept without their stray keys", async () => {
         const { label: _, ...unlabelled } = cand("", []);
-        const { got, note } = await emit({ candidates: [{ ...unlabelled, boundary }, cand("kept", [])], reasoning: "r" });
-        expect(got!.candidates.map((c) => c.label)).toEqual(["kept"]);
-        expect(got).not.toHaveProperty("boundary");
+        const { got, note, emits } = await emit({ candidates: [{ ...unlabelled, boundary }, { ...cand("kept", []), notes: "x" }], reasoning: "r" });
+        expect(emits).toBe(2);
+        expect(got).toEqual({ candidates: [cand("kept", [])], reasoning: "r" });
         expect(note!["salvaged"]).toBe("kept the rest, dropped 1 item(s)");
-        expect(note).not.toHaveProperty("repaired");
+        expect(note!["error"]).not.toContain("boundary");
+        expect(note!["stripped"]).toEqual(["candidates.0.boundary", "candidates.1.notes"]);
       });
 
-      it("is lifted only from a candidate the check keeps, and only the dropped candidate is counted", async () => {
-        const lost = await emit({ candidates: [{ ...cand("cites a search never run", ["r9"]), boundary }, { ...cand("kept", []), notes: "x" }], reasoning: "r" });
-        expect(lost.got!.candidates.map((c) => c.label)).toEqual(["kept"]);
-        expect(lost.got).not.toHaveProperty("boundary");
-        expect(lost.note!["salvaged"]).toBe("kept the rest, dropped 1 item(s)");
-        expect(lost.note!["repaired"]).toBe("stripped 2 unknown key(s)");
-        const kept = await emit({ candidates: [cand("cites a search never run", ["r9"]), { ...cand("kept", []), boundary }], reasoning: "r" });
-        expect(kept.got!.candidates).toEqual([cand("kept", [])]);
-        expect(kept.got!.boundary).toEqual(boundary);
-        expect(kept.note!["salvaged"]).toBe("kept the rest, dropped 1 item(s)");
-        expect(kept.note!["repaired"]).toBe("stripped 1 unknown key(s), lifted boundary to the top level");
+      it("drops a candidate the check refuses, and only that one", async () => {
+        const { got, note } = await emit({ candidates: [{ ...cand("token minted outside captured telemetry", []), boundary }, { ...cand("kept", []), notes: "x" }], reasoning: "r" });
+        expect(got).toEqual({ candidates: [cand("kept", [])], reasoning: "r" });
+        expect(note!["salvaged"]).toBe("kept the rest, dropped 1 item(s)");
       });
 
       it("does not fill a missing required field from an item: the submission still fails", async () => {
@@ -228,10 +244,10 @@ describe("a move as a kernel turn", () => {
         expect((await emit({ causes: [{ ...cand("upstream", []), evidence: ev }], reasoning: "r" }, "submit_assessment")).got).toBeNull();
       });
 
-      it("is dropped, not lifted, when the submission has no such field (entry points carry no boundary)", async () => {
-        const { got, note } = await emit({ candidates: [{ ...cand("kept", []), boundary }], reasoning: "r" }, "submit_entry_points");
-        expect(got).toEqual({ candidates: [cand("kept", [])], reasoning: "r" });
-        expect(note!["repaired"]).toBe("stripped 1 unknown key(s)");
+      it("does not save a submission citing a search never run, however sound the rest", async () => {
+        const { got, note } = await emit({ candidates: [cand("cites a search never run", ["r9"]), { ...cand("kept", []), notes: "x" }], reasoning: "r" });
+        expect(got).toBeNull();
+        expect(note).not.toHaveProperty("salvaged");
       });
     });
 
@@ -249,8 +265,8 @@ describe("a move as a kernel turn", () => {
     });
   });
 
-  it("tells the model the cap is rounds of searches, which may hold several", () => {
-    expect(constraints(cfg, range, ["edr"], ["edr"])).toContain(`search rounds this turn: at most ${cfg.maxToolCallsPerTurn} (a round may hold several searches)`);
+  it("tells the model the cap is on searches", () => {
+    expect(constraints(cfg, range, ["edr"], ["edr"])).toContain(`searches this turn: at most ${cfg.maxToolCallsPerTurn}\n`);
   });
 
   it("drops a citation of a refused call, live and as a resume rebuilds it", () => {
@@ -296,6 +312,293 @@ describe("a move as a kernel turn", () => {
   });
 });
 
+describe("an answer that fails its check goes back to the model, twice at most", () => {
+  const submit = (answer: unknown) => ({ calls: [{ tool: SUBMIT_TOOL, args: answer }] });
+  const good = { candidates: [cand("curl wrote /tmp/x", ["r1"])], reasoning: "r" };
+  const bad = { candidates: [cand("curl wrote /tmp/x", ["r1"]), cand("ghost event", ["r9"])], reasoning: "r" };
+  const labels = (out: { submission: unknown }) => (out.submission as { candidates: { label: string }[] }).candidates.map((c) => c.label);
+  const kinds = (t: ReturnType<typeof setup>) => t.trace.chronological().map((e) => e.type);
+
+  it("takes the fixed answer after one correction, with nothing salvaged, and the correction is no search", async () => {
+    const t = setup((_, n) => (n === 1 ? { calls: [{ tool: "splunk_query", args: SEARCH }] } : n === 2 ? submit(bad) : submit(good)), { [SEARCH.spl]: "3 events matched\ncurl wrote /tmp/x" });
+    const out = await t.client.runTurn(t.request());
+
+    expect(CORRECTIONS).toBe(2);
+    expect(t.provider.requests).toHaveLength(3);
+    // The answer citing this move's own search r1 passes the check inside the turn.
+    expect(labels(out)).toEqual(["curl wrote /tmp/x"]);
+    expect(kinds(t)).not.toContain("rejected-submission");
+    // On the ledger: the search, then the answer sent back, under the move's role.
+    const calls = await t.calls();
+    expect(calls.map((c) => [c.ref, c.tool, c.ok, c.failure, c.role])).toEqual([["r1", "splunk_query", true, null, "expand"], ["r2", SUBMIT_TOOL, false, "invalid_args", "expand"]]);
+    expect(calls[1]!.result).toContain(`Invalid submission: toolCallIds never issued in this run: r9.`);
+    expect(t.provider.requests[2]!.messages.filter((m) => m.role === "tool").at(-1)!.content).toContain(`Fix it and call ${SUBMIT_TOOL} again.`);
+    // Not a search: not returned, not traced, not citable, not coverage, not in the projection; it keeps its number.
+    expect(out.toolCalls.map((c) => c.id)).toEqual(["r1"]);
+    expect(t.trace.chronological().filter((e) => e.type === "query").map((e) => (e.payload as { toolCallId: string }).toolCallId)).toEqual(["r1"]);
+    expect(correction(calls[1]!)).toBe(true);
+    expect(issued(t.tools, "r2")).toBe(false);
+    expect(t.tools.callCount).toBe(2);
+    expect(t.tools.coverage).toEqual({ edr: 1 });
+    expect(rootCauseV3Projection("r1", (await t.state.read("r1")) as never).searches).toBe(1);
+  });
+
+  it("sends an answer its gate refuses back once, as a correction, and takes the next one whatever the gate says", async () => {
+    const said = (n: number) => ({ conclusion: `answer ${n} names mallory`, chain: [], openQuestions: [], reasoning: "r" });
+    const t = setup((request, n) => (request.force === SUBMIT_TOOL ? { emit: said(n) } : submit(said(n))));
+    const gate = (a: unknown) => (/mallory/.test((a as { conclusion: string }).conclusion) ? "the conclusion names \"mallory\"" : null);
+    const out = await t.client.runTurn(t.request({ move: "conclude", submitTool: "submit_conclusion", maxSearches: 0, gate }));
+
+    expect(t.provider.requests).toHaveLength(2);
+    const calls = await t.calls();
+    expect(calls.map((c) => [c.tool, c.failure])).toEqual([[SUBMIT_TOOL, "invalid_args"]]);
+    expect(calls[0]!.result).toContain("the conclusion names \"mallory\"");
+    expect((out.submission as { conclusion: string }).conclusion).toBe("answer 2 names mallory");
+    expect(t.trace.chronological().filter((e) => e.type === "reasoning").map((e) => e.payload)).toEqual([{ sentBack: "the conclusion names \"mallory\"" }]);
+    expect(kinds(t)).not.toContain("rejected-submission");
+  });
+
+  it("salvages the last answer after two corrections", async () => {
+    const unseen = { candidates: [cand("curl wrote /tmp/x", ["r1"]), cand("token minted outside captured telemetry", ["r1"])], reasoning: "r" };
+    const t = setup((_, n) => (n === 1 ? { calls: [{ tool: "splunk_query", args: SEARCH }] } : submit(unseen)), { [SEARCH.spl]: "3 events matched" });
+    const out = await t.client.runTurn(t.request());
+
+    expect(t.provider.requests).toHaveLength(4);
+    const calls = await t.calls();
+    expect(calls.map((c) => [c.ref, c.tool, c.failure])).toEqual([["r1", "splunk_query", null], ["r2", SUBMIT_TOOL, "invalid_args"], ["r3", SUBMIT_TOOL, "invalid_args"]]);
+    expect(labels(out)).toEqual(["curl wrote /tmp/x"]);
+    const note = t.trace.chronological().filter((e) => e.type === "rejected-submission").map((e) => e.payload as Record<string, string>);
+    expect(note).toHaveLength(1);
+    expect(note[0]!["salvaged"]).toBe("kept the rest, dropped 1 item(s)");
+    expect(out.toolCalls.map((c) => c.id)).toEqual(["r1"]);
+    expect(out.failed).toBeUndefined();
+  });
+
+  it("salvages nothing after two corrections when the answer cites a search never run", async () => {
+    const t = setup((_, n) => (n === 1 ? { calls: [{ tool: "splunk_query", args: SEARCH }] } : submit(bad)), { [SEARCH.spl]: "3 events matched" });
+    const out = await t.client.runTurn(t.request());
+    expect(out.submission).toBeNull();
+    const note = t.trace.chronological().filter((e) => e.type === "rejected-submission").map((e) => e.payload as Record<string, string>);
+    expect(note).toHaveLength(1);
+    expect(note[0]!["error"]).toContain("toolCallIds never issued in this run: r9.");
+    expect(note[0]).not.toHaveProperty("salvaged");
+  });
+
+  it("spends none of the move's searches: both run, and the next ref follows the correction's", async () => {
+    const two = { purpose: "the parent", spl: "index=lab sourcetype=edr host=ws-7 parent" };
+    const t = setup(
+      (request, n) => (request.force === SUBMIT_TOOL ? { emit: { candidates: [cand("curl wrote /tmp/x", ["r1", "r3"])], reasoning: "r" } } : n === 1 ? { calls: [{ tool: "splunk_query", args: SEARCH }] } : n === 2 ? submit(bad) : { calls: [{ tool: "splunk_query", args: two }] }),
+      { [SEARCH.spl]: "3 events matched", [two.spl]: "1 event matched" },
+    );
+    const out = await t.client.runTurn(t.request({ maxSearches: 2 }));
+
+    expect(t.provider.requests.map((r) => r.force)).toEqual([undefined, undefined, undefined, SUBMIT_TOOL]);
+    const calls = await t.calls();
+    expect(calls.map((c) => [c.ref, c.tool, c.ok])).toEqual([["r1", "splunk_query", true], ["r2", SUBMIT_TOOL, false], ["r3", "splunk_query", true]]);
+    expect(calls.filter((c) => neverRan(c))).toEqual([]);
+    expect(out.toolCalls.map((c) => [c.id, c.text])).toEqual([["r1", "3 events matched"], ["r3", "1 event matched"]]);
+    expect(labels(out)).toEqual(["curl wrote /tmp/x"]);
+    expect(["r1", "r2", "r3"].map((id) => issued(t.tools, id))).toEqual([true, false, true]);
+    // A search the code makes next takes r4, not the correction's number.
+    expect((await t.tools.call("splunk_query", SEARCH, { allowedDomains: ["edr"], allDomains: ["edr"], timeoutMs: 1000, range })).toolCallId).toBe("r4");
+  });
+
+  // As the reference: a move with no searches opens on a round free to think, and once that round has answered,
+  // its searches are spent, so the correction is forced.
+  it("corrects a move with no searches too: its first round free, the correction forced", async () => {
+    const fixed = { evidence: [{ summary: "s", strength: "direct", polarity: "supports", toolCallIds: [] }], reasoning: "r" };
+    const t = setup((_, n) => (n === 1 ? submit({ evidence: [{ ...fixed.evidence[0], toolCallIds: ["r9"] }], reasoning: "r" }) : { emit: fixed }));
+    const out = await t.client.runTurn(t.request({ move: "strengthen", submitTool: "submit_assessment", maxSearches: 0 }));
+    expect(t.provider.requests.map((r) => r.force)).toEqual([undefined, SUBMIT_TOOL]);
+    expect(t.provider.requests[0]!.tools.map((x) => x.id)).toEqual([SUBMIT_TOOL]);
+    expect((await t.calls()).map((c) => [c.ref, c.tool])).toEqual([["r1", SUBMIT_TOOL]]);
+    expect(out.submission).toEqual(fixed);
+    expect(out.toolCalls).toEqual([]);
+  });
+});
+
+describe("an answer that fails its schema goes back to the model like one that fails its check", () => {
+  const submit = (answer: unknown) => ({ calls: [{ tool: SUBMIT_TOOL, args: answer }] });
+  const good = { candidates: [cand("curl wrote /tmp/x", ["r1"]), cand("bash ran curl", ["r1"])], reasoning: "r" };
+  // The live failures: a key the schema does not know inside a candidate, and the next move's fields flattened to the top.
+  const stray = { candidates: [cand("curl wrote /tmp/x", ["r1"]), { ...cand("bash ran curl", ["r1"]), boundary: { source: "proxy" }, edge: "E1" }], reasoning: "r" };
+  const labels = (out: { submission: unknown }) => (out.submission as { candidates: { label: string }[] }).candidates.map((c) => c.label);
+  const taken = (t: ReturnType<typeof setup>) => t.trace.chronological().find((e) => e.type === "submission")?.payload as Record<string, unknown>;
+
+  // As the reference's zod: a key the schema has no field for is dropped, not an error, so it costs no correction.
+  it("takes an answer whose only fault is a key the schema does not know the first time, without that key", async () => {
+    const t = setup((_, n) => (n === 1 ? { calls: [{ tool: "splunk_query", args: SEARCH }] } : submit(stray)), { [SEARCH.spl]: "3 events matched" });
+    const out = await t.client.runTurn(t.request());
+
+    expect(t.provider.requests).toHaveLength(2);
+    expect(out.submission).toEqual(good);
+    expect((await t.calls()).map((c) => [c.ref, c.tool])).toEqual([["r1", "splunk_query"]]);
+    expect(t.trace.chronological().map((e) => e.type)).not.toContain("rejected-submission");
+    expect(taken(t)["stripped"]).toEqual(["candidates.1.boundary", "candidates.1.edge"]);
+  });
+
+  it("still corrects a next move sent as a string, dropping the next move's fields flattened beside it", async () => {
+    const flat = { ...good, source: "edr", target: "N1", why: "the parent process", next: "expand" };
+    const t = setup((_, n) => (n === 1 ? { calls: [{ tool: "splunk_query", args: SEARCH }] } : n === 2 ? submit(flat) : submit({ ...good, next: { move: "expand", target: "N1", why: "the parent process" } })), { [SEARCH.spl]: "3 events matched" });
+    const out = await t.client.runTurn(t.request());
+
+    expect(t.provider.requests).toHaveLength(3);
+    const calls = await t.calls();
+    expect(calls.map((c) => [c.ref, c.tool, c.failure])).toEqual([["r1", "splunk_query", null], ["r2", SUBMIT_TOOL, "invalid_args"]]);
+    expect(calls[1]!.result).toContain(`Invalid submission: next: must be object. Fix it and call ${SUBMIT_TOOL} again.`);
+    expect(calls[1]!.result).not.toContain("unrecognized key");
+    expect(labels(out)).toEqual(["curl wrote /tmp/x", "bash ran curl"]);
+    expect((out.submission as { next: unknown }).next).toEqual({ move: "expand", target: "N1", why: "the parent process" });
+  });
+
+  it("still corrects a value outside its enum, and says only that", async () => {
+    const off = { candidates: [cand("curl wrote /tmp/x", ["r1"]), { ...cand("bash ran curl", ["r1"]), edge: "E1", nodeEvidence: [{ summary: "s", strength: "strong", polarity: "supports", toolCallIds: ["r1"] }] }], reasoning: "r" };
+    const t = setup((_, n) => (n === 1 ? { calls: [{ tool: "splunk_query", args: SEARCH }] } : n === 2 ? submit(off) : submit(good)), { [SEARCH.spl]: "3 events matched" });
+    const out = await t.client.runTurn(t.request());
+
+    const calls = await t.calls();
+    expect(calls.map((c) => [c.ref, c.tool, c.failure])).toEqual([["r1", "splunk_query", null], ["r2", SUBMIT_TOOL, "invalid_args"]]);
+    expect(calls[1]!.result).toContain("Invalid submission: candidates.1.nodeEvidence.0.strength: must be equal to one of the allowed values: direct, corroborating, circumstantial. Fix it");
+    expect(calls[1]!.result).not.toContain("unrecognized key");
+    expect(labels(out)).toEqual(["curl wrote /tmp/x", "bash ran curl"]);
+  });
+
+  it("salvages the last answer as before once both corrections are spent, without its stray keys", async () => {
+    const off = { candidates: [{ ...cand("curl wrote /tmp/x", ["r1"]), edge: "E1" }, { ...cand("bash ran curl", ["r1"]), domain: 7 }], reasoning: "r", why: "w" };
+    const t = setup((request, n) => (n === 1 ? { calls: [{ tool: "splunk_query", args: SEARCH }] } : request.emit !== undefined ? { emit: off } : submit(off)), { [SEARCH.spl]: "3 events matched" });
+    const out = await t.client.runTurn(t.request());
+
+    // Two sent back, the third to the emission turn and its retry, as a schema-invalid submit always went.
+    expect(t.provider.requests.map((r) => r.emit !== undefined)).toEqual([false, false, false, false, true, true]);
+    expect((await t.calls()).map((c) => [c.ref, c.tool])).toEqual([["r1", "splunk_query"], ["r2", SUBMIT_TOOL], ["r3", SUBMIT_TOOL]]);
+    expect(out.submission).toEqual({ candidates: [cand("curl wrote /tmp/x", ["r1"])], reasoning: "r" });
+    const note = t.trace.chronological().filter((e) => e.type === "rejected-submission").map((e) => e.payload as Record<string, unknown>);
+    expect(note).toHaveLength(1);
+    expect(note[0]!["salvaged"]).toBe("kept the rest, dropped 1 item(s)");
+    expect(note[0]!["stripped"]).toEqual(["candidates.0.edge", "why"]);
+    expect(out.failed).toBeUndefined();
+  });
+});
+
+describe("a turn's search cap counts searches, not rounds", () => {
+  const search = (i: number) => ({ purpose: `search ${i}`, spl: `index=lab sourcetype=edr q=${i}` });
+  const table = (n: number) => Object.fromEntries(Array.from({ length: n }, (_, i) => [search(i + 1).spl, `${i + 1} events matched`]));
+  const refusedCalls = (calls: CallPayload[]) => calls.filter((c) => c.failure === "refused");
+  const NO_MORE = `Not run: no searches left this turn. Submit now with ${SUBMIT_TOOL}.`;
+
+  it("runs the first 3 of 5 searches one response asks for under a cap of 3 and refuses the other 2, uncitable", async () => {
+    const t = setup(
+      (request) => (request.emit !== undefined || request.force === SUBMIT_TOOL ? { emit: { candidates: [], reasoning: "r" } } : request.messages.some((m) => m.role === "tool") ? { content: "done" } : { calls: [1, 2, 3, 4, 5].map((i) => ({ tool: "splunk_query", args: search(i) })) }),
+      table(5),
+    );
+    const out = await t.client.runTurn(t.request({ maxSearches: 3 }));
+    // The cap spent in the first response, the second is the answer, forced.
+    expect(t.provider.requests.map((r) => r.force)).toEqual([undefined, SUBMIT_TOOL]);
+
+    const calls = await t.calls();
+    expect(calls.map((c) => [c.ref, c.ok])).toEqual([["r1", true], ["r2", true], ["r3", true], ["r4", false], ["r5", false]]);
+    expect(refusedCalls(calls).map((c) => c.ref)).toEqual(["r4", "r5"]);
+    for (const c of refusedCalls(calls)) expect(c.result).toContain(NO_MORE);
+    expect(t.tools.inputOf("r3")).toEqual(search(3));
+    expect(["r1", "r2", "r3", "r4", "r5"].map((id) => issued(t.tools, id))).toEqual([true, true, true, false, false]);
+    expect(out.toolCalls.map((c) => c.text)).toEqual(["1 events matched", "2 events matched", "3 events matched", expect.stringContaining(NO_MORE), expect.stringContaining(NO_MORE)]);
+    // The search that spent the cap says so, as the refusals do.
+    const shown = t.provider.requests[1]!.messages.filter((m) => m.role === "tool").map((m) => m.content);
+    expect(shown[2]).toContain(JSON.stringify(`3 events matched\nNo searches left this turn. Submit now with ${SUBMIT_TOOL}.`));
+    expect(shown[1]).not.toContain("No searches left");
+  });
+
+  it("caps strengthen at 3 searches, however the model spreads them over rounds", async () => {
+    const t = setup(
+      (request, n) => (request.emit !== undefined || request.force === SUBMIT_TOOL ? { emit: { evidence: [], reasoning: "r" } } : n === 1 ? { calls: [1, 2].map((i) => ({ tool: "splunk_query", args: search(i) })) } : n === 2 ? { calls: [3, 4, 5].map((i) => ({ tool: "splunk_query", args: search(i) })) } : { content: "done" }),
+      table(5),
+    );
+    const g = seeded();
+    const symptom = Object.keys(g.nodes)[0]!;
+    const ctx = { runId: "r1", turn: 1, cfg, model: t.client, tools: t.tools, trace: t.trace.forTurn(1, "strengthen", symptom), domains: ["edr"], range, index: "lab", signal: new AbortController().signal } as unknown as LoopContext;
+    await strengthen({ move: "strengthen", targetId: symptom, why: "check it" } as never, g, ctx);
+
+    expect(cfg.strengthenSearches).toBe(3);
+    expect(t.provider.requests[0]!.messages.map((m) => m.content).join("\n")).toContain("searches this turn: at most 3\n");
+    const calls = await t.calls();
+    expect(calls.map((c) => [c.ref, c.ok])).toEqual([["r1", true], ["r2", true], ["r3", true], ["r4", false], ["r5", false]]);
+    expect(refusedCalls(calls).map((c) => c.ref)).toEqual(["r4", "r5"]);
+  });
+
+  it("runs scope's 14 searches in batches of 7: the rest of a response waits for the results", async () => {
+    const BATCH = `Not run: at most ${SCOPE_BATCH} searches per batch. Read these results first, then send the next batch (fix any search that returned nothing).`;
+    const t = setup(
+      (request, n) => (request.emit !== undefined || request.force === SUBMIT_TOOL ? { emit: { map: `**Systems**\n- ws-7 seen 12 times\n${"- host seen 10 times\n".repeat(12)}`, reasoning: "r" } }
+        : n === 1 ? { calls: Array.from({ length: 9 }, (_, i) => ({ tool: "splunk_query", args: search(i + 1) })) }
+        : n === 2 ? { calls: Array.from({ length: 8 }, (_, i) => ({ tool: "splunk_query", args: search(i + 8) })) }
+        : { calls: [{ tool: "splunk_query", args: search(16) }] }),
+      table(16),
+    );
+    const deps = { model: t.client, tools: t.tools, trace: t.trace, domains: ["edr"], sizes: { edr: 10 } } as never;
+    const map = await scope(deps, cfg, range);
+
+    expect([SCOPE_SEARCHES, SCOPE_BATCH]).toEqual([14, 7]);
+    expect(map).toContain("ws-7 seen 12 times");
+    const calls = await t.calls();
+    const ran = calls.filter((c) => c.failure !== "refused").map((c) => JSON.parse(c.arguments).purpose);
+    expect(ran).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14].map((i) => `search ${i}`));
+    // First response: 7 run, 2 wait. Second: 7 run (the cap), the 8th is past the cap. Third: the answer, forced,
+    // so the model is never free to ask for more.
+    expect(refusedCalls(calls).map((c) => [JSON.parse(c.arguments).purpose, c.result.includes(BATCH), c.result.includes(NO_MORE)])).toEqual([
+      ["search 8", true, false], ["search 9", true, false], ["search 15", false, true],
+    ]);
+    expect(t.provider.requests.map((r) => r.force)).toEqual([undefined, undefined, SUBMIT_TOOL]);
+  });
+});
+
+// The reference forces the submit, with no thinking, from the round after the one that spent the move's searches, and
+// keeps every round after it forced. The round count alone would leave those rounds free, and thinking.
+describe("a move that has spent its searches answers on the next round, forced, as the reference", () => {
+  const search = (i: number) => ({ purpose: `search ${i}`, spl: `index=lab sourcetype=edr q=${i}` });
+  const table = Object.fromEntries([1, 2, 3, 4].map((i) => [search(i).spl, `${i} events matched`]));
+  const good = { candidates: [cand("curl wrote /tmp/x", ["r1"])], reasoning: "r" };
+  const bad = { candidates: [cand("curl wrote /tmp/x", ["r1"]), cand("ghost event", ["r9"])], reasoning: "r" };
+  const pair = (a: number, b: number) => ({ calls: [a, b].map((i) => ({ tool: "splunk_query", args: search(i) })) });
+
+  it("forces the round after the cap is reached mid-round, with rounds still left on the count", async () => {
+    const t = setup((request, n) => (request.force === SUBMIT_TOOL ? { emit: good } : n === 1 ? pair(1, 2) : n === 2 ? pair(3, 4) : { calls: [{ tool: "splunk_query", args: search(5) }] }), table);
+    const out = await t.client.runTurn(t.request({ maxSearches: 3 }));
+
+    // Searches 1-3 run, the 4th is past the cap; the third round is the answer, though the count allows a fourth.
+    expect((await t.calls()).map((c) => [c.ref, c.ok])).toEqual([["r1", true], ["r2", true], ["r3", true], ["r4", false]]);
+    expect(t.provider.requests.map((r) => r.force)).toEqual([undefined, undefined, SUBMIT_TOOL]);
+    // The kernel asks every round to think; the wire never sends thinking on a forced one (tests/core/claude-wire).
+    expect(t.provider.requests.every((r) => r.think === true)).toBe(true);
+    expect(out.submission).toEqual(good);
+  });
+
+  it("keeps a correction after a forced answer forced", async () => {
+    const t = setup((request, n) => (request.force === SUBMIT_TOOL ? { emit: n === 2 ? bad : good } : { calls: [{ tool: "splunk_query", args: search(1) }] }), table);
+    const out = await t.client.runTurn(t.request({ maxSearches: 1 }));
+
+    expect(t.provider.requests.map((r) => r.force)).toEqual([undefined, SUBMIT_TOOL, SUBMIT_TOOL]);
+    expect((await t.calls()).map((c) => [c.ref, c.tool])).toEqual([["r1", "splunk_query"], ["r2", SUBMIT_TOOL]]);
+    expect(out.submission).toEqual(good);
+  });
+
+  it("leaves every round free while searches are left", async () => {
+    const submit = { calls: [{ tool: SUBMIT_TOOL, args: good }] };
+    const t = setup((_, n) => (n === 1 ? pair(1, 2) : submit), table);
+    const out = await t.client.runTurn(t.request({ maxSearches: 6 }));
+
+    expect(t.provider.requests.map((r) => r.force)).toEqual([undefined, undefined]);
+    expect(out.submission).toEqual(good);
+  });
+
+  it("opens a move with no searches on a free round that offers only the submit, and answers there", async () => {
+    const t = setup(() => ({ calls: [{ tool: SUBMIT_TOOL, args: { evidence: [], reasoning: "r" } }] }));
+    const out = await t.client.runTurn(t.request({ move: "strengthen", submitTool: "submit_assessment", maxSearches: 0 }));
+
+    expect(t.provider.requests.map((r) => [r.force, r.tools.map((x) => x.id)])).toEqual([[undefined, [SUBMIT_TOOL]]]);
+    expect(out.submission).toEqual({ evidence: [], reasoning: "r" });
+  });
+});
+
 describe("what a move's prompt tells the model to call", () => {
   // Every move's instructions, built on a graph that has the pieces each one names.
   const moves = (): Record<string, string> => {
@@ -326,5 +629,88 @@ describe("what a move's prompt tells the model to call", () => {
       expect(sent.tools.map((x) => x.id)).toEqual(searches ? ["splunk_query", SUBMIT_TOOL] : [SUBMIT_TOOL]);
     }
     expect(all.conclude).not.toContain("splunk_query");
+  });
+});
+
+describe("a move's model: scope on the scope model, a refused move asked again as the reference does", () => {
+  const MAP = { map: `**Systems**\n- ws-7 seen 12 times\n${"- host seen 10 times\n".repeat(12)}`, reasoning: "r" };
+  const SNAPSHOT = "Find the cause.\n<graph_snapshot>\nN1 curl wrote /tmp/x\nSTORIES (competing explanations of the whole incident; latest round live)\nR1.H1 an attacker ran curl\n</graph_snapshot>";
+  const sent = (request: { messages: readonly { content: string }[] }) => request.messages.map((m) => m.content).join("\n");
+  const spends = async (state: InProcessState<V3Kinds>) => (await state.read("r1")).filter((e) => e.kind === "spend").map((e) => e.payload as { model_id: string; role: string });
+  const refusals = (trace: MemoryTrace) => trace.chronological().filter((e) => e.type === "refusal").map((e) => e.payload);
+  const answered = (request: Parameters<Parameters<typeof modelOf>[0]>[0]) => (request.emit !== undefined ? { emit: { candidates: [], reasoning: "r" } } : { content: "done" });
+
+  it("runs scope's every call on cfg.scopeModel, and journals its spend as that model; a move without one runs on the run's", async () => {
+    const t = setup((request) => (request.emit !== undefined || request.force === SUBMIT_TOOL ? { emit: MAP } : { content: "done" }));
+    const deps = { model: t.client, tools: t.tools, trace: t.trace, domains: ["edr"], sizes: { edr: 10 } } as never;
+    expect(cfg.scopeModel).toBe("claude-sonnet-5");
+    expect(await scope(deps, cfg, range)).toContain("ws-7 seen 12 times");
+    expect(t.provider.models.length).toBeGreaterThan(0);
+    expect(new Set(t.provider.models)).toEqual(new Set(["claude-sonnet-5"]));
+    expect(await spends(t.state)).toEqual(t.provider.models.map(() => expect.objectContaining({ model_id: "claude-sonnet-5", role: "scope" })));
+
+    const before = t.provider.models.length;
+    await t.client.runTurn(t.request());
+    expect(new Set(t.provider.models.slice(before))).toEqual(new Set(["scripted/model"]));
+  });
+
+  it("asks a refused move again without the STORIES section, on the same model", async () => {
+    const t = setup((request, n) => (n === 1 ? { refuse: true } : answered(request)));
+    const out = await t.client.runTurn(t.request({ userContent: SNAPSHOT }));
+
+    expect(out.submission).toEqual({ candidates: [], reasoning: "r" });
+    expect(sent(t.provider.requests[0]!)).toContain("STORIES (competing");
+    for (const r of t.provider.requests.slice(1)) {
+      expect(sent(r)).not.toContain("STORIES");
+      expect(sent(r)).toContain("N1 curl wrote /tmp/x\n</graph_snapshot>");
+    }
+    expect(new Set(t.provider.models)).toEqual(new Set(["scripted/model"]));
+    expect(refusals(t.trace)).toEqual([{ attempt: 1, model: "scripted/model", retry: "without STORIES" }]);
+    expect(t.trace.chronological().map((e) => e.type)).not.toContain("provider-failure");
+  });
+
+  it("refused again, asks it on cfg.refusalFallbackModel with the whole snapshot", async () => {
+    const t = setup((request, _n, model) => (model !== cfg.refusalFallbackModel ? { refuse: true } : answered(request)));
+    const out = await t.client.runTurn(t.request({ userContent: SNAPSHOT }));
+
+    expect(out.submission).toEqual({ candidates: [], reasoning: "r" });
+    expect(t.provider.models.slice(0, 2)).toEqual(["scripted/model", "scripted/model"]);
+    expect(new Set(t.provider.models.slice(2))).toEqual(new Set(["claude-sonnet-5"]));
+    expect(sent(t.provider.requests[2]!)).toContain("STORIES (competing");
+    expect(refusals(t.trace)).toEqual([
+      { attempt: 1, model: "scripted/model", retry: "without STORIES" },
+      { attempt: 2, model: "scripted/model", retry: "fallback model claude-sonnet-5" },
+    ]);
+    expect((await spends(t.state)).slice(2).every((s) => s.model_id === "claude-sonnet-5" && s.role === "expand")).toBe(true);
+  });
+
+  it("refused a third time, gives up on the move: no submission, no searches, the run goes on", async () => {
+    const t = setup(() => ({ refuse: true }));
+    const out = await t.client.runTurn(t.request({ userContent: SNAPSHOT }));
+
+    expect(out).toEqual({ submission: null, toolCalls: [] });
+    expect(t.provider.models).toEqual(["scripted/model", "scripted/model", "claude-sonnet-5"]);
+    expect(refusals(t.trace)).toEqual([
+      { attempt: 1, model: "scripted/model", retry: "without STORIES" },
+      { attempt: 2, model: "scripted/model", retry: "fallback model claude-sonnet-5" },
+      { attempt: 3, gaveUp: true },
+    ]);
+    expect(t.trace.chronological().map((e) => e.type)).not.toContain("submission");
+  });
+
+  it("keeps the pool refusing a call apart: it ends the run, and no model is asked again", async () => {
+    const spec = specOf({ budgets: { max_calls: 0, max_cost_usd: 10, max_wall_ms: 600_000, max_park_ms: 60_000 } });
+    const t = setup(() => ({ refuse: true }), {}, spec);
+    await expect(t.client.runTurn(t.request({ userContent: SNAPSHOT }))).rejects.toBeInstanceOf(Refused);
+    expect(t.provider.requests).toHaveLength(0);
+    expect(refusals(t.trace)).toEqual([]);
+  });
+
+  it("does not take a provider failure for a refusal: it is not asked again", async () => {
+    const t = setup(() => { throw new Error("502 failed to execute HTTP request to provider API"); });
+    const out = await t.client.runTurn(t.request({ userContent: SNAPSHOT }));
+    expect(out.failed).toContain("502");
+    expect(new Set(t.provider.models)).toEqual(new Set(["scripted/model"]));
+    expect(refusals(t.trace)).toEqual([]);
   });
 });

@@ -3,7 +3,6 @@
 // reports the steps in between and the links. A link into a node with an open boundary resolves that boundary:
 // its cause has been found.
 import type { EdgeIn, GraphPatch } from "../graph.js";
-import { entitiesOf } from "../coverage.js";
 import { toConnect } from "../frontier.js";
 import { instructions } from "../model/prompts.js";
 import type { SubmitLinks } from "../model/schemas.js";
@@ -43,7 +42,7 @@ export const connect: Handler = async (d, g, ctx) => {
   let resolve: GraphPatch["resolveBoundary"];
   for (const l of sub.links) {
     const a = end(l.from), b = end(l.to);
-    const evidence = await v.evidence(l.evidence, a && g.nodes[a.id] ? g.nodes[a.id]!.domain : ctx.domains[0]!, entitiesOf(g, ...[a?.id, b?.id].filter((x): x is string => !!x)));
+    const evidence = await v.evidence(l.evidence, a && g.nodes[a.id] ? g.nodes[a.id]!.domain : ctx.domains[0]!);
     const why = !a || !b ? `unknown end ${!a ? l.from : l.to}`
       : a.id === b.id ? "a link joins two different events"
       : a.at && b.at && Date.parse(a.at) > Date.parse(b.at) + SKEW_MS ? `${l.from} (${a.at}) is after ${l.to} (${b.at}); a cause comes first`
@@ -52,8 +51,8 @@ export const connect: Handler = async (d, g, ctx) => {
       // was once linked to a stolen role's first call on timing alone).
       : a.legitimate && !b.legitimate && !evidence.some((x) => x.strength === "direct" && x.polarity === "supports") ? "a legitimate step links into the attack only with direct evidence"
       : "";
-    // A legitimate step's link without direct evidence is kept as inferred.
-    const inferred = why === "a legitimate step links into the attack only with direct evidence";
+    // Loose: a legitimate step's link without direct evidence is kept as inferred.
+    const inferred = ctx.cfg.loose && why === "a legitimate step links into the attack only with direct evidence";
     if (inferred) for (const x of evidence) x.strength = "circumstantial";
     if (why && !inferred) { ctx.trace.write("rejected-evidence", { link: l, reason: why }); continue; }
     // The cause of a node with an open boundary has been found: resolve the boundary with this link.

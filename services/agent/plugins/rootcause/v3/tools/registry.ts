@@ -3,7 +3,7 @@
 // model makes, and this registry for one the code makes, and both are journaled as `call` events.
 import { CALL_REF } from "../../../../core/agent.js";
 import type { CallPayload } from "../../../../contracts/events.js";
-import { schemaErrors } from "../../../../core/stream.js";
+import { schemaErrors, SUBMIT_TOOL } from "../../../../core/stream.js";
 import type { Domain } from "../types.js";
 
 export interface ToolContext {
@@ -43,6 +43,12 @@ const REF = new RegExp(`^${CALL_REF}(\\d+)$`);
 // Both are on the ledger as failed calls; this is the one reading of them, live, on resume and in the projection.
 export function neverRan(call: Pick<CallPayload, "failure" | "result">): boolean {
   return call.failure === "refused" || /^<vigil:tool_result[^>]*>\nfailed: \w+ -- refused:/.test(call.result);
+}
+
+// An answer the move's check sent back to the model to fix: on the ledger as a call with a ref, but no search.
+// It is never evidence, never coverage and never a search shown or counted, live, on resume or in the projection.
+export function correction(call: Pick<CallPayload, "tool">): boolean {
+  return call.tool === SUBMIT_TOOL;
 }
 
 // A ref is citable when the run has issued it (positions 1..callCount) and the call ran.

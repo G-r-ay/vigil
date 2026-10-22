@@ -131,7 +131,8 @@ describe("victim accounts and dead ends", () => {
     const { renderReport } = await import("../../../plugins/rootcause/v3/report.js");
     const { MemoryTrace } = await import("../../../plugins/rootcause/v3/trace.js");
     const g = seeded();
-    apply(g, { addNodes: [node("repl", { label: "directory replication using alice's stolen credentials", evidence: [ev("direct", "supports", ["d1"])] })] });
+    // Linked to the alert by a proven link: the chain reaches alice, so the report may name her (unlinked.ts).
+    apply(g, { addNodes: [node("repl", { label: "directory replication using alice's stolen credentials", evidence: [ev("direct", "supports", ["d1"]), ev("direct", "supports", ["d3"])] })], addEdges: [{ tempId: "e", kind: "explains", source: "repl", target: "N1", prior: 0.3, evidence: [ev("direct", "supports", ["d2"]), ev("direct", "supports", ["d4"])] }] });
     apply(g, buildAttributionPatch("N2", [
       { layer: "machine-facing", relation: "ran-as", kind: "account", value: "alice", toolCallIds: ["r1"] },
       { layer: "machine-facing", relation: "operated-by", kind: "operator", value: "evil.test operator", toolCallIds: ["r2"] },
@@ -334,21 +335,29 @@ describe("baselines are checked, not taken on the model's word", () => {
   const cx = { inputOf: (id: string) => calls[id], range };
   const cand = (ids: string[], unusual = true) => ({ label: "register_self_hosted_runner by dev-a", domain: "github", prior: 0.4, artifacts: [{ kind: "user", value: "dev-a" }], nodeEvidence: [], edgeEvidence: [], baseline: { summary: "s", unusual, toolCallIds: ids } });
   const sub = (c: object) => ({ effects: [c], reasoning: "r" });
-  it("needs a whole-range search naming the account, both for unusual and for routine; a baseline that fails is dropped and the event tagged unverified", () => {
+  it("needs a whole-range search naming the account, both for unusual and for routine", () => {
+    expect(check("submit_effects", sub(cand(["r1"])), 3, cx)).toMatchObject({ success: true });
+    expect(check("submit_effects", sub(cand(["r2"])), 3, cx)).toMatchObject({ success: false, drop: [["effects", 0]] });
+    expect(check("submit_effects", sub(cand(["r3"], false)), 3, cx)).toMatchObject({ success: false });
+  });
+  it("needs a whole-range search naming the account, both for unusual and for routine; a baseline that fails is dropped and the event tagged unverified (loose)", () => {
     const kept = (r: ReturnType<typeof check>) => (r as { data: { effects: { baseline?: unknown; unverified?: boolean }[] } }).data.effects[0]!;
-    expect(kept(check("submit_effects", sub(cand(["r1"])), 3, cx))).toMatchObject({ baseline: { unusual: true } });
-    for (const e of [kept(check("submit_effects", sub(cand(["r2"])), 3, cx)), kept(check("submit_effects", sub(cand(["r3"], false)), 3, cx))]) {
+    const lx = { ...cx, loose: true };
+    expect(kept(check("submit_effects", sub(cand(["r1"])), 3, lx))).toMatchObject({ baseline: { unusual: true } });
+    for (const e of [kept(check("submit_effects", sub(cand(["r2"])), 3, lx)), kept(check("submit_effects", sub(cand(["r3"], false)), 3, lx))]) {
       expect(e.unverified).toBe(true);
       expect(e.baseline).toBeUndefined();
     }
   });
-  it("drops an item citing a ref the run never issued, and keeps the rest", async () => {
+  it("fails the whole submission on a ref the run never issued, and salvage keeps nothing, as the reference", async () => {
     const { salvage } = await import("../../../plugins/rootcause/v3/model/client.js");
     const two = sub({ ...cand(["r1"]), label: "second" });
     const input = { effects: [cand(["r1"]), { ...cand(["r9"]), label: "second" }, two.effects[0]], reasoning: "r" };
     const first = check("submit_effects", input, 3, cx);
-    expect(first).toMatchObject({ success: false, drop: [["effects", 1]] });
-    expect(salvage("submit_effects", input, 3, cx, first)).toMatchObject({ dropped: 1, data: { effects: [{ label: "register_self_hosted_runner by dev-a" }, { label: "second" }] } });
+    expect(first).toMatchObject({ success: false, drop: [] });
+    expect(salvage("submit_effects", input, 3, cx, first)).toBeNull();
+    const nested = { effects: [cand(["r1"]), { ...cand(["r1"]), nodeEvidence: [{ summary: "s", strength: "direct", polarity: "supports", toolCallIds: ["r1", "r9"] }] }], reasoning: "r" };
+    expect(salvage("submit_effects", nested, 3, cx, check("submit_effects", nested, 3, cx))).toBeNull();
   });
 });
 

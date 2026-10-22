@@ -23,7 +23,7 @@ import { journalAnswers, noAnswers, type Answers } from "./answers.js";
 import { GatewayExhausted } from "./limiter.js";
 import { announceOpen, noAnnounce, type Announce } from "./checkpoints.js";
 import type { Harness, Outcome, TurnConfig } from "./loop.js";
-import type { Message } from "./provider.js";
+import type { Message, Provider } from "./provider.js";
 import { registryOf, type Registry } from "./registry.js";
 import { scrub } from "./security.js";
 import type { ToolDispatch } from "./seams.js";
@@ -792,6 +792,21 @@ export interface Subturn {
   max_turns?: number;
   // Numbers each result as the ledger will (r12), so the answer can cite them.
   cite?: boolean;
+  // The caller's test of a submitted answer, and how many times one that fails it or the
+  // schema goes back to the model to fix: TurnConfig's. Each correction is a submit_answer call
+  // on the ledger.
+  check?: TurnConfig["check"];
+  corrections?: number;
+  // TurnConfig's: the parsed answer as the schema and the check hold it.
+  prepare?: TurnConfig["prepare"];
+  // TurnConfig's: true forces the next round to the answer, for a step whose cap is not on rounds.
+  answer_now?: TurnConfig["answer_now"];
+  // The model this step runs on in place of the spec's, through the same provider and gateway.
+  // Every call in it is asked of this model and priced and journaled as it.
+  model?: string;
+  // TurnConfig's: Claude caches the whole conversation and thinks on open rounds. Off unless set.
+  cache_conversation?: boolean;
+  think?: boolean;
 }
 
 export async function runSubturn<T>(ctx: PluginContext, sub: Subturn): Promise<Outcome<T>> {
@@ -799,7 +814,11 @@ export async function runSubturn<T>(ctx: PluginContext, sub: Subturn): Promise<O
   let turn = 0;
   const available = dedupe([...(options.tools ?? []), ...(options.hooks?.tools?.({ ...ctx, turn: () => turn }) ?? [])]);
   const known = new Set(available.map((tool) => tool.id));
-  const scoped: Harness<Kinds> = { ...harness, registry: registryOf(available, { [sub.role]: sub.tools.filter((id) => known.has(id)) }) };
+  const scoped: Harness<Kinds> = {
+    ...harness,
+    ...(sub.model === undefined ? {} : { provider: providerOn(harness, sub.role, sub.model) }),
+    registry: registryOf(available, { [sub.role]: sub.tools.filter((id) => known.has(id)) }),
+  };
   const calls = callsIn(await harness.state.read(options.run_id));
   turn = calls.reduce((max, call) => Math.max(max, call.turn), 0);
   let count = calls.length;
@@ -818,6 +837,12 @@ export async function runSubturn<T>(ctx: PluginContext, sub: Subturn): Promise<O
     result_cap: options.spec.runtime.result_cap,
     recall_limit: options.spec.runtime.recall_limit,
     ...(sub.cite === true ? { refs: { prefix: CALL_REF, offset: count } } : {}),
+    ...(sub.check === undefined ? {} : { check: sub.check }),
+    ...(sub.corrections === undefined ? {} : { corrections: sub.corrections }),
+    ...(sub.prepare === undefined ? {} : { prepare: sub.prepare }),
+    ...(sub.answer_now === undefined ? {} : { answer_now: sub.answer_now }),
+    ...(sub.cache_conversation === true ? { cache_conversation: true } : {}),
+    ...(sub.think === true ? { think: true } : {}),
     ...(options.signal === undefined ? {} : { signal: options.signal }),
   };
   const framer = await Framer.open(harness.state, options.run_id, options.run_kind, [], []);
@@ -849,6 +874,13 @@ export async function runSubturn<T>(ctx: PluginContext, sub: Subturn): Promise<O
     await harness.state.append(options.run_id, [event(options, "call", call)]);
     framer.note(call.ref);
   }
+}
+
+// A step's own model, from the harness that resolves the spec's. One that cannot is refused
+// rather than run on the spec's model and journaled as another.
+function providerOn(harness: Harness<Kinds>, role: string, model: string): Provider {
+  if (harness.provider_for === undefined) throw new Error(`the ${role} step asks for ${model}, and this harness serves only ${harness.provider.model}`);
+  return harness.provider_for(model);
 }
 
 // --- child runs --------------------------------------------------------------

@@ -7,14 +7,15 @@ import { ACCUSE, TAKEOVER } from "./model/client.js";
 import { allPaths, bestPathFromSymptom, getParents, islands, type EdgeKind, type Graph, type GraphEdge, type GraphNode } from "./graph.js";
 import { settled } from "./scoring.js";
 import type { TraceEntry, TraceWriter } from "./trace.js";
-import type { Alert, Evidence, ExitReason, Spent } from "./types.js";
+import { ACCOUNT_KINDS, type Alert, type Evidence, type ExitReason, type Spent } from "./types.js";
+import { unlinked, UNLINKED_ACTOR, UNLINKED_ADDRESS, type Unlinked } from "./unlinked.js";
 
 const pct = (x: number) => x.toFixed(2);
 // An account the logs name (ad:, aws:, github:, k8s:..., an address or an email), as opposed to a description.
 const NAMED = /^(ad|aws|azure|gcp|github|k8s|okta|email|ip|user):|^[\w.+-]+@[\w.-]+$|^\d{1,3}(\.\d{1,3}){3}$/i;
 const UNNAMED = "the attacker (an operator the logs do not name)";
 const DOMAIN = /\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:com|net|org|io|ai|co|test|example|info|biz|xyz|ru|cn|top|site|online)\b/gi;
-const IOC_KINDS = new Set(["ip", "domain-name", "url", "file-hash", "image-digest", "access-key", "arn", "commit-sha", "process", "host", "user"]);
+const IOC_KINDS = new Set(["ip", "domain-name", "url", "file-hash", "image-digest", "access-key", "arn", "commit-sha", "process", "host", ...ACCOUNT_KINDS]);
 const cut = (s: string, n: number) => (s.length > n ? s.slice(0, n) + ` …[+${s.length - n} chars]` : s);
 
 // The report's sentence and the six-word verdict are one rule. benign and needs_review are not this rule's.
@@ -62,6 +63,12 @@ export function forReport(g: Graph): Graph {
   if (!Object.values(g.nodes).some((n) => n.unverified)) return g;
   return { ...g, nodes: Object.fromEntries(Object.entries(g.nodes).map(([id, n]) => [id, n.unverified ? { ...n, label: `${n.label.replace(ACCUSE_ALL, "[unverified]")} (unverified)` } : n])) };
 }
+
+// The accounts an event ran as, likeliest first. A ruled-out link is an exonerated account, not one it ran as.
+export const ranAs = (g: Graph, n: GraphNode): string[] => actorsFor(g, n).filter(({ e }) => !e.retired && e.status !== "ruled-out").map(({ actor }) => actor.label);
+
+// A link as the report words it: its id and confidence, and that it is inferred when no record joins its ends.
+export const tieText = (t: { edgeId: string; confidence: number; inferred: boolean }) => `${t.edgeId} ${pct(t.confidence)}${t.inferred ? " (inferred: no record joins them)" : ""}`;
 
 export interface ActorRef { id: string; label: string; status: string; confidence: number; disputed: boolean }
 export interface AccountRow { name: string; role: "attacker" | "victim" | "legitimate"; usedBy?: string[]; seenAs?: string[] }
@@ -148,8 +155,9 @@ const evidenceRow = (e: Evidence): EvidenceRow => ({ polarity: e.polarity, stren
 
 // The report's findings as rows, in one pass over the graph as the report reads it (forReport's unless raw): who is
 // who first, since the conclusion, the timeline and the targeted searches are filtered by it. chronological: the trace
-// by ts, then id, for the content a run flagged.
-export function reportRows(g: Graph, chronological: readonly TraceEntry[], raw = false): ReportRows {
+// by ts, then id, for the content a run flagged. Unless raw, every name the alert's proven chain does not reach is
+// redacted from the rows (red, unlinked.ts), outside the sentences and rows that clear it.
+export function reportRows(g: Graph, chronological: readonly TraceEntry[], raw = false, red: Unlinked | undefined = raw ? undefined : unlinked(g)): ReportRows {
   const path = bestPathFromSymptom(g);
   // Who is who: an account an action ran as, when someone else operated that action, is a victim account.
   const live = (e: { status: string; retired?: boolean }) => !e.retired && e.status !== "ruled-out";
@@ -162,8 +170,8 @@ export function reportRows(g: Graph, chronological: readonly TraceEntry[], raw =
   const seenAs = new Set<string>(); // domains the unnamed operators' descriptions mention
   for (const a of Object.values(g.nodes).filter((x) => x.kind === "actor" && !NAMED.test(x.label))) for (const d of a.label.match(DOMAIN) ?? []) seenAs.add(d.toLowerCase());
   for (const n of Object.values(g.nodes).filter((x) => x.kind === "action" && x.status !== "ruled-out" && (raw || !x.unverified))) {
-    const ranAs = actorsFor(g, n).filter(({ e }) => live(e)).map(({ actor }) => actor.label);
-    const ops = [...new Set(actorsFor(g, n, "operated-by").filter(({ e }) => live(e) && e.confidence >= 0.5).map(({ actor }) => actor.label).filter((o) => !ranAs.includes(o)).map(opName))];
+    const as = ranAs(g, n);
+    const ops = [...new Set(actorsFor(g, n, "operated-by").filter(({ e }) => live(e) && e.confidence >= 0.5).map(({ actor }) => actor.label).filter((o) => !as.includes(o)).map(opName))];
     ops.forEach((o) => attackers.add(o));
     for (const { e, actor } of actorsFor(g, n)) if (live(e) && ops.some((o) => o !== actor.label)) ops.forEach((o) => o !== actor.label && (operators.get(actor.label) ?? operators.set(actor.label, new Set()).get(actor.label)!).add(o));
   }
@@ -233,9 +241,9 @@ export function reportRows(g: Graph, chronological: readonly TraceEntry[], raw =
 
   // Incident timeline: every event that is not ruled out, in time order, on or off the chain.
   const timeline = [...acts].sort((a, b) => (a.observedAt ?? "~").localeCompare(b.observedAt ?? "~")).map((n): TimelineRow => {
-    const ranAs = actorsFor(g, n).filter(({ e }) => live(e)).map(({ actor }) => actor.label);
-    const operatedBy = actorsFor(g, n, "operated-by").filter(({ e }) => live(e) && e.confidence >= 0.5).map(({ actor }) => actor.label).filter((o) => !ranAs.includes(o));
-    return { id: n.id, label: n.label, status: n.status, confidence: n.confidence, domain: n.domain, ...(n.observedAt ? { observedAt: n.observedAt } : {}), onChain: !!path?.nodeIds.includes(n.id), legitimate: !!n.legitimate, ranAs, operatedBy };
+    const as = ranAs(g, n);
+    const operatedBy = actorsFor(g, n, "operated-by").filter(({ e }) => live(e) && e.confidence >= 0.5).map(({ actor }) => actor.label).filter((o) => !as.includes(o));
+    return { id: n.id, label: n.label, status: n.status, confidence: n.confidence, domain: n.domain, ...(n.observedAt ? { observedAt: n.observedAt } : {}), onChain: !!path?.nodeIds.includes(n.id), legitimate: !!n.legitimate, ranAs: as, operatedBy };
   });
 
   // Other findings: events off the best path that are not ruled out.
@@ -253,9 +261,46 @@ export function reportRows(g: Graph, chronological: readonly TraceEntry[], raw =
 
   const open = openRows(g, chronological);
 
-
-  return { accounts, people, conclusion, chain, attribution, impersonation, exonerated, timeline, others, alternatives, tested, open };
+  const rows = { accounts, people, conclusion, chain, attribution, impersonation, exonerated, timeline, others, alternatives, tested, open };
+  return red ? redactRows(g, rows, red) : rows;
 }
+
+// Keys whose values are ids, states and sources, never a name.
+const PLAIN = new Set(["id", "kind", "status", "domain", "observedAt", "polarity", "strength", "source", "sourcetype", "edgeId", "targetDomain", "originNodeId", "role", "refs"]);
+// Every string of a row through the redactor. A legitimate event's row clears who it names, as its report line says.
+export function redactDeep<T>(x: T, red: Unlinked, legit: (id: string) => boolean = () => false, cleared = false): T {
+  if (typeof x === "string") return (cleared ? x : red.text(x)) as T;
+  if (Array.isArray(x)) return x.map((y) => redactDeep(y, red, legit, cleared)) as T;
+  if (!x || typeof x !== "object") return x;
+  const o = x as Record<string, unknown>;
+  const clear = cleared || o["legitimate"] === true || (typeof o["id"] === "string" && legit(o["id"]));
+  return Object.fromEntries(Object.entries(o).map(([k, v]) => [k, PLAIN.has(k) && (typeof v === "string" || k === "refs" && Array.isArray(v) && v.every((r) => typeof r === "string")) ? v : redactDeep(v, red, legit, clear)])) as T;
+}
+
+// The rows with the names the proven chain does not reach redacted. Accounts by role: an attacker's name and the
+// operators who used a victim's account go; a victim and a legitimate user keep theirs (their lines clear them).
+// exonerated is a ruled-out attribution and people feeds the filters: both stay as they are.
+function redactRows(g: Graph, rows: ReportRows, red: Unlinked): ReportRows {
+  const legit = (id: string) => !!g.nodes[id]?.legitimate;
+  const seen = new Set<string>();
+  const accounts = rows.accounts.map((a): AccountRow => a.role === "attacker" ? { ...a, name: red.text(a.name) } : a.role === "victim" ? { ...a, usedBy: [...new Set(a.usedBy!.map((u) => red.text(u)))] } : a)
+    .filter((a) => { const k = `${a.role} ${a.name}`; if (seen.has(k)) return false; seen.add(k); return true; });
+  return {
+    ...rows,
+    accounts,
+    conclusion: rows.conclusion && { ...rows.conclusion, text: red.text(rows.conclusion.text), ...(rows.conclusion.rootCause ? { rootCause: { ...rows.conclusion.rootCause, label: legit(rows.conclusion.rootCause.id) ? rows.conclusion.rootCause.label : red.text(rows.conclusion.rootCause.label) } } : {}) },
+    chain: redactDeep(rows.chain, red, legit),
+    attribution: redactDeep(rows.attribution, red, legit),
+    impersonation: redactDeep(rows.impersonation, red, legit),
+    timeline: redactDeep(rows.timeline, red, legit),
+    others: redactDeep(rows.others, red, legit),
+    tested: redactDeep(rows.tested, red),
+    open: redactDeep(rows.open, red, legit),
+  };
+}
+
+// The report's line for what was redacted: how many, and why.
+export const unlinkedNote = (n: number) => `**Unlinked names:** ${n} ${n === 1 ? "identity was" : "identities were"} named without a proven link to the alert and ${n === 1 ? "is" : "are"} shown as ${UNLINKED_ACTOR} (an address as ${UNLINKED_ADDRESS}) or left out of the indicators.`;
 
 // What the run could not settle, as one list for section 6 of the report and the projection's open_questions (#2476
 // decision 9): open boundaries, disputed links, ruled-out events and links, content flagged as possible prompt
@@ -311,10 +356,14 @@ export function renderReport(g0: Graph, trace: TraceWriter, exit: ExitReason | n
   const g = raw ? g0 : forReport(g0);
   const path = bestPathFromSymptom(g);
   const pathNodes = path?.nodeIds.map((id) => g.nodes[id]!) ?? [];
-  const rows = reportRows(g, trace.chronological(), raw);
+  const red = raw ? undefined : unlinked(g);
+  // Narrative and decisions are written from the graph and the trace, not the rows: redacted here.
+  const say = (s: string, cleared = false) => (red && !cleared ? red.text(s) : s);
+  const rows = reportRows(g, trace.chronological(), raw, red);
   const out: string[] = [];
   out.push(`# RCA report: ${alert.title}`, "", `Run ${g.runId} · alert ${alert.id} at ${alert.observedAt} · exit **${exit}**${budget ? ` · $${budget.usd.toFixed(2)}` : ""}`, "");
   out.push(`**Disposition:** ${disposition(g, exit).sentence}`, "");
+  const noteAt = out.length;
   if (raw) out.push("*Unfiltered report. The disposition is computed by code and can only come out True Positive, Inconclusive, or False Positive when the alerted event itself is refuted; it cannot come out benign.*", "");
 
   if (rows.accounts.length) {
@@ -343,7 +392,7 @@ export function renderReport(g0: Graph, trace: TraceWriter, exit: ExitReason | n
   else {
     out.push(`Root-cause chain, symptom first (path score ${pct(rows.chain.score)}):`, "");
     [...rows.chain.events].reverse().forEach((n, i) => {
-      const link = n.tie ? ` ← link ${n.tie.edgeId} ${pct(n.tie.confidence)}${n.tie.inferred ? " (inferred: no record joins them)" : ""}` : "";
+      const link = n.tie ? ` ← link ${tieText(n.tie)}` : "";
       const label = n.boundary ? `[open boundary] cause of ${n.boundary.originNodeId} believed to be in ${n.boundary.targetDomain}: ${n.boundary.reason ?? ""}` : n.label;
       out.push(`${i + 1}. **${n.id}** ${label} — ${n.status} ${pct(n.confidence)}${n.observedAt ? ` @ ${n.observedAt}` : ""} (${n.domain})${n.isRoot ? " **ROOT CAUSE**" : ""}${n.legitimate && !raw ? " *(legitimate activity, not the attacker)*" : ""}${link}`);
       if (n.rootJustification) out.push(`   - why root: ${n.rootJustification}`);
@@ -368,11 +417,16 @@ export function renderReport(g0: Graph, trace: TraceWriter, exit: ExitReason | n
   // logon lists ordinary workstations and an admin's own host (a dozen office addresses and an admin
   // workstation were once listed from a 0.39 link and an unlinked logon).
   const loose = new Set(islands(g, 0.5).map((n) => n.id));
-  const legitVals = new Set(Object.values(g.nodes).filter((x) => x.kind === "action" && x.status !== "ruled-out" && x.legitimate).flatMap((x) => x.artifacts.filter((a) => a.kind === "ip" || a.kind === "user").map((a) => a.value.trim().toLowerCase())));
+  const legitVals = new Set(Object.values(g.nodes).filter((x) => x.kind === "action" && x.status !== "ruled-out" && x.legitimate).flatMap((x) => x.artifacts.filter((a) => a.kind === "ip" || ACCOUNT_KINDS.has(a.kind)).map((a) => a.value.trim().toLowerCase())));
   const iocs = new Map<string, Set<string>>();
   for (const n of Object.values(g.nodes)) {
     if (n.status === "ruled-out" || n.kind !== "action" || n.legitimate || (!raw && n.unverified)) continue;
-    for (const a of n.artifacts) if (IOC_KINDS.has(a.kind) && (raw || (!(a.kind === "user" && legitName(a.value)) && !legitVals.has(a.value.trim().toLowerCase()) && !(loose.has(n.id) && (a.kind === "ip" || a.kind === "user"))))) (iocs.get(a.kind) ?? iocs.set(a.kind, new Set()).get(a.kind)!).add(a.value);
+    for (const a of n.artifacts) {
+      if (!IOC_KINDS.has(a.kind) || !(raw || (!(ACCOUNT_KINDS.has(a.kind) && legitName(a.value)) && !legitVals.has(a.value.trim().toLowerCase()) && !(loose.has(n.id) && (a.kind === "ip" || ACCOUNT_KINDS.has(a.kind)))))) continue;
+      // An account or address the proven chain does not reach is no indicator: left out, and counted as redacted.
+      if (red?.unreached(a.value) && (a.kind === "ip" || a.kind === "arn" || ACCOUNT_KINDS.has(a.kind))) red.drop(a.value);
+      else (iocs.get(a.kind) ?? iocs.set(a.kind, new Set()).get(a.kind)!).add(a.value);
+    }
   }
   out.push("## Indicators (from confirmed and suspected events)", "");
   for (const [k, vs] of iocs) out.push(`- ${k}: ${[...vs].join(", ")}`);
@@ -389,13 +443,14 @@ export function renderReport(g0: Graph, trace: TraceWriter, exit: ExitReason | n
   // 3. Narrative per path node
   out.push("## 3. Narrative", "");
   for (const n of pathNodes.filter((x) => x.kind !== "boundary-marker")) {
-    out.push(`### ${n.id} ${n.label}`, "");
+    const legit = !!n.legitimate;
+    out.push(`### ${n.id} ${say(n.label, legit)}`, "");
     const steps = n.confidenceHistory.map((h) => {
       const evs = n.evidence.filter((e) => e.turn === h.turn);
-      return `Turn ${h.turn} (${pct(h.value)})${evs.length ? `: ${evs.map((e) => `${e.polarity === "refutes" ? "against" : "for"}, ${e.strength}: ${e.summary}`).join(" ")}` : ""}`;
+      return `Turn ${h.turn} (${pct(h.value)})${evs.length ? `: ${evs.map((e) => `${e.polarity === "refutes" ? "against" : "for"}, ${e.strength}: ${say(e.summary, legit)}`).join(" ")}` : ""}`;
     });
     out.push(...(steps.length ? steps.map((s) => `- ${s}`) : ["- no evidence recorded"]));
-    if (n.artifacts.length) out.push(`- artifacts: ${n.artifacts.map((a) => `${a.kind}=${a.value}`).join(", ")}`);
+    if (n.artifacts.length) out.push(`- artifacts: ${n.artifacts.map((a) => `${a.kind}=${say(a.value, legit)}`).join(", ")}`);
     out.push("");
   }
 
@@ -437,7 +492,7 @@ export function renderReport(g0: Graph, trace: TraceWriter, exit: ExitReason | n
   out.push("## 4. Decisions", "");
   for (const e of trace.chronological().filter((x) => x.type === "decision")) {
     const d = e.payload as { move: string; targetId: string; reason: string };
-    out.push(`- turn ${e.turn}: ${d.move} ${d.targetId} — ${d.reason}`);
+    out.push(`- turn ${e.turn}: ${d.move} ${d.targetId} — ${say(d.reason)}`);
   }
   out.push("");
 
@@ -461,5 +516,6 @@ export function renderReport(g0: Graph, trace: TraceWriter, exit: ExitReason | n
   // 6. Open questions
   out.push("## 6. Open questions", "");
   out.push(...(rows.open.length ? rows.open.map((x) => `- ${x.text}`) : ["- none"]), "");
+  if (red?.count) out.splice(noteAt, 0, unlinkedNote(red.count), "");
   return out.join("\n");
 }

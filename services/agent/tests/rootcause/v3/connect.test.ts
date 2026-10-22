@@ -67,25 +67,45 @@ describe("connect", () => {
     expect(g.nodes.B1!.resolvedTo).toBe("N4");
     expect(islands(g)).toEqual([]);
   });
-  it("a legitimate step links into the attack as an inferred link unless it has direct evidence", async () => {
+  it("a legitimate step links into the attack only with direct evidence", async () => {
     const { connect } = await import("../../../plugins/rootcause/v3/handlers/connect.js");
     const g = graph();
     apply(g, { setFlags: [{ nodeId: "N4", legitimate: true }] });
     const link = (strength: string) => ({ events: [], links: [{ from: "N4", to: "N2", prior: 0.4, evidence: [{ summary: "s", strength, polarity: "supports", toolCallIds: ["r1"] }] }], reasoning: "" });
-    const weak = (await connect({ move: "connect", targetId: "N2", turn: 5, reason: "" }, g, ctxFor(link("circumstantial")))).addEdges;
+    expect((await connect({ move: "connect", targetId: "N2", turn: 5, reason: "" }, g, ctxFor(link("circumstantial")))).addEdges).toEqual([]);
+    expect((await connect({ move: "connect", targetId: "N2", turn: 5, reason: "" }, g, ctxFor(link("direct")))).addEdges).toHaveLength(1);
+  });
+  it("a legitimate step links into the attack as an inferred link unless it has direct evidence (loose)", async () => {
+    const { connect } = await import("../../../plugins/rootcause/v3/handlers/connect.js");
+    const g = graph();
+    apply(g, { setFlags: [{ nodeId: "N4", legitimate: true }] });
+    const link = (strength: string) => ({ events: [], links: [{ from: "N4", to: "N2", prior: 0.4, evidence: [{ summary: "s", strength, polarity: "supports", toolCallIds: ["r1"] }] }], reasoning: "" });
+    const loose = (sub: unknown) => ({ ...ctxFor(sub), cfg: { ...cfg, loose: true } });
+    const weak = (await connect({ move: "connect", targetId: "N2", turn: 5, reason: "" }, g, loose(link("circumstantial")))).addEdges;
     expect(weak).toHaveLength(1);
     expect(weak![0]).toMatchObject({ inferred: true });
-    const strong = (await connect({ move: "connect", targetId: "N2", turn: 5, reason: "" }, g, ctxFor(link("direct")))).addEdges;
+    const strong = (await connect({ move: "connect", targetId: "N2", turn: 5, reason: "" }, g, loose(link("direct")))).addEdges;
     expect(strong).toHaveLength(1);
     expect(strong![0]!.inferred).toBeUndefined();
   });
 });
 
 describe("legitimate steps", () => {
-  it("a legitimate cause candidate without direct edge evidence joins as an inferred link", async () => {
+  it("a legitimate cause candidate needs direct edge evidence", async () => {
     const { candidatePatch, Vetter } = await import("../../../plugins/rootcause/v3/handlers/common.js");
     const g = graph();
     const ctx = ctxFor(null);
+    ctx.tools.outputOf = () => '{"first":"1773194400","last":"1773450800"}'; // spread over the range: routine
+    const c = (strength: "direct" | "circumstantial") => ({ label: "dev registered a runner", domain: "edr", prior: 0.3, artifacts: [], nodeEvidence: [], identitySignals: [],
+      edgeEvidence: [{ summary: "s", strength, polarity: "supports" as const, toolCallIds: ["r1"] }], legitimate: true, baseline: { summary: "b", unusual: false, toolCallIds: ["r2"] } });
+    const v = new Vetter(ctx, []);
+    expect((await candidatePatch(c("circumstantial"), v, g, ctx, "N2")).patch).toEqual({});
+    expect((await candidatePatch(c("direct"), v, g, ctx, "N2")).patch.addEdges).toHaveLength(1);
+  });
+  it("a legitimate cause candidate without direct edge evidence joins as an inferred link (loose)", async () => {
+    const { candidatePatch, Vetter } = await import("../../../plugins/rootcause/v3/handlers/common.js");
+    const g = graph();
+    const ctx = { ...ctxFor(null), cfg: { ...cfg, loose: true } };
     ctx.tools.outputOf = () => '{"first":"1773194400","last":"1773450800"}'; // spread over the range: routine
     const c = (strength: "direct" | "circumstantial") => ({ label: "dev registered a runner", domain: "edr", prior: 0.3, artifacts: [], nodeEvidence: [], identitySignals: [],
       edgeEvidence: [{ summary: "s", strength, polarity: "supports" as const, toolCallIds: ["r1"] }], legitimate: true, baseline: { summary: "b", unusual: false, toolCallIds: ["r2"] } });
@@ -159,10 +179,34 @@ describe("routine over several days", () => {
 describe("a link needs a value both events carry", () => {
   const on = { ...cfg, linkNeedsSharedValue: true };
   const art = (kind: string, value: string) => ({ kind: kind as any, value });
-  it("keeps same host + nearby time across accounts or sources as an inferred link; a shared process, file name or token is a join", async () => {
+  it("refuses same host + nearby time across accounts or sources; keeps a shared process, file name or token", async () => {
     const { applyPatch, emptyPatch, createGraph, sharedValue } = await import("../../../plugins/rootcause/v3/graph.js");
     const g = createGraph("t");
     const add = (p: any) => applyPatch(g, { ...emptyPatch(), ...p }, 1, on);
+    add({ addNodes: [
+      node("logon", { label: "NTLM logon to SRV-01 from 192.0.2.14 with alice's credential", domain: "wineventlog", artifacts: [art("host", "SRV-01"), art("user", "alice"), art("ip", "192.0.2.14")] }),
+      node("psexec", { label: "PsExec deploy.bat on SRV-01 by bob", domain: "wineventlog", artifacts: [art("host", "SRV-01"), art("user", "bob")] }),
+      node("debug", { label: "debug pod created on ip-192-0-2-30", domain: "eks", artifacts: [art("host", "ip-192-0-2-30.internal"), art("ip", "198.51.100.67")] }),
+      node("runc", { label: "runc create container a1b2c3d4 on ip-192-0-2-30", domain: "edr", artifacts: [art("host", "ip-192-0-2-30.internal"), art("k8s-resource", "a1b2c3d4")] }),
+      node("mail", { label: "email with attachment Invoice_10001.xlsm", domain: "email", artifacts: [art("domain-name", "bad.example")] }),
+      node("excel", { label: "EXCEL opened the attachment", domain: "edr", artifacts: [art("process", '"EXCEL.EXE" C:\\Users\\a\\Downloads\\Invoice_10001.xlsm')] }),
+    ] });
+    const sig = (id: string, v: string) => buildAttributionPatch(id, [{ layer: "machine-facing", relation: "ran-as", kind: "account", value: v, resolvesTo: `ad:${v}`, toolCallIds: ["r1"] }], g, { turn: 1, domain: "wineventlog", traceIds: () => [] });
+    add(sig("N1", "alice")); add(sig("N2", "bob"));
+    expect(sharedValue(g, g.nodes.N1!, g.nodes.N2!)).toBeNull(); // host only, different accounts
+    expect(sharedValue(g, g.nodes.N3!, g.nodes.N4!)).toBeNull(); // host only, different sources
+    expect(sharedValue(g, g.nodes.N5!, g.nodes.N6!)).toMatch(/invoice_10001\.xlsm/i);
+    const r = add({ addEdges: [
+      { tempId: "x", kind: "explains", source: "N1", target: "N2", prior: 0.4, evidence: [ev("direct")] },
+      { tempId: "y", kind: "explains", source: "N5", target: "N6", prior: 0.4, evidence: [ev("direct")] },
+    ] });
+    expect(r.rejected.map((x) => x.reason)).toEqual([expect.stringMatching(/no shared value: N1 and N2/)]);
+    expect(Object.values(g.edges).filter((e) => e.kind === "explains").map((e) => `${e.source}>${e.target}`)).toEqual(["N5>N6"]);
+  });
+  it("keeps same host + nearby time across accounts or sources as an inferred link; a shared process, file name or token is a join (loose)", async () => {
+    const { applyPatch, emptyPatch, createGraph, sharedValue } = await import("../../../plugins/rootcause/v3/graph.js");
+    const g = createGraph("t");
+    const add = (p: any) => applyPatch(g, { ...emptyPatch(), ...p }, 1, { ...on, loose: true });
     add({ addNodes: [
       node("logon", { label: "NTLM logon to SRV-01 from 192.0.2.14 with alice's credential", domain: "wineventlog", artifacts: [art("host", "SRV-01"), art("user", "alice"), art("ip", "192.0.2.14")] }),
       node("psexec", { label: "PsExec deploy.bat on SRV-01 by bob", domain: "wineventlog", artifacts: [art("host", "SRV-01"), art("user", "bob")] }),

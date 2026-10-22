@@ -2,7 +2,7 @@
 // applies one. applyPatch validates, merges, rescores and reports what changed. No I/O except load/save.
 import type { AgentConfig } from "./config.js";
 import { confidence, status as deriveStatus, clampPrior, type Status } from "./scoring.js";
-import { STRONG_KINDS, type Artifact, type Domain, type Evidence } from "./types.js";
+import { ACCOUNT_KINDS, STRONG_KINDS, type Artifact, type Domain, type Evidence } from "./types.js";
 import { sameEvent } from "./stitch.js";
 
 export type NodeId = string;
@@ -82,6 +82,8 @@ export interface Graph {
   rare?: string; // the rare-activity sweep (rare.ts), computed once per run and kept for resume
   conclusion?: Conclusion; // the model's closing verdict (conclude move), written when the run ends
   theorizedTurn?: number;
+  storiesSince?: number; // the turn of the first round of stories
+  branchedTurn?: number; // the turn of the last branch move
 }
 
 // Competing stories of the whole incident (theorize move) and the predictions that tell them apart (test move).
@@ -279,10 +281,11 @@ export function applyPatch(g: Graph, patch: GraphPatch, turn: number, cfg: Agent
   }
   for (const id of patch.incrementExpand ?? []) if (g.nodes[id]) { g.nodes[id].expandAttempts++; g.nodes[id].updatedTurn = turn; }
   for (const id of patch.incrementForks ?? []) if (g.nodes[id]) { g.nodes[id].forkCount++; g.nodes[id].updatedTurn = turn; }
-  for (const id of patch.incrementBranch ?? []) if (g.nodes[id]) { g.nodes[id].branchAttempts = (g.nodes[id].branchAttempts ?? 0) + 1; g.nodes[id].updatedTurn = turn; }
+  for (const id of patch.incrementBranch ?? []) if (g.nodes[id]) { g.nodes[id].branchAttempts = (g.nodes[id].branchAttempts ?? 0) + 1; g.nodes[id].updatedTurn = turn; g.branchedTurn = turn; }
   for (const id of patch.incrementConnect ?? []) if (g.nodes[id]) g.nodes[id].connectAttempts = (g.nodes[id].connectAttempts ?? 0) + 1;
   if (patch.setConclusion) g.conclusion = patch.setConclusion;
   if (patch.setTheories) {
+    g.storiesSince ??= turn;
     g.theorizeCount = (g.theorizeCount ?? 0) + 1;
     g.theorizedTurn = turn;
     if (patch.setTheories.length) {
@@ -374,16 +377,24 @@ export function applyPatch(g: Graph, patch: GraphPatch, turn: number, cfg: Agent
   for (const e of patch.addEdges) { const before = new Set(Object.keys(g.edges)); const id = addEdge(e); if (id) { idMap[e.tempId] = id; if (!before.has(id)) created.push(id); } }
   // A new link between two events needs a value both carry. Checked after the patch's attributions are in,
   // since whether a host or an account counts depends on who each event ran as.
-  const inferUnjoined = (id: string) => {
+  const unjoined = (id: string) => {
     const e = g.edges[id];
-    if (!cfg.linkNeedsSharedValue || e?.kind !== "explains" || e.createdTurn !== turn || e.evidence.length !== e.evidence.filter((v) => v.turn === turn).length) return;
+    if (!cfg.linkNeedsSharedValue || e?.kind !== "explains" || e.createdTurn !== turn || e.evidence.length !== e.evidence.filter((v) => v.turn === turn).length) return false;
     const a = g.nodes[e.source], b = g.nodes[e.target];
-    if (a?.kind !== "action" || b?.kind !== "action" || sharedValue(g, a, b, true)) return;
-    // Kept as an inferred link; its evidence counts as circumstantial (timing, naming), never as a join.
-    e.inferred = true;
-    for (const v of e.evidence) v.strength = "circumstantial";
+    if (a?.kind !== "action" || b?.kind !== "action" || sharedValue(g, a, b, true)) return false;
+    // Loose: kept as an inferred link; its evidence counts as circumstantial (timing, naming), never as a join.
+    if (cfg.loose) {
+      e.inferred = true;
+      for (const v of e.evidence) v.strength = "circumstantial";
+      return false;
+    }
+    rejected.push({ item: { source: e.source, target: e.target }, reason: `no shared value: ${e.source} and ${e.target} carry no common process, session, container, token, key, file or address (a host counts only within one source for one account)` });
+    delete g.edges[id];
+    touched.delete(id);
+    for (const [k, v] of Object.entries(idMap)) if (v === id) delete idMap[k];
+    return true;
   };
-  for (const id of created) inferUnjoined(id);
+  for (const id of created) unjoined(id);
   // Routine work by one account leads to more of its routine work: a step that causes its own account's legitimate
   // step is legitimate too, unless someone else operated it or it is labelled malicious (a developer's
   // routine step from their usual address was once left unmarked upstream of their legitimate one and became the chain top).
@@ -426,8 +437,8 @@ export function applyPatch(g: Graph, patch: GraphPatch, turn: number, cfg: Agent
     else {
       const had = new Set(Object.keys(g.edges));
       const join = addEdge({ tempId: `join:${markerId}`, kind: "explains", source: cand, target: m.originNodeId, prior: 0.3, evidence: joinEvidence });
-      if (join) {
-        if (!had.has(join)) inferUnjoined(join);
+      // A join with no shared value is refused (strict) and the boundary stays open; loose keeps it inferred.
+      if (join && !(had.has(join) ? false : unjoined(join))) {
         idMap[`join:${markerId}`] = join;
         resolveMarker(markerId, cand);
       }
@@ -541,7 +552,7 @@ export function linkedPrincipals(a: GraphNode, b: GraphNode): boolean {
 // for one account, and an account only when both ran as it: same host and nearby time is how unrelated work gets
 // chained in (an attacker's logon to a server, then an admin's remote job there a minute later; a pod created, then
 // a container start on that node seconds later, across sources; both blamed a legitimate user).
-const LOOSE_KINDS = new Set(["host", "user"]);
+const LOOSE_KINDS: ReadonlySet<string> = new Set(["host", ...ACCOUNT_KINDS]);
 const ACCUSE_WORDS = /\b(attacker|malicious|stolen|compromised|hijacked|backdoor|exfiltrat\w*|rogue|implant)\b/i;
 function topAccount(g: Graph, n: GraphNode): string | undefined {
   return getParents(g, n.id, "attributed-to").filter((e) => !e.retired && e.status !== "ruled-out").sort((a, b) => b.confidence - a.confidence)[0]?.source;

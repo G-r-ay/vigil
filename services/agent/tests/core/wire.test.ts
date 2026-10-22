@@ -4,7 +4,7 @@ import { Limiter } from "../../core/limiter.js";
 import { costOf } from "../../core/prices.js";
 import { EMIT_TOOL, ModelSilent, OutputCapReached, openAiSurface, resetEmitMode, resetOutputCap, setSilentPauses } from "../../core/wire.js";
 import { ZERO_TOKENS, type TokenCounts } from "../../contracts/budget.js";
-import type { Message, Provider, ToolCall, Turn, TurnRequest } from "../../core/provider.js";
+import { ModelRefused, type Message, type Provider, type ToolCall, type Turn, type TurnRequest } from "../../core/provider.js";
 
 type Body = OpenAI.Chat.ChatCompletionCreateParams;
 
@@ -97,12 +97,14 @@ async function turn(surface: Provider, request: TurnRequest): Promise<Turn> {
   const tool_calls: ToolCall[] = [];
   let content = "";
   let tokens = ZERO_TOKENS;
+  let reasoning: Turn["reasoning"];
   for await (const event of surface.stream(request)) {
     if (event.type === "text_delta") content += event.text;
     else if (event.type === "usage") tokens = event.tokens;
+    else if (event.type === "reasoning") reasoning = event.reasoning;
     else tool_calls.push(event.call);
   }
-  return { content, tool_calls, tokens };
+  return { content, tool_calls, tokens, ...(reasoning === undefined ? {} : { reasoning }) };
 }
 
 beforeEach(() => {
@@ -814,6 +816,21 @@ describe("the output cap", () => {
     expect(calls).toBe(1);
   });
 
+  // Bifrost passes Anthropic's stop_reason "refusal" through as the finish_reason; OpenAI says "content_filter".
+  it("fails a refused reply as ModelRefused at once, billing the spend", async () => {
+    for (const finish of ["refusal", "content_filter"]) {
+      let calls = 0;
+      const surface = surfaceOf(async () => {
+        calls += 1;
+        return completion({ role: "assistant", content: "I can't help with that." }, { prompt_tokens: 100, completion_tokens: 8, total_tokens: 108 }, finish);
+      });
+      const failed = turn(surface, { messages: [{ role: "user", content: "go" }], tools: [] });
+      await expect(failed).rejects.toBeInstanceOf(ModelRefused);
+      await expect(failed).rejects.toMatchObject({ message: expect.stringContaining(`finish_reason=${finish}`), tokens: { input: 100, output: 8 } });
+      expect(calls).toBe(1);
+    }
+  });
+
   it("leaves a reply cut off mid-answer to the caller", async () => {
     const surface = surfaceOf(async () => completion({ role: "assistant", content: '{"verb": "HA' }, SPENT, "length"));
     const cut = await turn(surface, { messages: [{ role: "user", content: "go" }], tools: [] });
@@ -838,5 +855,107 @@ describe("the output cap", () => {
       expect(bodies.at(-1)!.max_tokens).toBe(12_000);
       expect(surface.sampling?.["max_output_tokens"]).toBe(12_000);
     }
+  });
+});
+
+describe("Claude's conversation cache and thinking", () => {
+  const tools = [{ id: "search", description: "search", parameters: {} }, { id: "submit_answer", description: "answer", parameters: SCHEMA }];
+  const loop: Message[] = [
+    { role: "system", content: "the stable prefix" },
+    { role: "user", content: "go" },
+    { role: "assistant", content: "", tool_calls: [{ id: "c1", tool: "search", args: "{}" }], reasoning: [{ type: "reasoning.text", text: "hm", signature: "s1" }] },
+    { role: "tool", call_id: "c1", content: "3 rows" },
+  ];
+
+  function claude(model = "claude-sonnet-5", refuse?: (body: Body) => boolean) {
+    const bodies: Body[] = [];
+    const create = async (body: Body) => {
+      bodies.push(structuredClone(body));
+      if (refuse?.(body) === true) throw Object.assign(new Error("not supported"), { status: 400 });
+      return completion({ role: "assistant", content: '{"verb":"HALT"}', tool_calls: [{ id: "2", function: { name: "submit_answer", arguments: '{"verb":"HALT"}' } }] });
+    };
+    const client = { chat: { completions: { create } } } as unknown as OpenAI;
+    return { surface: openAiSurface(client, model, limiter(), "vertex", `vertex/${model}`), bodies };
+  }
+
+  it("asks for adaptive thinking, summarized, as Bifrost's reasoning field on an open round", async () => {
+    const { surface, bodies } = claude();
+    await turn(surface, { messages: loop, tools, think: true });
+    expect(bodies[0]!).toMatchObject({ reasoning: { max_tokens: 1024, display: "summarized" } });
+    expect(bodies[0]!.tool_choice).toBeUndefined();
+  });
+
+  it("never asks a forced round to think, on any rung of the forced ladder, nor an emission", async () => {
+    const forced = claude();
+    await turn(forced.surface, { messages: loop, tools, force: "submit_answer", think: true });
+    const ladder = claude("claude-sonnet-5", (body) => body.tool_choice !== undefined);
+    await turn(ladder.surface, { messages: loop, tools, force: "submit_answer", think: true });
+    const emission = claude();
+    await turn(emission.surface, { messages: loop, tools: [], emit: SCHEMA, think: true });
+    for (const body of [...forced.bodies, ...ladder.bodies, ...emission.bodies]) expect(body).not.toHaveProperty("reasoning");
+    expect(ladder.bodies.map((body) => body.tools?.length)).toEqual([2, 1]);
+  });
+
+  it("moves a breakpoint onto the last message, a tool result or a user turn, on every call of the request", async () => {
+    const { surface, bodies } = claude();
+    await turn(surface, { messages: loop, tools, cache_conversation: true });
+    expect(bodies[0]!.messages.at(-1)).toEqual({ role: "tool", tool_call_id: "c1", content: [{ type: "text", text: "3 rows", cache_control: { type: "ephemeral" } }] });
+    await turn(surface, { messages: [...loop, { role: "user", content: "and now?" }], tools: [], emit: SCHEMA, cache_conversation: true });
+    expect(bodies[1]!.messages.at(-1)).toEqual({ role: "user", content: [{ type: "text", text: "and now?", cache_control: { type: "ephemeral" } }] });
+    for (const body of bodies) expect(JSON.stringify(body).match(/cache_control/g)).toHaveLength(2);
+  });
+
+  it("sends an assistant turn's thinking back as reasoning_details, to Claude only", async () => {
+    const { surface, bodies } = claude();
+    await turn(surface, { messages: loop, tools });
+    expect(bodies[0]!.messages[2]).toEqual({
+      role: "assistant",
+      content: "",
+      tool_calls: [{ id: "c1", type: "function", function: { name: "search", arguments: "{}" } }],
+      reasoning_details: [{ type: "reasoning.text", text: "hm", signature: "s1" }],
+    });
+    const bodiesElsewhere: Body[] = [];
+    const other = surfaceOf(async (body) => {
+      bodiesElsewhere.push(body);
+      return completion({ role: "assistant", content: "ok" });
+    });
+    await turn(other, { messages: loop, tools, think: true, cache_conversation: true });
+    expect(JSON.stringify(bodiesElsewhere[0])).not.toMatch(/reasoning|cache_control/);
+  });
+
+  it("assembles each thinking block from its fragments and its signature, apart from what the model said", async () => {
+    const chunk = (delta: Record<string, unknown>, finish: string | null = null) =>
+      ({ id: "c", created: 1, model: "m", object: "chat.completion.chunk", choices: [{ index: 0, delta, finish_reason: finish }] }) as unknown as Chunk;
+    const chunks = [
+      chunk({ reasoning: "weigh ", reasoning_details: [{ index: 0, type: "reasoning.text", text: "weigh " }] }),
+      chunk({ reasoning: "it", reasoning_details: [{ index: 0, type: "reasoning.text", text: "it" }] }),
+      chunk({ reasoning_details: [{ index: 0, type: "reasoning.text", signature: "sig-a" }] }),
+      chunk({ reasoning_details: [{ index: 1, type: "reasoning.encrypted", data: "opaque" }] }),
+      chunk({ content: "searching" }),
+      chunk({ tool_calls: [{ index: 0, type: "function", id: "t1", function: { name: "search", arguments: "{}" } }] }),
+      chunk({}, "tool_calls"),
+      { id: "c", created: 1, model: "m", object: "chat.completion.chunk", choices: [], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } } as unknown as Chunk,
+    ];
+    const client = { chat: { completions: { create: async () => ({ async *[Symbol.asyncIterator]() { yield* chunks; } }) } } } as unknown as OpenAI;
+    const surface = openAiSurface(client, "claude-sonnet-5", limiter(), "vertex", "vertex/claude-sonnet-5");
+
+    const order: string[] = [];
+    for await (const event of surface.stream({ messages: loop, tools, think: true })) order.push(event.type);
+    expect(order).toEqual(["text_delta", "usage", "reasoning", "tool_call"]);
+
+    const got = await turn(surface, { messages: loop, tools, think: true });
+    expect(got.content).toBe("searching");
+    expect(got.tool_calls.map((call) => call.tool)).toEqual(["search"]);
+    expect(got.reasoning).toEqual([
+      { type: "reasoning.text", text: "weigh it", signature: "sig-a" },
+      { type: "reasoning.encrypted", data: "opaque" },
+    ]);
+  });
+
+  it("yields no reasoning event when the model did not think", async () => {
+    const surface = surfaceOf(async () => completion({ role: "assistant", content: "ok" }));
+    const order: string[] = [];
+    for await (const event of surface.stream({ messages: [{ role: "user", content: "go" }], tools: [] })) order.push(event.type);
+    expect(order).toEqual(["text_delta", "usage"]);
   });
 });

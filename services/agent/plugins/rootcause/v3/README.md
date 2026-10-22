@@ -15,24 +15,46 @@ How a run goes (`engine.ts`):
 - Every model call is a kernel turn: `runSubturn` through `model/client.ts`, the one
   place the loop touches the kernel. A move's role is the move, its system prompt the
   loop's prompt plus the survey, the environment map and the rare sweep, its task the
-  move's prompt, its schema the move's submit schema, and its `max_turns` the move's search
-  cap. Framing the brief (`frame.ts`) is a turn with the frame schema and no tools. The
-  kernel bills each call to the run's pool, journals `spend`, `frame` and `call` events,
+  move's prompt and its schema the move's submit schema. The move's search cap counts
+  searches, not rounds: the evidence tool refuses any search past it (and, for scope, any
+  past the batch of 7 a response may hold), and `max_turns` only bounds the rounds.
+  Framing the brief (`frame.ts`) is a turn with the frame schema and no tools. Its title
+  is the symptom's label, held to the labels' ACCUSE and TAKEOVER rules: one that fires is
+  asked once more with the rule, then named in code ("<action> on <target> by <principal>
+  from <address>"), and `rootcause_setup.frame_note` says which. The kernel bills each call to the run's pool, journals `spend`, `frame` and `call` events,
   and delimits search results; v3 keeps none of that of its own.
 - The model searches through one evidence tool (`tools/`), granted as a local tool whose
   handler is the `Registry`'s `run`. The kernel shows each result with its ref (`r12`) and
   journals the search as a `call` event with it; the model cites refs. The registry keeps
   what each ref ran and returned for the baseline checks. A search the code makes itself
   (the rare sweep, a story's sweep, a presence lookup) takes the next ref and is journaled the same way.
-- A move's answer is checked once, in `check()`: an accusing label with no baseline is
-  tagged unverified, a link with no shared value is kept as inferred, and an item citing a
-  ref the ledger never journaled is dropped. A turn with no valid answer is one attempt
-  on its target. Nothing is asked again.
+- A move's answer is held to `check()` inside the turn: an accusing label with no baseline, a
+  baseline that fails its checks, or an item citing a ref the ledger never journaled fails it,
+  and a link with no shared value is refused. `cfg.loose` (off by default, journaled in
+  `rootcause_setup`) is the reference's loose mode: such a finding is kept, tagged unverified,
+  and such a link kept as inferred. A failed answer, or one that misses the move's
+  schema (an unknown key, say), goes back to the model to fix, twice at most between them (each time a `submit_answer` call on the ledger, numbered but no search);
+  then salvage drops the items the failure rests on and keeps the rest. A turn with no
+  valid answer is one attempt on its target.
+- `unlinked.ts`: the report names an account, user, email, principal or address as attacker,
+  origin or operator only when the alert's proven chain reaches it (the alert and what reaches
+  it over confirmed links). The conclude answer goes back once while it names another; what is
+  left the report, the run summary and the console show as `[unlinked actor]` /
+  `[unlinked address]`, except in a sentence that clears the name (legitimate, ruled out, not
+  the attacker...). Loose or strict, the same.
 - `ledger.ts` journals `rootcause_setup`, `rootcause_turn` (the turn's trace entries, its
   graph patch among them) and `rootcause_exit`. The graph is folded back from patches, so
   a resume continues at the next turn with its graph, trace and calls as they were.
 - An operator's stop is polled between and during turns, a lost lease leaves no terminal,
-  and the pool refusing a call ends the run `budget_exhausted`.
+  and the pool refusing a call ends the moves `budget_exhausted`.
+- A move the provider or gateway fails (the kernel returns it as a failed turn, after the
+  limiter's own 3 tries) runs again after 30s when its error reads as the network (the
+  reference's list plus the gateway's 5xx), 20 times at most. Any other failure, or one past
+  those retries, is a failed turn: one attempt on its target, as the reference counts it.
+  Three in a row stop the moves and the run ends `failed`. However the moves stop (three
+  failed turns, the pool, the budget), the closing conclude turn is tried before the report;
+  one that fails leaves the report without the model's conclusion, and `rootcause_exit`
+  says so in `conclude_failed` (three failed turns: `failed`).
 
 What the port changed:
 - No files. `run` hands the graph to `onTurn` after every turn and returns the report,

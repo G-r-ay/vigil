@@ -4,6 +4,8 @@ export interface AgentConfig {
   strengthenSearches: number;
   maxTheorize: number;
   rareSweep: boolean;
+  theorizeEvery: number;
+  branchEvery: number;
   rawOutputMaxChars: number;
   toolTimeoutMs: number;
   maxStrengthenAttempts: number;
@@ -14,11 +16,15 @@ export interface AgentConfig {
   lookbackDays: number;
   stitchWindowMinutes: number;
   linkNeedsSharedValue: boolean;
+  loose: boolean; // record freely: findings that fail a check are tagged (unverified / inferred link), not refused; the report is strict
+  chooseTurn: boolean; // with no runnable `next`, ask the model in a choose turn instead of taking the frontier's pick
   wrapUpAt: number; // share of maxUsd left when the model is told to wrap up
   concludeAt: number; // share left when the run stops for the closing conclude turn
   thresholds: { confirm: number; settled: number; ruleOut: number; expandMin: number; altPathMin: number; competitorMax: number };
   weights: { direct: number; corroborating: number; circumstantial: number };
   priorRange: [number, number];
+  scopeModel: string; // the model the scope turn maps the environment on
+  refusalFallbackModel: string; // the model a move the run's model refused twice is asked on
 }
 
 export const defaultConfig: AgentConfig = {
@@ -26,6 +32,8 @@ export const defaultConfig: AgentConfig = {
   maxToolCallsPerTurn: 6,
   strengthenSearches: 3, // a check needs a record or two; 6 let strengthen take a third of all searches
   rareSweep: true, // rare-activity sweep at the start of a run (rare.ts)
+  theorizeEvery: 4, // turns of other moves between rounds, once a round's tests are done
+  branchEvery: 6, // once the stories run, a branch from a chain event at least this often
   maxTheorize: 8, // rounds of competing stories per run (4 ran out by mid-run with the key question open)
   rawOutputMaxChars: 20_000, // v1 found 8k too small for 50 rows
   toolTimeoutMs: 90_000, // big sources (millions of events) need it; a slow search returns partial results
@@ -37,9 +45,13 @@ export const defaultConfig: AgentConfig = {
   lookbackDays: 14,
   stitchWindowMinutes: 30,
   linkNeedsSharedValue: true, // a new cause/effect link needs a value both events carry
+  loose: false, // a finding that fails a check is refused, as the reference with loose off; true keeps it tagged
+  chooseTurn: false, // the frontier picks, at no model cost (the reference loop); true restores the paid choose turn
   wrapUpAt: 0.10,
   concludeAt: 0.03, // at least $0.50: one conclude turn costs about that
   thresholds: { confirm: 0.85, settled: 0.95, ruleOut: 0.1, expandMin: 0.6, altPathMin: 0.3, competitorMax: 0.15 },
   weights: { direct: 2.0, corroborating: 1.0, circumstantial: 0.4 },
   priorRange: [0.1, 0.5],
+  scopeModel: "claude-sonnet-5",
+  refusalFallbackModel: "claude-sonnet-5",
 };

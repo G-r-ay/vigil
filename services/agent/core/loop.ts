@@ -26,6 +26,10 @@ export interface Harness<Kinds extends Record<string, unknown> = Record<never, n
   // Experimental (core/guards.ts): the guarded reader's model, when it is
   // not the run's own. A reader only extracts and labels, so a cheaper one serves.
   guards_provider?: Provider;
+  // The run's provider asked for another model: the same gateway, client, limiter and key,
+  // the id resolved as the spec's is. What a subturn on a model of its own runs on, and so is
+  // priced and journaled as. Absent, no subturn can name a model.
+  provider_for?: (model: string) => Provider;
 }
 
 export interface TurnConfig {
@@ -64,6 +68,11 @@ export interface TurnConfig {
   // is what its step may spend, so the answer comes inside it, a call fewer at the cap. An
   // agent's cap counts its working turns, which a plugin budgets by, so its answer comes after.
   answer_within_cap?: boolean;
+  // Asked before every round but the first, while the answer can be a submit: true makes that round
+  // and every one after it the answer round, forced to the submit, as the round past the cap is. For a
+  // caller whose cap is not on rounds (root cause counts searches): once it is spent, the next round
+  // answers. Absent, only the round count forces the answer.
+  answer_now?: () => boolean;
   // Turns the caller already holds, seeded before the loop. A stateless client
   // posts the whole conversation each time and the run is one turn of it.
   history?: readonly Message[];
@@ -86,12 +95,36 @@ export interface TurnConfig {
   // Numbers each result so the model can cite it: the nth call is `${prefix}${offset + n}`.
   // Absent leaves results unnumbered, as the workflows written before the kernel expect.
   refs?: { prefix: string; offset: number };
+  // Holds a submitted answer that met the schema to the caller's own test: null accepts it,
+  // a string is what is wrong with it. A rejected answer's submit call is answered with that
+  // string and the model goes another round, `corrections` times at most (default 0); then the
+  // run fails with the last answer handed on as rejected_value. Rounds that only answered do
+  // not count against max_turns. An answer that came by emission instead is checked once, with
+  // no corrections. Absent, the schema is the only test, as before.
+  check?: (answer: unknown) => string | null | Promise<string | null>;
+  // A submit that parsed but missed the schema is sent back the same way, with the schema's
+  // errors, and counts against the same corrections; once they are spent it goes to the
+  // emission turn as it always has. 0 sends nothing back.
+  corrections?: number;
+  // The parsed answer as it is held to the schema and the check, for every submit and emission: a
+  // caller whose schema is a parser's that drops keys it has no field for (zod's plain object)
+  // gives one that drops them, so such a key is never an error and never sent back. What it
+  // returns is the answer from there on: validated, checked, handed on. Absent, the answer is held
+  // as parsed, and a key the schema forbids is an error like any other.
+  prepare?: (answer: unknown) => unknown;
   // Asked once more when the model stops with turns left and fewer than min_results
   // results: keep going or say it is done. The ask is the next frame's transient tail.
   persist?: { min_results: number };
   // Where this turn's spend is journaled when not on its own ledger: a child's model calls
   // are its parent's spend, while its own ledger holds what it was shown and said.
   spend_to?: { run_id: string; run_kind: RunKind };
+  // Claude's cost and quality settings, as the root-cause reference runs them; off by default, and
+  // another model is sent what it always was. cache_conversation puts a cache breakpoint on the
+  // last message of every call beside the system prompt's, so each round reads the conversation so
+  // far from cache. think asks for adaptive thinking on every round the tool choice is not forced,
+  // and carries each round's thinking back with its calls.
+  cache_conversation?: boolean;
+  think?: boolean;
   // Lets this turn run against a ledger that already holds a terminal. Only for a turn
   // that describes a run rather than continues one -- never one that can reach a tool.
   after_terminal?: boolean;
@@ -129,12 +162,18 @@ export interface Outcome<T> {
   // Set only when parked: the call the harness stopped at, and the checkpoint a
   // resolution must answer for it to go through.
   pending: Pending | null;
-  // Set only when the role answered but never in a shape the schema accepts: a defect
+  // Set only when the role answered but never in a shape the schema, or the caller's check, accepts: a defect
   // in the emission, structured so a workflow never parses the reason to see it.
   emission_rejected?: true;
   // With emission_rejected: the last emission, parsed whole, when it was JSON that missed the schema (unset when it
   // did not parse or was cut off), so a caller can keep the part that is sound.
   rejected_value?: unknown;
+  // With emission_rejected: set when the answer met the schema but failed the caller's check, to
+  // what the check said of the last one.
+  check_failed?: string;
+  // Set when the model declined to answer (ModelRefused): failed by its own stop reason, which
+  // the budget's refusal above is not.
+  model_refused?: true;
   // True when the tool loop was stopped by the cap rather than by the model, so
   // a workflow knows the answer was reached over a truncated set of calls.
   capped: boolean;

@@ -18,7 +18,7 @@ import {
   type Status,
   type TurnConfig,
 } from "./loop.js";
-import { ProviderError, type Message, type ToolCall, type ToolSchema, type Turn, type TurnRequest } from "./provider.js";
+import { ModelRefused, ProviderError, type Message, type Reasoning, type ToolCall, type ToolSchema, type Turn, type TurnRequest } from "./provider.js";
 import { assemble, canonical, DEFAULT_FOLD, prefixOf, windowCeiling, type FoldPolicy, type Prefix } from "./context.js";
 import { createHash } from "node:crypto";
 import { scannerFor, wrap } from "./security.js";
@@ -70,9 +70,16 @@ export interface FrameSeen {
 }
 
 // The one hash every reader of a frame agrees on: messages, tools and the
-// emission schema, key-sorted.
+// emission schema, key-sorted. A turn's thinking is left out: the ledger never holds it,
+// so a rebuild from the ledger could not hash it, and a call is what it was asked over.
 export function inputHash(messages: readonly Message[], tools: readonly ToolSchema[], emit: Record<string, unknown> | null): string {
-  return contentHash(JSON.stringify(canonical({ messages, tools, emit })));
+  const asked = messages.map((message) => (message.role === "assistant" && message.reasoning !== undefined ? unthought(message) : message));
+  return contentHash(JSON.stringify(canonical({ messages: asked, tools, emit })));
+}
+
+function unthought(message: Message & { role: "assistant" }): Message {
+  const { reasoning: _, ...rest } = message;
+  return rest;
 }
 
 export function contentHash(text: string): string {
@@ -120,6 +127,8 @@ class Run<T, Kinds extends Record<string, unknown>> {
   private nudge: string | null = null;
   // A submit call that did not match the schema: the emission turn starts from its correction.
   private refusedSubmit: { content: string; parsed: unknown; reason: string } | null = null;
+  // Answers the caller's check sent back to the model to fix.
+  private corrected = 0;
   private readonly folder: Folder<Kinds>;
 
   constructor(
@@ -140,7 +149,7 @@ class Run<T, Kinds extends Record<string, unknown>> {
     } catch (error) {
       if (this.cfg.signal?.aborted === true || hardStop(error)) throw error;
       const reason = error instanceof Error ? error.message : String(error);
-      return yield* announce(this.done("failed", null, reason));
+      return yield* announce({ ...this.done("failed", null, reason), ...(error instanceof ModelRefused ? { model_refused: true as const } : {}) });
     }
   }
 
@@ -227,8 +236,12 @@ class Run<T, Kinds extends Record<string, unknown>> {
   private async *toolLoop(submit: boolean): AsyncGenerator<StreamEvent<T>, Outcome<T> | null> {
     // When the answer can be a tool call, the round after the search rounds is forced to the
     // submit tool where the wire allows. Inside the cap, a capped role pays for no round past it.
+    // A caller's answer_now forces it sooner; once forced, every round after is too.
+    let round = 0;
+    let forced = false;
     while (this.turns < this.searches + (submit ? 1 : 0)) {
-      const closing = this.turns >= this.searches;
+      forced ||= submit && round++ > 0 && this.cfg.answer_now?.() === true;
+      const closing = forced || this.turns >= this.searches;
       if (closing) this.capped = true;
       const fold = await this.folder.advance();
       // The answer round is the emission's stand-in, which never looked at the store.
@@ -245,12 +258,12 @@ class Run<T, Kinds extends Record<string, unknown>> {
 
       let turn;
       try {
-        turn = yield* this.burn({ messages, tools: this.prefix.tools, ...(closing ? { force: SUBMIT_TOOL } : {}) }, tail);
+        turn = yield* this.burn({ messages, tools: this.prefix.tools, ...(closing ? { force: SUBMIT_TOOL } : {}), ...this.claudeWire() }, tail);
       } catch (error) {
         // The answer round stands in for the emission, so it gets the emission's recourse:
         // a failed one is asked again by emit() over a folded transcript.
         const tighter = FOLD_LADDER[this.folds];
-        if (!closing || error instanceof ModelSilent || error instanceof OutputCapReached || tighter === undefined || this.cfg.signal?.aborted === true || hardStop(error)) throw error;
+        if (!closing || error instanceof ModelSilent || error instanceof OutputCapReached || error instanceof ModelRefused || tighter === undefined || this.cfg.signal?.aborted === true || hardStop(error)) throw error;
         this.tightened = tighter;
         this.folds += 1;
         this.rejected.push(`the answer call failed (${error instanceof Error ? error.message : String(error)}); asked again over a folded transcript`);
@@ -261,7 +274,14 @@ class Run<T, Kinds extends Record<string, unknown>> {
       // A search asked for beside the answer is what the answer waits on; one asked for
       // past the cap is not run. Any further submit is an answer too, not a search.
       const asked = turn.tool_calls.filter((call) => !submit || call.tool !== SUBMIT_TOOL);
-      if (closing) return submitted === undefined ? null : this.accepted(submitted);
+      const thought = this.cfg.think === true && turn.reasoning !== undefined && turn.reasoning.length > 0 ? { reasoning: turn.reasoning } : {};
+      if (closing) {
+        if (submitted === undefined) return null;
+        const answer = yield* this.accepted(submitted, turn.content, thought);
+        // Sent back to fix: the cap is still spent, so the next round is forced to the submit again.
+        if (answer === AGAIN) continue;
+        return answer;
+      }
       this.turns += 1;
       if (asked.length === 0) {
         if (this.stoppedEarly()) {
@@ -279,10 +299,15 @@ class Run<T, Kinds extends Record<string, unknown>> {
             continue;
           }
         }
-        return submitted === undefined ? null : this.accepted(submitted);
+        if (submitted === undefined) return null;
+        const answer = yield* this.accepted(submitted, turn.content, thought);
+        if (answer !== AGAIN) return answer;
+        // A round that only answered is not a search round: sending the answer back costs the role none.
+        this.turns -= 1;
+        continue;
       }
 
-      this.transcript.push({ role: "assistant", content: turn.content, tool_calls: asked });
+      this.transcript.push({ role: "assistant", content: turn.content, tool_calls: asked, ...thought });
       for (const call of asked) {
         const tool = this.tools.find((granted) => granted.id === call.tool);
         if (tool === undefined) {
@@ -312,17 +337,62 @@ class Run<T, Kinds extends Record<string, unknown>> {
     return null;
   }
 
-  // The submit call as the answer when it holds to the schema. When it does not, the
-  // emission turn is asked with what was wrong, as it would be of an emission.
-  private accepted(call: ToolCall): Outcome<T> | null {
+  // The submit call as the answer when it holds to the schema and the caller's check. One that
+  // fails either is answered with what is wrong, while corrections last, and the model goes
+  // another round (AGAIN): the failed call and that answer are on the transcript and the ledger
+  // like any refused call, so a replay rebuilds the next round. Schema and check draw on the one
+  // budget. Once it is spent, one that fails the check is handed on as failed, and one that misses
+  // the schema (or never parsed, which is not sent back) asks the emission turn with what was
+  // wrong, as it would of an emission.
+  private async *accepted(call: ToolCall, said: string, thought: { reasoning?: readonly Reasoning[] } = {}): AsyncGenerator<StreamEvent<T>, Outcome<T> | null | typeof AGAIN> {
     const schema = this.cfg.schema!;
     const validate = compile(schema);
-    const parsed = tryParse(call.args === "" ? "{}" : call.args);
-    if (parsed !== undefined && validate(parsed)) return this.done("completed", parsed as T, "the role answered");
+    const parsed = this.prepared(tryParse(call.args === "" ? "{}" : call.args));
+    const budget = this.cfg.corrections ?? 0;
+    if (parsed !== undefined && validate(parsed)) {
+      const failed = await this.failedCheck(parsed);
+      if (failed === null) return this.done("completed", parsed as T, "the role answered");
+      if (this.corrected >= budget) return this.uncorrected(parsed, failed);
+      this.rejected.push(`the answer failed its check: ${failed}`);
+      yield* this.sentBack(call, said, failed, thought);
+      return AGAIN;
+    }
     const reason = parsed === undefined ? "the response was not valid JSON" : errorsOf(validate);
+    const issues = parsed === undefined ? reason : issuesOf(validate);
     this.rejected.push(`${reason}: ${call.args.slice(0, 400)}`);
+    if (parsed !== undefined && this.corrected < budget) {
+      yield* this.sentBack(call, said, issues, thought);
+      return AGAIN;
+    }
     this.refusedSubmit = { content: call.args, parsed, reason };
     return null;
+  }
+
+  // A parsed answer as the caller holds it to the schema (TurnConfig.prepare); one that never parsed stays unparsed.
+  private prepared(parsed: unknown): unknown {
+    return parsed === undefined || this.cfg.prepare === undefined ? parsed : this.cfg.prepare(parsed);
+  }
+
+  // A submit answered with what is wrong with it, as one correction.
+  private async *sentBack(call: ToolCall, said: string, wrong: string, thought: { reasoning?: readonly Reasoning[] }): AsyncGenerator<StreamEvent<T>, void> {
+    this.corrected += 1;
+    this.transcript.push({ role: "assistant", content: said, tool_calls: [call], ...thought });
+    yield* this.record(call, { ok: false, failure: { kind: "invalid_args", detail: `Invalid submission: ${wrong}. Fix it and call ${SUBMIT_TOOL} again.` } });
+  }
+
+  // What the caller's check says is wrong with an answer that met the schema; null when it
+  // passes or there is no check.
+  private async failedCheck(answer: unknown): Promise<string | null> {
+    return this.cfg.check === undefined ? null : await this.cfg.check(answer);
+  }
+
+  // An answer that met the schema but not the check, once corrections are spent: failed, with
+  // the answer handed on so the caller can keep what in it is sound.
+  private uncorrected(answer: unknown, failed: string): Outcome<T> {
+    const after = this.corrected === 0 ? "" : ` after ${this.corrected} correction(s)`;
+    this.rejected.push(`the answer failed its check: ${failed}`);
+    const outcome = this.done("failed", null, `the answer failed its check${after}: ${failed}`);
+    return { ...outcome, emission_rejected: true, rejected_value: answer, check_failed: failed };
   }
 
   // Stopped with turns in hand and next to nothing gathered, and not yet asked.
@@ -337,7 +407,7 @@ class Run<T, Kinds extends Record<string, unknown>> {
   private gathered(): number {
     const local = new Set(this.tools.filter((tool) => tool.local).map((tool) => tool.id));
     const prior = (this.cfg.history ?? []).filter((message) => message.role === "tool").length;
-    return prior + this.calls.filter((attempt) => !local.has(attempt.tool)).length;
+    return prior + this.calls.filter((attempt) => !local.has(attempt.tool) && attempt.tool !== SUBMIT_TOOL).length;
   }
 
   // The store is the authority on whether the run is still going, so one
@@ -462,13 +532,13 @@ class Run<T, Kinds extends Record<string, unknown>> {
       // worth changing before asking again is how much it is asked over.
       let turn;
       try {
-        turn = yield* this.burn({ messages: this.assembled(tail), tools: [], emit: schema }, tail);
+        turn = yield* this.burn({ messages: this.assembled(tail), tools: [], emit: schema, ...this.claudeWire() }, tail);
       } catch (error) {
         // A silent model is a gateway fault, not a transcript too big to answer: asking
         // again over less would only spend the empty replies again. Nor does folding
         // give a model that thought through the whole output cap any more of it.
         const tighter = FOLD_LADDER[this.folds];
-        if (error instanceof ModelSilent || error instanceof OutputCapReached || tighter === undefined || this.cfg.signal?.aborted === true) throw error;
+        if (error instanceof ModelSilent || error instanceof OutputCapReached || error instanceof ModelRefused || tighter === undefined || this.cfg.signal?.aborted === true) throw error;
         this.tightened = tighter;
         this.folds += 1;
         this.rejected.push(`the emission call failed (${(error as Error).message}); asked again over a folded transcript`);
@@ -476,9 +546,11 @@ class Run<T, Kinds extends Record<string, unknown>> {
         continue;
       }
 
-      const parsed = tryParse(turn.content);
+      const parsed = this.prepared(tryParse(turn.content));
       if (parsed !== undefined && validate(parsed)) {
-        return this.done("completed", parsed as T, "the role answered");
+        // The emission is held to the caller's check too, once: its own retries are for the schema.
+        const failed = await this.failedCheck(parsed);
+        return failed === null ? this.done("completed", parsed as T, "the role answered") : this.uncorrected(parsed, failed);
       }
 
       // Pasting the body back is the right correction for a model that got the
@@ -534,6 +606,7 @@ class Run<T, Kinds extends Record<string, unknown>> {
     const signal = this.cfg.signal ? { signal: this.cfg.signal } : {};
     const tool_calls: ToolCall[] = [];
     let content = "";
+    let reasoning: readonly Reasoning[] | undefined;
     let billed = false;
     let settled = false;
     // Flagged between the record and the write, because those are two failures with
@@ -552,6 +625,7 @@ class Run<T, Kinds extends Record<string, unknown>> {
     try {
       for await (const event of this.harness.provider.stream({ ...request, ...signal })) {
         if (event.type === "tool_call") tool_calls.push(event.call);
+        else if (event.type === "reasoning") reasoning = event.reasoning;
         else if (event.type === "text_delta") {
           content += event.text;
           yield event;
@@ -571,7 +645,16 @@ class Run<T, Kinds extends Record<string, unknown>> {
       if (!settled) this.harness.budget.release();
     }
 
-    return { content, tool_calls };
+    return { content, tool_calls, ...(reasoning === undefined ? {} : { reasoning }) };
+  }
+
+  // The turn's opt-ins to Claude's cache and thinking, as the request carries them. Unset, the
+  // request is what it always was.
+  private claudeWire(): Pick<TurnRequest, "cache_conversation" | "think"> {
+    return {
+      ...(this.cfg.cache_conversation === true ? { cache_conversation: true } : {}),
+      ...(this.cfg.think === true ? { think: true } : {}),
+    };
   }
 
   private frame(request: Omit<TurnRequest, "signal">, tail: string | null): FrameSeen {
@@ -580,7 +663,13 @@ class Run<T, Kinds extends Record<string, unknown>> {
       role: this.cfg.role,
       model_id: this.harness.provider.model,
       provider_type: this.harness.provider.provider_type,
-      sampling: { ...(this.harness.provider.sampling ?? {}) },
+      // What the turn opted into rides with the rest, so a frame says the call was asked to cache
+      // its conversation, and to think when it was free to (the wire sends both to Claude alone).
+      sampling: {
+        ...(this.harness.provider.sampling ?? {}),
+        ...(request.cache_conversation === true ? { cache_conversation: true } : {}),
+        ...(request.think === true && request.force === undefined && request.emit === undefined ? { think: "adaptive" } : {}),
+      },
       system: this.prefix.system,
       task: this.cfg.task,
       recall: this.prefix.recall,
@@ -681,6 +770,9 @@ class Run<T, Kinds extends Record<string, unknown>> {
 }
 
 const EMIT_ASK = "Emit your answer now as JSON matching the schema.";
+
+// What accepted() returns when the answer went back to the model to fix.
+const AGAIN = Symbol("again");
 
 // What an emission is told when it follows a failed one. The rejected body goes back as the
 // assistant turn it was, or the model is asked to correct something it cannot see. A cut-off
@@ -894,6 +986,20 @@ export function schemaErrors(schema: Record<string, unknown>, value: unknown): s
 export function schemaIssues(schema: Record<string, unknown>, value: unknown): ErrorObject[] {
   const validate = compile(schema);
   return validate(value) ? [] : [...(validate.errors ?? [])];
+}
+
+// The same errors as a submit sent back to fix is told them: a dotted path, then what is wrong
+// there, as the reference's own schema issues read ("next: must be object").
+function issuesOf(validate: ValidateFunction): string {
+  return (validate.errors ?? []).map((error) => {
+    const at = error.instancePath.split("/").slice(1).join(".");
+    const params = error.params as { additionalProperty?: string; allowedValues?: unknown[] };
+    const what =
+      error.keyword === "additionalProperties" ? `unrecognized key "${params.additionalProperty ?? ""}"`
+      : error.keyword === "enum" ? `${error.message ?? ""}: ${(params.allowedValues ?? []).join(", ")}`
+      : error.message ?? "";
+    return at === "" ? what : `${at}: ${what}`;
+  }).join("; ");
 }
 
 // An enum error names the values it would take, or the model is asked to correct a field blind.

@@ -14,11 +14,11 @@ import { KernelModelClient, KernelTurns, Refused } from "./model/client.js";
 import { run, seedFromAlert } from "./orchestrator.js";
 import { renderReport } from "./report.js";
 import { scope } from "./scope.js";
-import { neverRan, Registry, type Journal } from "./tools/registry.js";
-import { sourceFor, UnsupportedSource, type Invoke, type SourceAdapter } from "./tools/source.js";
+import { correction, neverRan, Registry, type Journal } from "./tools/registry.js";
+import { sourceFor, UnsupportedSource, type DataSpan, type Invoke, type SourceAdapter } from "./tools/source.js";
 import { splunkAdapter } from "./tools/splunk-source.js";
 import { MemoryTrace } from "./trace.js";
-import type { Deps, ExitReason } from "./types.js";
+import type { Deps, ExitReason, RunResult } from "./types.js";
 
 // The v3 loop as a worker run: it opens and journals its own ledger, every move one kernel turn billed to the
 // run's pool, searches through the run's bound telemetry tool, and resumes from what it journaled. The kernel
@@ -41,6 +41,8 @@ export interface V3Options {
   stop?: StopSource;
   adapters?: readonly SourceAdapter[];
   log?: (line: string) => void;
+  // The wait before a move lost to the network runs again (the loop's own, 30s, when unset).
+  retryWaitMs?: number;
 }
 
 export interface V3Report {
@@ -182,8 +184,9 @@ async function drive(
   const { cfg, alert, index, range } = setup;
   const source = bound.adapter.open(invoke, { index, range });
   registry.register(source.evidenceTool());
-  // The calls a resumed run already made stay citable, and a new one never reuses a ref.
-  for (const call of prior.filter((e) => e.kind === "call").map((e) => e.payload as CallPayload)) registry.note(call.ref, argsOf(call.arguments), call.ok ? call.result : "", !neverRan(call));
+  // The calls a resumed run already made stay citable, and a new one never reuses a ref. A correction keeps its
+  // number too, but is no search.
+  for (const call of prior.filter((e) => e.kind === "call").map((e) => e.payload as CallPayload)) registry.note(call.ref, argsOf(call.arguments), call.ok ? call.result : "", !neverRan(call) && !correction(call));
   const trace = new MemoryTrace(run_id, () => new Date(), folded.entries);
   // The pool's own spend, which a resume was seeded with off the ledger.
   const budget = { get usd() { return harness.budget.spent.cost_usd; } };
@@ -211,6 +214,7 @@ async function drive(
   const fresh = folded.lastTurn < 0;
   let exit: ExitReason | null = null;
   let report: string;
+  let ended: Pick<RunResult, "failed" | "cut" | "concludeFailed">;
   try {
     const result = await run(alert, cfg, deps, {
       runId: run_id,
@@ -220,6 +224,8 @@ async function drive(
       startTurn: Math.max(1, folded.lastTurn + 1),
       signal,
       log,
+      cutoff: spentOut,
+      ...(options.retryWaitMs === undefined ? {} : { retryWaitMs: options.retryWaitMs }),
       onTurn: async (g, turn) => {
         turnNow = turn + 1;
         if (turn === 0 && !fresh) return;
@@ -228,6 +234,7 @@ async function drive(
     });
     exit = result.exit;
     report = result.report;
+    ended = result;
   } catch (error) {
     // What the run found so far is the report, however it stopped.
     // A run the pool cut off ends budget-exhausted; a stop or a failure has no exit.
@@ -239,9 +246,17 @@ async function drive(
     if (spentOut(error)) return end("budget_exhausted", error.message, conclusionOf(written));
     return end("failed", error instanceof Error ? error.message : String(error), conclusionOf(written));
   }
-  await state.append(run_id, [event("rootcause_exit", { exit, report, entries: trace.drain() })]);
+  // A closing turn that failed leaves the report without the model's conclusion: the exit says so.
+  await state.append(run_id, [event("rootcause_exit", {
+    exit, report, entries: trace.drain(),
+    ...(ended.failed === undefined ? {} : { failed: ended.failed }),
+    ...(ended.concludeFailed === undefined ? {} : { conclude_failed: ended.concludeFailed }),
+  })]);
+  const summary = conclusionOf(report);
+  if (ended.failed !== undefined) return end("failed", `three turns in a row failed: ${ended.failed}`, summary);
+  if (ended.cut !== undefined && exit === "budget-exhausted") return end("budget_exhausted", ended.cut, summary);
   const outcome: RunOutcome = exit === "budget-exhausted" ? "budget_exhausted" : "completed";
-  return end(outcome, `the trace ended: ${exit}`, conclusionOf(report));
+  return end(outcome, `the trace ended: ${exit}`, summary);
 }
 
 const argsOf = (raw: string): unknown => { try { return JSON.parse(raw); } catch { return {}; } };
@@ -254,10 +269,47 @@ async function open(options: V3Options, adapter: SourceAdapter, invoke: Invoke, 
   const framed = await frameAlert(turns, run_id, spec.prompt, indexes);
   const index = configured ?? framed.index;
   if (index === null) throw new Unframed(`the brief does not say which of the indexes holds its telemetry (${indexes.slice(0, 20).join(", ") || "none listed"}), and no root_cause_index is configured`);
-  const t = Date.parse(framed.alert.observedAt);
-  const range: [string, string] = [new Date(t - defaultConfig.lookbackDays * DAY_MS).toISOString(), new Date(t + DAY_MS).toISOString()];
-  const survey = await adapter.open(invoke, { index, range }).survey();
-  return { cfg: configFor(spec), alert: framed.alert, index, range, survey, environment: null };
+  let span: DataSpan | null = null;
+  let unmeasured = "the index holds no events";
+  try {
+    span = await adapter.span(invoke, index);
+  } catch (error) {
+    unmeasured = error instanceof Error ? error.message : String(error);
+  }
+  const ranged = rangeOf(framed.alert.observedAt, span, defaultConfig.lookbackDays, unmeasured);
+  const survey = await adapter.open(invoke, { index, range: ranged.range }).survey();
+  return { cfg: configFor(spec), alert: framed.alert, index, ...ranged, ...(framed.note === null ? {} : { frame_note: framed.note }), survey, environment: null };
+}
+
+const dayOf = (ms: number) => Math.floor(ms / DAY_MS) * DAY_MS;
+const iso = (ms: number) => new Date(ms).toISOString();
+
+type Ranged = Required<Pick<SetupPayload, "range" | "range_source" | "data_span" | "range_note">> & Pick<SetupPayload, "span_query">;
+
+// The run's range, as the reference's scenarios set theirs: the data's own span in whole UTC days, from the
+// midnight before its first event to the midnight after its last. The alert stays inside it: an alert outside the
+// data widens the range to the alert's day. A span that could not be measured (why: the reason) leaves the alert's
+// window, lookbackDays before it to a day after.
+export function rangeOf(observedAt: string, span: DataSpan | null, lookbackDays: number, why: string): Ranged {
+  const t = Date.parse(observedAt);
+  if (span === null) {
+    return {
+      range: [iso(t - lookbackDays * DAY_MS), iso(t + DAY_MS)],
+      range_source: "alert-window",
+      data_span: null,
+      range_note: `the data's span was not measured (${why}), so the range is the alert's window: ${lookbackDays} days before it to a day after`,
+    };
+  }
+  const first = Date.parse(span.first), last = Date.parse(span.last);
+  const range: [string, string] = [iso(dayOf(Math.min(first, t))), iso(dayOf(Math.max(last, t)) + DAY_MS)];
+  const outside = t < first ? `; the alert at ${observedAt} is before the data's first event, so the range starts on its day` : t > last ? `; the alert at ${observedAt} is after the data's last event, so the range ends after its day` : "";
+  return {
+    range,
+    range_source: "data",
+    data_span: [span.first, span.last],
+    span_query: span.query,
+    range_note: `the data's own span, ${span.first} to ${span.last}, in whole days${outside}`,
+  };
 }
 
 async function halted(

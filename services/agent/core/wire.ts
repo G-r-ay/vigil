@@ -3,9 +3,11 @@ import OpenAI from "openai";
 import type { TokenCounts } from "../contracts/budget.js";
 import { estimateTokens, Limiter, statusOf } from "./limiter.js";
 import {
+  ModelRefused,
   ProviderError,
   type Message,
   type Provider,
+  type Reasoning,
   type ProviderEvent,
   type ToolCall,
   type ToolSchema,
@@ -179,14 +181,46 @@ export function takesCacheMarker(provider_type: string, model: string): boolean 
 
 // One breakpoint on the system message. Anthropic's cache key runs tools, system,
 // messages, so it caches the tools and the system prompt together. A prefix under
-// the model's minimum just does not cache.
-function cacheable(messages: Body["messages"]): Body["messages"] {
+// the model's minimum just does not cache. With `conversation`, a second on the last
+// message, moved forward every round: the next call finds this one's whole prefix in the
+// cache and pays for what it adds. Two of the four breakpoints Anthropic allows.
+function cacheable(messages: Body["messages"], conversation = false): Body["messages"] {
   const at = messages.findLastIndex((message) => message.role === "system");
   const system = messages[at];
-  if (system === undefined || typeof system.content !== "string") return messages;
+  const last = conversation ? messages.length - 1 : -1;
+  if (system === undefined || typeof system.content !== "string") return messages.map((message, i) => (i === last ? marked(message) : message));
   const block = { type: "text", text: system.content, cache_control: { type: "ephemeral" } };
-  return messages.map((message, i) => (i === at ? ({ ...message, content: [block] } as typeof message) : message));
+  return messages.map((message, i) => (i === at ? ({ ...message, content: [block] } as typeof message) : i === last ? marked(message) : message));
 }
+
+// The message with its last content part carrying the cache marker. Bifrost reads the
+// marker off a text part of a system, user or tool message (core/providers/anthropic/chat.go,
+// the CacheControl it copies onto each block); an assistant message is never last.
+function marked(message: Body["messages"][number]): Body["messages"][number] {
+  if (message.role === "assistant" || message.role === "function") return message;
+  const ephemeral = { cache_control: { type: "ephemeral" } };
+  if (typeof message.content === "string") {
+    if (message.content === "") return message;
+    return { ...message, content: [{ type: "text", text: message.content, ...ephemeral }] } as typeof message;
+  }
+  const parts = message.content as unknown as readonly Record<string, unknown>[];
+  if (parts.length === 0) return message;
+  return { ...message, content: parts.map((part, i) => (i === parts.length - 1 ? { ...part, ...ephemeral } : part)) } as unknown as typeof message;
+}
+
+// Whether Bifrost turns a reasoning ask into adaptive thinking, with no budget, for this
+// Claude: Opus 4.7 and later, Sonnet 5 and later, Fable and Mythos -- its
+// IsAdaptiveOnlyThinkingModel. Any other Claude would be given a fixed budget instead, which
+// is not what thinking means here, so it is not asked to think.
+export function thinksAdaptively(model: string): boolean {
+  return /opus-4[-.][78]|opus-5|sonnet-5|fable|mythos/i.test(model);
+}
+
+// Adaptive thinking, through Bifrost's chat surface: `reasoning.max_tokens` on an
+// adaptive-only model becomes `thinking: {type: "adaptive"}` with no effort and no budget
+// (the number is not sent on), and `display` rides through as thinking.display -- summarized,
+// so the thought is readable. core/providers/anthropic/chat.go, "Convert reasoning".
+const ADAPTIVE = { reasoning: { max_tokens: 1024, display: "summarized" } };
 
 export function openAiSurface(
   client: OpenAI,
@@ -235,13 +269,19 @@ class OpenAiSurface implements Provider {
     const turn = request.emit === undefined ? await this.ask(request) : await this.emit(request, request.emit);
     if (turn.content !== "") yield { type: "text_delta", text: turn.content };
     yield { type: "usage", tokens: turn.tokens };
+    if (turn.reasoning !== undefined && turn.reasoning.length > 0) yield { type: "reasoning", reasoning: turn.reasoning };
     for (const call of turn.tool_calls) yield { type: "tool_call", call };
   }
 
   private async ask(request: TurnRequest): Promise<Turn> {
-    const body = (tools: readonly ToolSchema[]) => ({ model: this.wire_model, messages: wire(request.messages), ...(tools.length === 0 ? {} : { tools: wireTools(tools) }) });
+    const claude = takesCacheMarker(this.provider_type, this.model);
+    const tail = request.cache_conversation === true;
+    const body = (tools: readonly ToolSchema[]) => ({ model: this.wire_model, messages: wire(request.messages, claude), ...(tools.length === 0 ? {} : { tools: wireTools(tools) }) });
     const forced = request.tools.find((tool) => tool.id === request.force);
-    if (forced === undefined) return turnOf(await this.call(body(request.tools), request.signal));
+    if (forced === undefined) {
+      const thinks = request.think === true && claude && thinksAdaptively(this.model);
+      return turnOf(await this.call({ ...body(request.tools), ...(thinks ? ADAPTIVE : {}) }, request.signal, tail));
+    }
     // Remembered per model like emitModes: "tool" means the gateway refuses a forced choice,
     // "prompt" that it refuses tools at all. Each is remembered once the next rung has gone
     // through: a 400 about something else is not a refusal.
@@ -251,7 +291,7 @@ class OpenAiSurface implements Provider {
     if (known === undefined) {
       try {
         const tool_choice = { type: "function" as const, function: { name: forced.id } };
-        return turnOf(await this.call({ ...body(request.tools), tool_choice }, request.signal));
+        return turnOf(await this.call({ ...body(request.tools), tool_choice }, request.signal, tail));
       } catch (error) {
         if (!refusal(error)) throw error;
       }
@@ -259,7 +299,7 @@ class OpenAiSurface implements Provider {
     // Where the choice cannot be forced, offering only the named tool is the next best thing to it.
     if (known !== "prompt") {
       try {
-        const turn = turnOf(await this.call(body([forced]), request.signal));
+        const turn = turnOf(await this.call(body([forced]), request.signal, tail));
         rememberMode(mode, "tool");
         return turn;
       } catch (error) {
@@ -274,14 +314,15 @@ class OpenAiSurface implements Provider {
   }
 
   private async emit(request: TurnRequest, schema: Record<string, unknown>): Promise<Turn> {
-    const messages = wire(request.messages);
+    const messages = wire(request.messages, takesCacheMarker(this.provider_type, this.model));
+    const tail = request.cache_conversation === true;
     const mode = `${this.model}\n${JSON.stringify(schema)}`;
     // Shared with viaTool, so a downgrade that spans both still reports one total.
     const spend = tally();
     if ((emitModes.get(mode) ?? "schema") === "schema") {
       try {
         const format = { type: "json_schema" as const, json_schema: { name: "emission", strict: false, schema } };
-        const turn = spend.count(turnOf(await this.call({ model: this.wire_model, messages, response_format: format }, request.signal)));
+        const turn = spend.count(turnOf(await this.call({ model: this.wire_model, messages, response_format: format }, request.signal, tail)));
         // A gateway that drops response_format answers 200 with an object of the model's
         // own invention, so fall through to the tool, whose parameters it does forward.
         if (honours(turn.content, schema)) return turn;
@@ -293,7 +334,7 @@ class OpenAiSurface implements Provider {
     }
 
     if (emitModes.get(mode) !== "prompt") {
-      const carried = await this.viaTool(messages, schema, spend, request.signal);
+      const carried = await this.viaTool(messages, schema, spend, request.signal, tail);
       if (carried !== null) return carried;
       rememberMode(mode, "prompt");
     }
@@ -301,7 +342,7 @@ class OpenAiSurface implements Provider {
     // Neither wire carried it, so the schema goes in the prompt, which asks nothing of
     // the gateway. What comes back is JSON the caller already parses and corrects.
     const asked = [...messages, { role: "user" as const, content: prompted(schema) }];
-    const turn = spend.count(turnOf(await this.call({ model: this.wire_model, messages: asked }, request.signal)));
+    const turn = spend.count(turnOf(await this.call({ model: this.wire_model, messages: asked }, request.signal, tail)));
     if (turn.content !== "" || turn.tool_calls.length === 0) return turn;
 
     // No tools were offered and it called one anyway: a provider that finds a name in
@@ -311,6 +352,7 @@ class OpenAiSurface implements Provider {
         await this.call(
           { model: this.wire_model, messages: [...asked, { role: "user", content: instead(turn) }] },
           request.signal,
+          tail,
         ),
       ),
     );
@@ -323,6 +365,7 @@ class OpenAiSurface implements Provider {
     schema: Record<string, unknown>,
     spend: Tally,
     signal?: AbortSignal,
+    tail = false,
   ): Promise<Turn | null> {
     const emit = { name: EMIT_TOOL, description: "Emit your answer.", parameters: schema };
     const forced = {
@@ -334,7 +377,7 @@ class OpenAiSurface implements Provider {
 
     let turn: Turn;
     try {
-      turn = spend.count(turnOf(await this.call(forced, signal)));
+      turn = spend.count(turnOf(await this.call(forced, signal, tail)));
     } catch (error) {
       // Only a refusal: returning null claims this wire never works here, which a local
       // fault (no status) and a ceiling ("not now") do not establish.
@@ -354,6 +397,7 @@ class OpenAiSurface implements Provider {
         await this.call(
           { ...forced, messages: [...messages, { role: "user", content: instead(turn, `Call ${EMIT_TOOL} with your final answer, and call nothing else.`) }] },
           signal,
+          tail,
         ),
       ),
     );
@@ -363,11 +407,11 @@ class OpenAiSurface implements Provider {
 
   // Streamed, and not for the deltas: a buffered completion is subject to the gateway's
   // non-streaming ceiling -- 30 seconds in Bifrost, returned as a 504.
-  private async call(body: Body, signal?: AbortSignal): Promise<OpenAI.Chat.ChatCompletion> {
+  private async call(body: Body, signal?: AbortSignal, conversation = false): Promise<OpenAI.Chat.ChatCompletion> {
     // Before the limiter, not only inside the request: a call still queued behind
     // a rate limit is the cheapest one to give up on.
     signal?.throwIfAborted();
-    if (takesCacheMarker(this.provider_type, this.model)) body = { ...body, messages: cacheable(body.messages) };
+    if (takesCacheMarker(this.provider_type, this.model)) body = { ...body, messages: cacheable(body.messages, conversation) };
     const cap = outputCaps.get(this.model) ?? "max_tokens";
     try {
       return await this.send(body, cap, signal);
@@ -383,6 +427,10 @@ class OpenAiSurface implements Provider {
     let wasted: TokenCounts = { input: 0, output: 0, cache_read: 0, cache_write: 0 };
     for (let attempt = 0; ; attempt += 1) {
       const { response, reported } = await this.sendOnce(body, cap, signal);
+      const finish: string | undefined = response.choices[0]?.finish_reason;
+      if (finish === "refusal" || finish === "content_filter") {
+        throw new ModelRefused(`the model refused to answer (finish_reason=${finish}) from ${this.wire_model}`, tokensOf(plus(response.usage, wasted)));
+      }
       if (response.choices[0]?.finish_reason === "length" && !said(response)) {
         const spent = tokensOf(plus(response.usage, wasted));
         throw new OutputCapReached(
@@ -495,6 +543,7 @@ function honours(content: string, schema: Record<string, unknown>): boolean {
 // and names are kept rather than overwritten by the nulls that follow.
 async function assemble(stream: AsyncIterable<OpenAI.Chat.ChatCompletionChunk>): Promise<OpenAI.Chat.ChatCompletion> {
   const calls = new Map<number, OpenAI.Chat.ChatCompletionMessageFunctionToolCall>();
+  const thought = new Map<number, Reasoning>();
   let content = "";
   let usage: OpenAI.CompletionUsage | undefined;
   let finish: OpenAI.Chat.ChatCompletion.Choice["finish_reason"] = "stop";
@@ -508,6 +557,15 @@ async function assemble(stream: AsyncIterable<OpenAI.Chat.ChatCompletionChunk>):
     if (choice === undefined) continue;
     if (choice.finish_reason) finish = choice.finish_reason;
     content += textOf(choice.delta.content);
+    for (const detail of detailsOf(choice.delta)) {
+      const held: Reasoning = thought.get(detail.index) ?? { type: detail.type ?? "reasoning.text" };
+      thought.set(detail.index, {
+        type: detail.type ?? held.type,
+        ...(held.text !== undefined || detail.text != null ? { text: (held.text ?? "") + (detail.text ?? "") } : {}),
+        ...(detail.signature != null ? { signature: detail.signature } : held.signature !== undefined ? { signature: held.signature } : {}),
+        ...(detail.data != null ? { data: detail.data } : held.data !== undefined ? { data: held.data } : {}),
+      });
+    }
     for (const delta of choice.delta.tool_calls ?? []) {
       const held = calls.get(delta.index);
       calls.set(delta.index, {
@@ -523,6 +581,7 @@ async function assemble(stream: AsyncIterable<OpenAI.Chat.ChatCompletionChunk>):
 
   if (head === undefined) throw new ProviderError("the gateway closed the stream without sending anything");
   const tool_calls = [...calls.entries()].sort(([a], [b]) => a - b).map(([, call]) => call);
+  const reasoning_details = [...thought.entries()].sort(([a], [b]) => a - b).map(([, detail]) => detail);
   return {
     id: head.id,
     created: head.created,
@@ -533,7 +592,13 @@ async function assemble(stream: AsyncIterable<OpenAI.Chat.ChatCompletionChunk>):
         index: 0,
         finish_reason: finish,
         logprobs: null,
-        message: { role: "assistant", content, refusal: null, ...(tool_calls.length === 0 ? {} : { tool_calls }) },
+        message: {
+          role: "assistant",
+          content,
+          refusal: null,
+          ...(tool_calls.length === 0 ? {} : { tool_calls }),
+          ...(reasoning_details.length === 0 ? {} : { reasoning_details }),
+        } as OpenAI.Chat.ChatCompletionMessage,
       },
     ],
     ...(usage === undefined ? {} : { usage }),
@@ -556,7 +621,24 @@ function turnOf(response: OpenAI.Chat.ChatCompletion): Turn {
   const tokens = tokensOf(response.usage);
   const message = response.choices[0]?.message;
   if (message === undefined) throw new ProviderError("the model returned no message", tokens);
-  return { content: textOf(message.content), tool_calls: callsOf(message.tool_calls), tokens };
+  const reasoning = (message as { reasoning_details?: Reasoning[] }).reasoning_details;
+  return { content: textOf(message.content), tool_calls: callsOf(message.tool_calls), tokens, ...(reasoning === undefined ? {} : { reasoning }) };
+}
+
+// A thinking block arrives in pieces, keyed by index, the way Bifrost streams Anthropic's:
+// its text a fragment at a time under reasoning_details, then its signature alone.
+interface Detail {
+  index: number;
+  type?: string;
+  text?: string | null;
+  signature?: string | null;
+  data?: string | null;
+}
+
+function detailsOf(delta: OpenAI.Chat.ChatCompletionChunk.Choice.Delta): Detail[] {
+  const details = (delta as { reasoning_details?: unknown }).reasoning_details;
+  if (!Array.isArray(details)) return [];
+  return details.filter((one): one is Detail => typeof one === "object" && one !== null && typeof (one as Detail).index === "number");
 }
 
 function callsOf(calls: OpenAI.Chat.ChatCompletionMessageToolCall[] | undefined): ToolCall[] {
@@ -595,12 +677,17 @@ function tokensOf(usage: OpenAI.CompletionUsage | undefined): TokenCounts {
   };
 }
 
-function wire(messages: readonly Message[]): OpenAI.Chat.ChatCompletionMessageParam[] {
+// A Claude turn's thinking goes back on its assistant message as the reasoning_details it
+// came as, which Bifrost replays as the thinking blocks, signatures intact (chat.go, "First add
+// reasoning details"): Anthropic wants the thinking that led to a tool call back with its result.
+// Any other model is sent what it always was.
+function wire(messages: readonly Message[], claude = false): OpenAI.Chat.ChatCompletionMessageParam[] {
   return messages.map((message) => {
     if (message.role === "tool") return { role: "tool", tool_call_id: message.call_id, content: message.content };
     if (message.role !== "assistant") return { role: message.role, content: message.content };
-    if (message.tool_calls.length === 0) return { role: "assistant", content: message.content };
-    return { role: "assistant", content: message.content, tool_calls: message.tool_calls.map(wireCall) };
+    const thought = claude && message.reasoning !== undefined && message.reasoning.length > 0 ? { reasoning_details: message.reasoning } : {};
+    if (message.tool_calls.length === 0) return { role: "assistant", content: message.content, ...thought };
+    return { role: "assistant", content: message.content, tool_calls: message.tool_calls.map(wireCall), ...thought };
   });
 }
 

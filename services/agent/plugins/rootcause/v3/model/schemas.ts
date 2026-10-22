@@ -74,7 +74,7 @@ const Candidate = obj({
 }, ["label", "domain", "prior", "artifacts", "nodeEvidence", "edgeEvidence"]);
 
 // The move to make next. Optional in every submission (a forgotten one must not cost a sound finding: the
-// choose turn asks for it); a choose turn submits this shape itself.
+// frontier picks, or with cfg.chooseTurn a choose turn asks for it); a choose turn submits this shape itself.
 const NextMove = obj({
   move: { type: "string", enum: ["expand", "strengthen", "fork", "branch", "pivot", "test", "theorize", "connect", "probe"] },
   target: str("a graph id (N.., E.., boundary id, prediction id) from the available list, or the exact label of an event (this submission or an earlier turn); not needed for theorize/connect"),

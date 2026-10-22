@@ -3,6 +3,7 @@ import { applyPatch, emptyPatch } from "../../../plugins/rootcause/v3/graph.js";
 import { fallback, options, optionsText, resolveNext } from "../../../plugins/rootcause/v3/lead.js";
 import type { TurnRequest } from "../../../plugins/rootcause/v3/model/client.js";
 import { run } from "../../../plugins/rootcause/v3/orchestrator.js";
+import type { AgentConfig } from "../../../plugins/rootcause/v3/config.js";
 import { Registry } from "../../../plugins/rootcause/v3/tools/registry.js";
 import { MemoryTrace } from "../../../plugins/rootcause/v3/trace.js";
 import { apply, cfg, ev, node, seeded } from "./helpers.js";
@@ -67,7 +68,8 @@ describe("lead", () => {
     expect(o.branch).toBeUndefined();
     expect(o.expand).toBeUndefined();
     expect(optionsText(g, cfg, { refused: "x" })).toContain("Your last choice was not used: x");
-    expect(optionsText(g, cfg, {})).toContain("you will be asked to choose");
+    expect(optionsText(g, cfg, {})).toContain("Leave `next` out and the system picks.");
+    expect(optionsText(g, { ...cfg, chooseTurn: true }, {})).toContain("you will be asked to choose");
     expect(optionsText(g, cfg, {}, 0, true)).not.toContain("asked to choose");
     expect(optionsText(g, cfg, {}, 0, true)).toContain("or an event by its exact label.");
   });
@@ -109,17 +111,62 @@ describe("lead", () => {
 });
 
 // The loop with a stub model: who names each move, and what the next prompt says.
-describe("the model names every move", () => {
-  const alert = { id: "a", source: "edr", title: "alert", observedAt: "2026-01-01T00:00:00Z", artifacts: [], raw: {} };
-  const conclusion = { conclusion: "done", chain: [], openQuestions: [], reasoning: "" };
-  const drive = async (answer: (req: TurnRequest, n: number, budget: { usd: number }) => unknown, graph?: ReturnType<typeof seeded>, failing: (n: number) => string | undefined = () => undefined) => {
-    const reqs: TurnRequest[] = [];
-    const budget = { usd: 0 };
-    const model = { runTurn: async (req: TurnRequest) => { reqs.push(req); const failed = failing(reqs.length); return failed !== undefined ? { submission: null, toolCalls: [], failed } : { submission: answer(req, reqs.length, budget) ?? null, toolCalls: [] }; } };
-    const trace = new MemoryTrace("t");
-    const r = await run(alert, { ...cfg, rareSweep: false, maxUsd: 100 }, { model, tools: new Registry(), trace, budget, domains: ["edr"], clock: () => new Date() }, { runId: "t", range: ["2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"], index: "x", graph });
-    return { reqs, r, trace };
-  };
+const alert = { id: "a", source: "edr", title: "alert", observedAt: "2026-01-01T00:00:00Z", artifacts: [], raw: {} };
+const conclusion = { conclusion: "done", chain: [], openQuestions: [], reasoning: "" };
+const drive = async (answer: (req: TurnRequest, n: number, budget: { usd: number }) => unknown, graph?: ReturnType<typeof seeded>, failing: (n: number) => string | undefined = () => undefined, over: Partial<AgentConfig> = {}) => {
+  const reqs: TurnRequest[] = [];
+  const budget = { usd: 0 };
+  const model = { runTurn: async (req: TurnRequest) => { reqs.push(req); const failed = failing(reqs.length); return failed !== undefined ? { submission: null, toolCalls: [], failed } : { submission: answer(req, reqs.length, budget) ?? null, toolCalls: [] }; } };
+  const trace = new MemoryTrace("t");
+  const r = await run(alert, { ...cfg, rareSweep: false, maxUsd: 100, ...over }, { model, tools: new Registry(), trace, budget, domains: ["edr"], clock: () => new Date() }, { runId: "t", range: ["2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"], index: "x", graph });
+  const decisions = trace.chronological().filter((e) => e.type === "decision").map((e) => e.payload as { move: string; targetId: string; reason: string; priority?: number });
+  return { reqs, r, trace, decisions };
+};
+
+// The reference loop: a missing or unavailable `next` is the frontier's to fill, with no model call.
+describe("with no runnable move named, the frontier picks", () => {
+  it("takes the first move and every unnamed one off the frontier, and asks the model only for the moves themselves", async () => {
+    const { reqs, decisions } = await drive((req, n, budget) => {
+      if (req.move === "conclude") return conclusion;
+      if (n === 3) budget.usd = 1e6;
+      return { evidence: [], reasoning: "r" };
+    });
+    expect(reqs.map((r) => r.move)).not.toContain("choose");
+    // Each model call is a move the loop decided on: none was spent picking one.
+    expect(reqs.map((r) => r.move)).toEqual(decisions.map((d) => d.move));
+    expect(decisions[0]).toMatchObject({ move: "strengthen", targetId: "N1", priority: 0, reason: expect.stringMatching(/^frontier P0: symptom N1 is not confirmed yet/) });
+    expect(decisions.slice(0, -1).every((d) => d.reason.startsWith("frontier P"))).toBe(true);
+    expect(reqs[0]!.userContent).toContain("Leave `next` out and the system picks.");
+  });
+
+  it("runs the frontier's pick after a next that is not available, and tells the model its choice was not used", async () => {
+    const { reqs, decisions, trace } = await drive((req, n, budget) => {
+      if (req.move === "conclude") return conclusion;
+      if (n === 2) budget.usd = 1e6;
+      return n === 1 ? { evidence: [], reasoning: "r", next: { move: "pivot", target: "B9", why: "x" } } : { evidence: [], reasoning: "r" };
+    });
+    expect(reqs.map((r) => r.move)).toEqual(["strengthen", "strengthen", "conclude"]);
+    expect(decisions[1]).toMatchObject({ move: "strengthen", targetId: "N1", reason: expect.stringMatching(/^frontier P0: /) });
+    expect(reqs[1]!.userContent).toContain("Your last choice was not used: pivot is not available now.");
+    expect(trace.chronological().find((e) => e.type === "reasoning")!.payload).toMatchObject({ lead: { move: "pivot" }, refused: "pivot is not available now." });
+  });
+
+  it("runs the move a submission names, its reason the model's", async () => {
+    const { reqs, decisions } = await drive((req, n, budget) => {
+      if (req.move === "conclude") return conclusion;
+      if (n === 1) return { evidence: [], reasoning: "r", next: { move: "expand", target: "N1", why: "its cause is unknown" } };
+      budget.usd = 1e6;
+      return { candidates: [], reasoning: "r" };
+    });
+    expect(reqs.map((r) => r.move)).toEqual(["strengthen", "expand", "conclude"]);
+    expect(decisions[1]).toMatchObject({ move: "expand", reason: "model: its cause is unknown" });
+    expect(decisions[1]).not.toHaveProperty("priority");
+  });
+});
+
+// cfg.chooseTurn: a missing or refused `next` is asked for in a choose turn instead.
+describe("with choose turns, the model names every move", () => {
+  const choosing = { chooseTurn: true };
 
   it("asks for the first move, tells a refusal and a silent turn to the next choose turn, and runs each choice", async () => {
     const { reqs, trace } = await drive((req, n, budget) => {
@@ -127,7 +174,7 @@ describe("the model names every move", () => {
       if (req.move === "choose") { if (n === 5) budget.usd = 1e6; return { move: "strengthen", target: "N1", why: "the alert is unconfirmed" }; }
       // The first strengthen names a move that is not open; the second gives nothing valid.
       return n === 2 ? { evidence: [], reasoning: "r", next: { move: "pivot", target: "B9", why: "x" } } : null;
-    });
+    }, undefined, undefined, choosing);
     expect(reqs.map((r) => r.move)).toEqual(["choose", "strengthen", "choose", "strengthen", "choose", "conclude"]);
     expect(reqs[0]!.maxSearches).toBe(0);
     expect(reqs[0]!.userContent).not.toContain("Your last choice was not used");
@@ -145,7 +192,7 @@ describe("the model names every move", () => {
       if (req.move === "conclude") return conclusion;
       if (n === 7) budget.usd = 1e6;
       return req.move === "choose" ? { move: "branch", target: "N1", why: "what else it led to" } : null;
-    });
+    }, undefined, undefined, choosing);
     const moves = reqs.map((r) => r.move);
     expect(moves.at(-1)).toBe("conclude");
     expect(moves.some((m, i) => m === "choose" && moves[i - 1] === "choose")).toBe(false);
@@ -162,7 +209,7 @@ describe("the model names every move", () => {
       if (req.move === "conclude") return conclusion;
       if (n === 3) budget.usd = 1e6;
       return req.move === "choose" ? { move: "strengthen", target: "N1", why: "the alert is unconfirmed" } : null;
-    }, undefined, (n) => (n === 1 ? "502 failed to execute HTTP request to provider API" : undefined));
+    }, undefined, (n) => (n === 1 ? "502 failed to execute HTTP request to provider API" : undefined), choosing);
     expect(reqs.map((r) => r.move)).toEqual(["choose", "choose", "strengthen", "conclude"]);
     expect(reqs[1]!.userContent).not.toContain("not a valid choice");
     expect(reqs[1]!.userContent).not.toContain("Your last choice was not used");
@@ -177,7 +224,7 @@ describe("the model names every move", () => {
       if (req.move === "conclude") return conclusion;
       if (n === 3) budget.usd = 1e6;
       return req.move === "choose" ? { move: "strengthen", target: "N1", why: "the alert is unconfirmed" } : null;
-    }, undefined, (n) => (n === 1 ? "" : undefined));
+    }, undefined, (n) => (n === 1 ? "" : undefined), choosing);
     expect(reqs.map((r) => r.move)).toEqual(["choose", "choose", "strengthen", "conclude"]);
     expect(reqs[1]!.userContent).not.toContain("not a valid choice");
     expect(reqs[1]!.userContent).toContain("Your last turn was lost to a provider error before your choice was judged");
@@ -190,7 +237,7 @@ describe("the model names every move", () => {
       if (n === 2) return { evidence: [], reasoning: "r", next: { move: "expand", target: "N1", why: "its cause is unknown" } };
       budget.usd = 1e6;
       return { candidates: [], reasoning: "r" };
-    });
+    }, undefined, undefined, choosing);
     expect(reqs.map((r) => r.move)).toEqual(["choose", "strengthen", "expand", "conclude"]);
   });
 
@@ -200,7 +247,7 @@ describe("the model names every move", () => {
       if (req.move === "conclude") return conclusion;
       budget.usd += 30;
       return req.move === "choose" ? { move: "strengthen", target: "N1", why: "the alert is unconfirmed" } : null;
-    });
+    }, undefined, undefined, choosing);
     expect(reqs.map((x) => x.move)).toEqual(["choose", "strengthen", "conclude"]);
     expect(r.exit).toBe("budget-exhausted");
     expect(r.report).toContain("exit **budget-exhausted**");

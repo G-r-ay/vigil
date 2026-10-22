@@ -1,15 +1,5 @@
 [
  {
-  "move": "choose",
-  "correlationId": "N1",
-  "toolCalls": [],
-  "submission": {
-   "move": "strengthen",
-   "target": "N1",
-   "why": "the alerted event is not confirmed yet"
-  }
- },
- {
   "move": "strengthen",
   "correlationId": "N1",
   "toolCalls": [

@@ -4,6 +4,7 @@ import type { AgentConfig } from "./config.js";
 import type { Move } from "./frontier.js";
 import { applyPatch, createGraph, getChildren, type Graph, type GraphPatch } from "./graph.js";
 import { seedFromAlert } from "./orchestrator.js";
+import { forReport } from "./report.js";
 import type { Survey } from "./survey.js";
 import type { TraceEntry } from "./trace.js";
 import type { Alert, ExitReason } from "./types.js";
@@ -20,6 +21,15 @@ export interface SetupPayload {
   alert: Alert;
   index: string;
   range: [string, string];
+  // Where the range came from: the data's own span (data_span, measured by span_query), whole days, or, when that
+  // could not be measured, the alert's window. range_note says how, in words. Absent on ledgers written before.
+  range_source?: "data" | "alert-window";
+  data_span?: [string, string] | null;
+  span_query?: string;
+  range_note?: string;
+  // Set when the frame model's first title for the alert judged the event (the words the loop refuses in an event
+  // label): whether a second ask named it neutrally, or the title was named in code. Absent when it did not.
+  frame_note?: string;
   survey: Survey;
   // The environment map (scope.ts), or null when mapping failed and the run went on without it.
   environment: string | null;
@@ -36,6 +46,8 @@ export interface ExitPayload {
   exit: ExitReason | null; // null: stopped or failed before an exit was reached
   report: string;
   entries: TraceEntry[];
+  failed?: string; // the moves stopped on three failed turns in a row: the last one's error
+  conclude_failed?: string; // the closing conclude turn failed (its error), so the report has no conclusion of the model's
 }
 
 export type V3Kinds = {
@@ -131,8 +143,10 @@ function stepOf(turn: number, entries: readonly TraceEntry[]): V3Step | null {
 const LABEL_MAX = 120;
 const clip = (s: string) => (s.length > LABEL_MAX ? `${s.slice(0, LABEL_MAX - 1)}…` : s);
 
-// The target's label and the nodes and links this turn created, read off the graph it left.
-function describe(step: V3Step, g: Graph): V3Step {
+// The target's label and the nodes and links this turn created, read off the graph it left as the report reads
+// it (forReport): an unverified event's label is the report's, never the model's accusing one.
+function describe(step: V3Step, raw: Graph): V3Step {
+  const g = forReport(raw);
   const edge = g.edges[step.targetId];
   const prediction = (g.theories ?? []).flatMap((t) => t.predictions).find((p) => p.id === step.targetId);
   const target = g.nodes[step.targetId]?.label ?? (edge ? `${edge.source} → ${edge.target}` : prediction?.expect ?? "");
@@ -153,8 +167,9 @@ export function fold(events: readonly AgentEvent<V3Kinds>[]): Folded {
   const out: Folded = { setup: null, graph: null, entries: [], lastTurn: -1, exit: null, report: null, steps: [] };
   for (const event of events) {
     if (event.kind === "rootcause_setup") {
-      out.setup = event.payload;
-      out.graph = seedFromAlert(createGraph(event.run_id), event.payload.alert, event.payload.cfg);
+      // A ledger written before loose was a setting ran loose: it replays, and resumes, the way it ran.
+      out.setup = event.payload.cfg.loose === undefined ? { ...event.payload, cfg: { ...event.payload.cfg, loose: true } } : event.payload;
+      out.graph = seedFromAlert(createGraph(event.run_id), event.payload.alert, out.setup.cfg);
     } else if (event.kind === "rootcause_turn" && out.setup !== null && out.graph !== null) {
       const { turn, rare, entries } = event.payload;
       if (rare !== undefined) out.graph.rare = rare;
