@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { AgentEvent } from "../../../contracts/events.js";
 import { emptyPatch, type GraphPatch, type Prediction } from "../../../plugins/rootcause/v3/graph.js";
 import { fold, type V3Kinds } from "../../../plugins/rootcause/v3/ledger.js";
-import { rootCauseV3Projection } from "../../../plugins/rootcause/v3/projection.js";
+import { rootCauseV3Projection, rootCauseV3Replay } from "../../../plugins/rootcause/v3/projection.js";
 import { renderReport } from "../../../plugins/rootcause/v3/report.js";
 import { MemoryTrace, type TraceEntry } from "../../../plugins/rootcause/v3/trace.js";
 import type { Alert } from "../../../plugins/rootcause/v3/types.js";
@@ -180,5 +180,76 @@ describe("rootcause v3 projection account", () => {
     } as AgentEvent<V3Kinds>);
     const v = rootCauseV3Projection("r1", [events[0]!, call(1, wrap("192 events matched, 0 results (showing 0 of 0)")), call(2, wrap("5,000 events matched, 1,234 results (showing 50 of 1,234)")), call(3, wrap("no count line here"))] as never);
     expect(v.recent_searches.map((s) => s.rows)).toEqual([0, 1234, undefined]);
+  });
+});
+
+// Loose mode: N2 is on the chain although unverified, its link to the alert is inferred, and the one account it was
+// attributed to is ruled out. Turn 2 targets N2, so the decision row names it too.
+function looseJournal() {
+  const events: AgentEvent<V3Kinds>[] = [];
+  let seq = 0;
+  let id = 0;
+  const push = (kind: string, payload: unknown) =>
+    events.push({ run_id: "r2", run_kind: "root_cause", seq: seq++, ts: `2026-05-05T12:00:${String(seq).padStart(2, "0")}Z`, kind, payload: JSON.parse(JSON.stringify(payload)), schema_version: 1 } as AgentEvent<V3Kinds>);
+  const entry = (turn: number, type: string, payload: unknown): TraceEntry => ({ id: `T${String(++id).padStart(6, "0")}`, ts: `2026-05-05T12:00:0${id}Z`, runId: "r2", turn, correlationId: "N1", relatedIds: [], type: type as never, payload });
+  const refuted = [ev("direct", "refutes", ["r9"], "the logon was the attacker's, not alice"), ev("corroborating", "refutes", ["r9b"], "no session for alice")];
+  const patch: GraphPatch = {
+    ...emptyPatch(),
+    addNodes: [
+      node("u", { label: "attacker ran the stolen implant", unverified: true, observedAt: at(8), evidence: solid("r1") }),
+      node("alice", { kind: "actor", label: "ad:alice" }),
+    ],
+    addEdges: [
+      { ...edge("e1", "explains", "u", "N1", solid("r2", "the attacker's implant deleted the catalog")), inferred: true },
+      edge("e2", "attributed-to", "alice", "u", refuted),
+    ],
+  };
+  push("run", { run_kind: "root_cause", spec: { sections: { engine: "rootcause-v3" } } });
+  push("rootcause_setup", { cfg, alert, index: "lab", range: [at(0), at(12)], survey: { text: "", domains: [], sizes: {} }, environment: null });
+  push("rootcause_turn", { turn: 1, entries: [entry(1, "decision", { move: "expand", targetId: "N1", reason: "find the cause" }), entry(1, "graph-patch", { patch, result: { idMap: { u: "N2" } } })] });
+  push("rootcause_turn", { turn: 2, entries: [entry(2, "decision", { move: "expand", targetId: "N2", reason: "go upstream" })] });
+  push("rootcause_exit", { exit: "budget-exhausted", report: "r", entries: [] });
+  return events;
+}
+
+describe("rootcause v3 projection chain, as the report shows it", () => {
+  const events = looseJournal();
+  const view = rootCauseV3Projection("r2", events as never);
+  const folded = fold(events);
+  const md = renderReport(folded.graph!, new MemoryTrace("r2", () => new Date(), folded.entries), "budget-exhausted", alert);
+  const tagged = "[unverified] ran the [unverified] implant (unverified)";
+  const n2 = () => view.steps.find((s) => s.step_id === "N2")!;
+
+  it("labels an unverified event on the chain the way the report does", () => {
+    expect(view.steps.map((s) => s.step_id)).toEqual(["N1", "N2"]);
+    expect(n2().event).toBe(tagged);
+    expect(md).toContain(`**N2** ${tagged}`);
+    expect(JSON.stringify(view.steps)).not.toContain("attacker ran the stolen implant");
+  });
+
+  it("names the same event the same way in the decisions: the turn that created it and the turn that targets it", () => {
+    expect(view.moves[0]!.created).toContainEqual({ id: "N2", kind: "cause", label: tagged });
+    expect(view.moves[1]!).toMatchObject({ targetId: "N2", target: tagged });
+    expect(JSON.stringify(view.moves)).not.toContain("attacker ran the stolen implant");
+  });
+
+  it("words the link as the report does, inferred, not the model's text about it", () => {
+    const step = view.steps.find((s) => s.step_id === "N1")!;
+    expect(step.link).toMatch(/^E\d+ \d\.\d\d \(inferred: no record joins them\)$/);
+    expect(md).toContain(`← link ${step.link}`);
+    expect(step.link).not.toContain("the attacker's implant");
+  });
+
+  it("names nobody as who ran an event when the report exonerates its only account", () => {
+    expect(md).toMatch(/\*\*Exonerated identities\*\*\n\n- ad:alice for N2/);
+    expect(n2().who).toBe("");
+    expect(view.timeline.events.find((e) => e.id === "N2")!.ranAs).toEqual([]);
+  });
+
+  it("replays the chain exactly as the live view shows it", () => {
+    const replay = rootCauseV3Replay("r2", events as never);
+    const replayed = replay.steps.filter((s) => s.kind === "step").map(({ kind: _k, recorded_at: _r, ...step }) => step);
+    expect(replayed).toEqual(view.steps.map(({ proven: _p, ...step }) => step));
+    expect(replay.moves).toEqual(view.moves);
   });
 });

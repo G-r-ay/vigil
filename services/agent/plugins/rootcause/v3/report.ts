@@ -63,6 +63,12 @@ export function forReport(g: Graph): Graph {
   return { ...g, nodes: Object.fromEntries(Object.entries(g.nodes).map(([id, n]) => [id, n.unverified ? { ...n, label: `${n.label.replace(ACCUSE_ALL, "[unverified]")} (unverified)` } : n])) };
 }
 
+// The accounts an event ran as, likeliest first. A ruled-out link is an exonerated account, not one it ran as.
+export const ranAs = (g: Graph, n: GraphNode): string[] => actorsFor(g, n).filter(({ e }) => !e.retired && e.status !== "ruled-out").map(({ actor }) => actor.label);
+
+// A link as the report words it: its id and confidence, and that it is inferred when no record joins its ends.
+export const tieText = (t: { edgeId: string; confidence: number; inferred: boolean }) => `${t.edgeId} ${pct(t.confidence)}${t.inferred ? " (inferred: no record joins them)" : ""}`;
+
 export interface ActorRef { id: string; label: string; status: string; confidence: number; disputed: boolean }
 export interface AccountRow { name: string; role: "attacker" | "victim" | "legitimate"; usedBy?: string[]; seenAs?: string[] }
 export interface EvidenceRow { polarity: string; strength: string; source: string; summary: string; turn: number; refs: string[] }
@@ -162,8 +168,8 @@ export function reportRows(g: Graph, chronological: readonly TraceEntry[], raw =
   const seenAs = new Set<string>(); // domains the unnamed operators' descriptions mention
   for (const a of Object.values(g.nodes).filter((x) => x.kind === "actor" && !NAMED.test(x.label))) for (const d of a.label.match(DOMAIN) ?? []) seenAs.add(d.toLowerCase());
   for (const n of Object.values(g.nodes).filter((x) => x.kind === "action" && x.status !== "ruled-out" && (raw || !x.unverified))) {
-    const ranAs = actorsFor(g, n).filter(({ e }) => live(e)).map(({ actor }) => actor.label);
-    const ops = [...new Set(actorsFor(g, n, "operated-by").filter(({ e }) => live(e) && e.confidence >= 0.5).map(({ actor }) => actor.label).filter((o) => !ranAs.includes(o)).map(opName))];
+    const as = ranAs(g, n);
+    const ops = [...new Set(actorsFor(g, n, "operated-by").filter(({ e }) => live(e) && e.confidence >= 0.5).map(({ actor }) => actor.label).filter((o) => !as.includes(o)).map(opName))];
     ops.forEach((o) => attackers.add(o));
     for (const { e, actor } of actorsFor(g, n)) if (live(e) && ops.some((o) => o !== actor.label)) ops.forEach((o) => o !== actor.label && (operators.get(actor.label) ?? operators.set(actor.label, new Set()).get(actor.label)!).add(o));
   }
@@ -233,9 +239,9 @@ export function reportRows(g: Graph, chronological: readonly TraceEntry[], raw =
 
   // Incident timeline: every event that is not ruled out, in time order, on or off the chain.
   const timeline = [...acts].sort((a, b) => (a.observedAt ?? "~").localeCompare(b.observedAt ?? "~")).map((n): TimelineRow => {
-    const ranAs = actorsFor(g, n).filter(({ e }) => live(e)).map(({ actor }) => actor.label);
-    const operatedBy = actorsFor(g, n, "operated-by").filter(({ e }) => live(e) && e.confidence >= 0.5).map(({ actor }) => actor.label).filter((o) => !ranAs.includes(o));
-    return { id: n.id, label: n.label, status: n.status, confidence: n.confidence, domain: n.domain, ...(n.observedAt ? { observedAt: n.observedAt } : {}), onChain: !!path?.nodeIds.includes(n.id), legitimate: !!n.legitimate, ranAs, operatedBy };
+    const as = ranAs(g, n);
+    const operatedBy = actorsFor(g, n, "operated-by").filter(({ e }) => live(e) && e.confidence >= 0.5).map(({ actor }) => actor.label).filter((o) => !as.includes(o));
+    return { id: n.id, label: n.label, status: n.status, confidence: n.confidence, domain: n.domain, ...(n.observedAt ? { observedAt: n.observedAt } : {}), onChain: !!path?.nodeIds.includes(n.id), legitimate: !!n.legitimate, ranAs: as, operatedBy };
   });
 
   // Other findings: events off the best path that are not ruled out.
@@ -343,7 +349,7 @@ export function renderReport(g0: Graph, trace: TraceWriter, exit: ExitReason | n
   else {
     out.push(`Root-cause chain, symptom first (path score ${pct(rows.chain.score)}):`, "");
     [...rows.chain.events].reverse().forEach((n, i) => {
-      const link = n.tie ? ` ← link ${n.tie.edgeId} ${pct(n.tie.confidence)}${n.tie.inferred ? " (inferred: no record joins them)" : ""}` : "";
+      const link = n.tie ? ` ← link ${tieText(n.tie)}` : "";
       const label = n.boundary ? `[open boundary] cause of ${n.boundary.originNodeId} believed to be in ${n.boundary.targetDomain}: ${n.boundary.reason ?? ""}` : n.label;
       out.push(`${i + 1}. **${n.id}** ${label} — ${n.status} ${pct(n.confidence)}${n.observedAt ? ` @ ${n.observedAt}` : ""} (${n.domain})${n.isRoot ? " **ROOT CAUSE**" : ""}${n.legitimate && !raw ? " *(legitimate activity, not the attacker)*" : ""}${link}`);
       if (n.rootJustification) out.push(`   - why root: ${n.rootJustification}`);
