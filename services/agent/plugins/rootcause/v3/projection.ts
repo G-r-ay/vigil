@@ -8,7 +8,8 @@ import type { Proof, StepPayload } from "../proof.js";
 import { bestPathFromSymptom, type Graph, type GraphEdge } from "./graph.js";
 import { fold, type V3Kinds, type V3Step } from "./ledger.js";
 import { correction, neverRan } from "./tools/registry.js";
-import { disposition, forReport, ranAs, reportRows, tieText, unconfirmedNote, type AccountRow, type ChainEvent, type Rejected, type ReportRows, type TimelineRow } from "./report.js";
+import { disposition, forReport, ranAs, redactDeep, reportRows, tieText, unconfirmedNote, type AccountRow, type ChainEvent, type Rejected, type ReportRows, type TimelineRow } from "./report.js";
+import { unlinked, type Unlinked } from "./unlinked.js";
 
 // A v3 run in the shape the console already reads a root-cause run in: its chain as
 // steps, symptom first, each tied to the event before it. Beside that, the run's own
@@ -49,8 +50,9 @@ const proofOf = (x: { status: string } | undefined): Proof =>
 
 // The chain as report.md shows it: labels as forReport tags them (an unverified event says so), who it ran as
 // as the report's timeline names it (a ruled-out account is exonerated, not who ran it), and each link worded as
-// the report words it (inferred when no record joins its ends), never the model's own text about the link.
-function chainOf(raw: Graph): StepPayload[] {
+// the report words it (inferred when no record joins its ends), never the model's own text about the link. Names the
+// alert's proven chain does not reach are redacted as the report redacts them (unlinked.ts).
+function chainOf(raw: Graph, red: Unlinked = unlinked(forReport(raw))): StepPayload[] {
   const g = forReport(raw);
   const path = bestPathFromSymptom(g);
   if (path === null) return [];
@@ -58,7 +60,7 @@ function chainOf(raw: Graph): StepPayload[] {
     const node = g.nodes[id]!;
     const tie: GraphEdge | undefined = path.edgeIds[i] === undefined ? undefined : g.edges[path.edgeIds[i]!];
     const artifact = node.artifacts[0];
-    return {
+    const step: StepPayload = {
       step_id: id,
       event: node.label,
       who: ranAs(g, node)[0] ?? "",
@@ -70,6 +72,7 @@ function chainOf(raw: Graph): StepPayload[] {
       link_status: proofOf(tie),
       origin_status: node.isRoot === true ? proofOf(node) : "none",
     };
+    return node.legitimate ? step : redactDeep(step, red);
   });
 }
 
@@ -112,15 +115,17 @@ export function rootCauseV3Projection(runId: string, events: readonly AgentEvent
     }
   }
   const g = folded.graph === null ? null : forReport(folded.graph);
+  // One redactor for every part of the account, as the report has one (report.md itself was redacted when written).
+  const red = g === null ? undefined : unlinked(g);
   // Null while the run is in flight. The word is the report's own rule, including when the exit
   // arrived before a graph did: root-cause-found and false-positive need none.
   const verdict = disposition(g, folded.exit);
   // The trace as the report reads it: by ts, then id (the journal holds it in the order it was written).
-  const rows = g === null ? null : reportRows(g, [...folded.entries].sort((a, b) => a.ts.localeCompare(b.ts) || a.id.localeCompare(b.id)));
+  const rows = g === null ? null : reportRows(g, [...folded.entries].sort((a, b) => a.ts.localeCompare(b.ts) || a.id.localeCompare(b.id)), false, red);
   const rejected = rows?.conclusion?.rejected ?? [];
   // The model's root cause only when the graph holds up its conclusion; else the node the graph itself marks as root.
   const named = g === null ? undefined : (rejected.length ? undefined : g.nodes[rows?.conclusion?.rootCause?.id ?? ""]) ?? Object.values(g.nodes).find((n) => n.isRoot && n.status !== "ruled-out");
-  const steps = (folded.graph === null ? [] : chainOf(folded.graph)).map((step) => ({ ...step, proven: step.link_status === "proven" || (step.origin && step.origin_status === "proven") }));
+  const steps = (folded.graph === null ? [] : chainOf(folded.graph, red)).map((step) => ({ ...step, proven: step.link_status === "proven" || (step.origin && step.origin_status === "proven") }));
   return {
     run_id: runId,
     run_kind: "root_cause",
@@ -145,7 +150,7 @@ export function rootCauseV3Projection(runId: string, events: readonly AgentEvent
       alert: folded.setup === null ? null : { id: folded.setup.alert.id, title: folded.setup.alert.title, observedAt: folded.setup.alert.observedAt },
       disposition: verdict.sentence,
       exit: folded.exit,
-      root_cause: named === undefined ? null : { id: named.id, label: named.label, ...(named.rootJustification ? { justification: named.rootJustification } : {}) },
+      root_cause: named === undefined ? null : redactDeep({ id: named.id, label: named.label, ...(named.rootJustification ? { justification: named.rootJustification } : {}) }, red!, () => !!named.legitimate),
       conclusion: rows.conclusion && { text: rejected.length ? `${unconfirmedNote(rejected)}\n\n${rows.conclusion.text}` : rows.conclusion.text, chain: rows.conclusion.chain, unconfirmed: rejected.length > 0, rejected },
       accounts: rows.accounts,
     },

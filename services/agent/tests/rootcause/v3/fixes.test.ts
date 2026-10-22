@@ -131,7 +131,8 @@ describe("victim accounts and dead ends", () => {
     const { renderReport } = await import("../../../plugins/rootcause/v3/report.js");
     const { MemoryTrace } = await import("../../../plugins/rootcause/v3/trace.js");
     const g = seeded();
-    apply(g, { addNodes: [node("repl", { label: "directory replication using alice's stolen credentials", evidence: [ev("direct", "supports", ["d1"])] })] });
+    // Linked to the alert by a proven link: the chain reaches alice, so the report may name her (unlinked.ts).
+    apply(g, { addNodes: [node("repl", { label: "directory replication using alice's stolen credentials", evidence: [ev("direct", "supports", ["d1"]), ev("direct", "supports", ["d3"])] })], addEdges: [{ tempId: "e", kind: "explains", source: "repl", target: "N1", prior: 0.3, evidence: [ev("direct", "supports", ["d2"]), ev("direct", "supports", ["d4"])] }] });
     apply(g, buildAttributionPatch("N2", [
       { layer: "machine-facing", relation: "ran-as", kind: "account", value: "alice", toolCallIds: ["r1"] },
       { layer: "machine-facing", relation: "operated-by", kind: "operator", value: "evil.test operator", toolCallIds: ["r2"] },

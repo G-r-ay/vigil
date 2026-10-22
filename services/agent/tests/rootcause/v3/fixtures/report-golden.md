@@ -4,6 +4,8 @@ Run t · alert a at 2026-04-02T00:00:00Z · exit **null**
 
 **Disposition:** True Positive (root cause not fully confirmed): 2 confirmed upstream event(s) explain the alert.
 
+**Unlinked names:** 1 identity was named without a proven link to the alert and is shown as [unlinked actor] (an address as [unlinked address]) or left out of the indicators.
+
 **Accounts**
 
 - the attacker (an operator the logs do not name): attacker (operated the malicious actions)
@@ -39,7 +41,7 @@ Root-cause chain, symptom first (path score 0.79):
 ## Incident timeline
 
 - time unknown · **N1** symptom — confirmed 0.88 (edr) · chain
-- 2026-04-01T09:00:00Z · **N4** connection from 203.0.113.5 to host-c3 — confirmed 0.98 (edr)
+- 2026-04-01T09:00:00Z · **N4** connection from [unlinked address] to host-c3 — confirmed 0.98 (edr)
 - 2026-04-01T10:00:00Z · **N2** devuser applied a config from 192.0.2.7 — confirmed 0.95 (edr) · chain · legitimate activity · ran as devuser
 - 2026-04-01T11:00:00Z · **N3** calendar entry deleted on host-b7 using j.doe's stolen session — confirmed 0.98 (edr) · chain · ran as j.doe, operated by intruder via the stolen session
 
@@ -61,7 +63,7 @@ Root-cause chain, symptom first (path score 0.79):
 
 ## Other findings (off the main chain)
 
-- **N4** connection from 203.0.113.5 to host-c3 — confirmed 0.98 @ 2026-04-01T09:00:00Z (edr): direct supports
+- **N4** connection from [unlinked address] to host-c3 — confirmed 0.98 @ 2026-04-01T09:00:00Z (edr): direct supports
 
 ## Established by targeted searches
 

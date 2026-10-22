@@ -33,6 +33,9 @@ export interface TurnRequest {
   minCount?: number; // mapping mode for the search tool
   maxPerBatch?: number; // searches run per model response; the rest wait for the results
   model?: string; // a model of its own for this move (scope's, a refusal's fallback); the spec's when unset
+  // A check of the move's own over an answer that passed the schema and the move's check: its message sends the
+  // answer back once, as a correction; after that the answer stands (conclude: names the proven chain does not reach).
+  gate?: (answer: unknown) => string | null;
   trace: TurnTrace;
 }
 
@@ -340,6 +343,7 @@ export class KernelModelClient implements ModelClient {
     const cx: CheckCtx = { inputOf: tools.inputOf?.bind(tools), range: this.d.range, loose: cfg.loose };
     // Keys the answers' schema has no field for, dropped before the kernel held them to it.
     const stripped = new Set<string>();
+    let gated = false;
     let outcome: Outcome<unknown> | undefined;
     let failure: unknown;
     try {
@@ -362,7 +366,10 @@ export class KernelModelClient implements ModelClient {
         check: async (answer) => {
           await this.sync(before);
           const v = check(req.submitTool, answer, tools, cx);
-          return v.success ? null : v.msg;
+          if (!v.success) return v.msg;
+          const sent = gated ? null : req.gate?.(v.data) ?? null;
+          if (sent !== null) { gated = true; req.trace.write("reasoning", { sentBack: sent }); }
+          return sent;
         },
         corrections: CORRECTIONS,
         // As the reference's zod parses a submission: a key its schema has no field for is dropped, not sent back.
@@ -469,6 +476,13 @@ export class ScriptedModelClient implements ModelClient {
     const submission = stripUnknown(SUBMIT[req.submitTool], clip(raw)).value;
     const bad = schemaErrors(SUBMIT[req.submitTool], submission);
     if (bad) { req.trace.write("rejected-submission", { input: raw, error: bad }); return { submission: null, toolCalls }; }
+    // The gate sends the answer back once: the script's next entry for the same move and target is the corrected one.
+    const sent = req.gate?.(submission) ?? null;
+    if (sent !== null && this.script.some((x, j) => !this.used.has(j) && x.move === req.move && x.correlationId === req.correlationId)) {
+      req.trace.write("reasoning", { sentBack: sent });
+      const again = await this.runTurn({ ...req, gate: undefined });
+      return { ...again, toolCalls: [...toolCalls, ...again.toolCalls] };
+    }
     req.trace.write("submission", { tool: req.submitTool, submission });
     return { submission, toolCalls };
   }
