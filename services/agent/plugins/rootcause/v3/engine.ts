@@ -18,7 +18,7 @@ import { correction, neverRan, Registry, type Journal } from "./tools/registry.j
 import { sourceFor, UnsupportedSource, type DataSpan, type Invoke, type SourceAdapter } from "./tools/source.js";
 import { splunkAdapter } from "./tools/splunk-source.js";
 import { MemoryTrace } from "./trace.js";
-import type { Deps, ExitReason } from "./types.js";
+import type { Deps, ExitReason, RunResult } from "./types.js";
 
 // The v3 loop as a worker run: it opens and journals its own ledger, every move one kernel turn billed to the
 // run's pool, searches through the run's bound telemetry tool, and resumes from what it journaled. The kernel
@@ -40,6 +40,8 @@ export interface V3Options {
   stop?: StopSource;
   adapters?: readonly SourceAdapter[];
   log?: (line: string) => void;
+  // The wait before a move lost to the network runs again (the loop's own, 30s, when unset).
+  retryWaitMs?: number;
 }
 
 export interface V3Report {
@@ -210,6 +212,7 @@ async function drive(
   const fresh = folded.lastTurn < 0;
   let exit: ExitReason | null = null;
   let report: string;
+  let ended: Pick<RunResult, "failed" | "cut" | "concludeFailed">;
   try {
     const result = await run(alert, cfg, deps, {
       runId: run_id,
@@ -219,6 +222,8 @@ async function drive(
       startTurn: Math.max(1, folded.lastTurn + 1),
       signal,
       log,
+      cutoff: spentOut,
+      ...(options.retryWaitMs === undefined ? {} : { retryWaitMs: options.retryWaitMs }),
       onTurn: async (g, turn) => {
         turnNow = turn + 1;
         if (turn === 0 && !fresh) return;
@@ -227,6 +232,7 @@ async function drive(
     });
     exit = result.exit;
     report = result.report;
+    ended = result;
   } catch (error) {
     // What the run found so far is the report, however it stopped.
     // A run the pool cut off ends budget-exhausted; a stop or a failure has no exit.
@@ -238,9 +244,17 @@ async function drive(
     if (spentOut(error)) return end("budget_exhausted", error.message, conclusionOf(written));
     return end("failed", error instanceof Error ? error.message : String(error), conclusionOf(written));
   }
-  await state.append(run_id, [event("rootcause_exit", { exit, report, entries: trace.drain() })]);
+  // A closing turn that failed leaves the report without the model's conclusion: the exit says so.
+  await state.append(run_id, [event("rootcause_exit", {
+    exit, report, entries: trace.drain(),
+    ...(ended.failed === undefined ? {} : { failed: ended.failed }),
+    ...(ended.concludeFailed === undefined ? {} : { conclude_failed: ended.concludeFailed }),
+  })]);
+  const summary = conclusionOf(report);
+  if (ended.failed !== undefined) return end("failed", `three turns in a row failed: ${ended.failed}`, summary);
+  if (ended.cut !== undefined && exit === "budget-exhausted") return end("budget_exhausted", ended.cut, summary);
   const outcome: RunOutcome = exit === "budget-exhausted" ? "budget_exhausted" : "completed";
-  return end(outcome, `the trace ended: ${exit}`, conclusionOf(report));
+  return end(outcome, `the trace ended: ${exit}`, summary);
 }
 
 const argsOf = (raw: string): unknown => { try { return JSON.parse(raw); } catch { return {}; } };
