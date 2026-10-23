@@ -29,7 +29,7 @@ from core.auth.auth_service import (
     _is_service_account,
     password_matches_any,
 )
-from core.auth.bootstrap_code import setup_code_matches
+from core.auth.bootstrap_code import has_human_user, setup_code_matches
 from core.auth.password_reset import (
     generate_reset_token,
     reset_link,
@@ -294,16 +294,6 @@ def _open_sign_in(session: Session, sid: str, user: User) -> Optional[SignIn]:
     return row
 
 
-def _has_any_user(session: Session) -> bool:
-    # A service account (Medic's gateway) can't sign anyone in, so it must not
-    # close bootstrap: enabling Medic before the first sign-in would otherwise
-    # leave the install with no way to make an admin.
-    return (
-        session.query(User.user_id).filter(User.service_account.is_(False)).first()
-        is not None
-    )
-
-
 def _user_payload(user: User, session: Session) -> dict:
     """User dict plus resolved permissions — the shape the SPA gates on.
     Login/refresh must include it, not just /me: the client stores the user
@@ -321,7 +311,7 @@ def bootstrap_status(session: UnitOfWorkSession):
     an instance with an empty user table cannot be signed into at all. The
     login screen asks this to offer first-account creation instead.
     """
-    return BootstrapStatusResponse(required=not _has_any_user(session))
+    return BootstrapStatusResponse(required=not has_human_user(session))
 
 
 @router.post("/bootstrap", status_code=status.HTTP_201_CREATED)
@@ -346,7 +336,7 @@ def bootstrap_admin(
         text("SELECT pg_advisory_xact_lock(:key)"), {"key": _BOOTSTRAP_LOCK}
     )
 
-    if _has_any_user(session):
+    if has_human_user(session):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="An account already exists. Ask an administrator to create yours.",

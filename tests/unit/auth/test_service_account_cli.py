@@ -271,7 +271,6 @@ def test_a_service_account_does_not_close_first_admin_bootstrap():
     _run("ensure", NAME)
 
     with unit_of_work() as session:
-        assert auth_router._has_any_user(session) is False
         assert auth_router.bootstrap_status(session).required is True
 
     AuthService.create_user(
@@ -282,7 +281,7 @@ def test_a_service_account_does_not_close_first_admin_bootstrap():
         role_id="role-viewer",
     )
     with unit_of_work() as session:
-        assert auth_router._has_any_user(session) is True
+        assert auth_router.bootstrap_status(session).required is False
 
 
 def test_ensure_undoes_what_a_stolen_session_could_change():
