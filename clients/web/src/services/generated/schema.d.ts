@@ -2975,29 +2975,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/conversations/import": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Import Conversations
-         * @description One-time best-effort import of browser localStorage history.
-         *
-         *     Idempotent — conversations whose id already exists are skipped. Returns
-         *     ``{"imported": n, "skipped": m}``.
-         */
-        post: operations["post_api_conversations_import"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/conversations/{conversation_id}": {
         parameters: {
             query?: never;
@@ -9230,19 +9207,6 @@ export interface components {
         IOCBulkAdd: {
             /** Iocs */
             iocs: {
-                [key: string]: unknown;
-            }[];
-        };
-        /**
-         * ImportConversationsRequest
-         * @description POST /import body — best-effort bulk import of localStorage history.
-         */
-        ImportConversationsRequest: {
-            /**
-             * Conversations
-             * @default []
-             */
-            conversations: {
                 [key: string]: unknown;
             }[];
         };
@@ -16587,41 +16551,6 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    post_api_conversations_import: {
-        parameters: {
-            query?: never;
-            header?: {
-                authorization?: string | null;
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ImportConversationsRequest"];
-            };
-        };
         responses: {
             /** @description Successful Response */
             200: {
