@@ -8565,8 +8565,6 @@ export interface components {
         };
         /** CustomWorkflowCreate */
         CustomWorkflowCreate: {
-            /** Created By */
-            created_by?: string | null;
             /** Description */
             description: string;
             /** Name */
@@ -11281,8 +11279,6 @@ export interface components {
         WorkflowRunCancelRequest: {
             /** Reason */
             reason: string;
-            /** Rejected By */
-            rejected_by?: string | null;
         };
         /**
          * WorkflowRunResumeRequest
