@@ -359,6 +359,22 @@ describe('TriageScreen', () => {
     expect(screen.queryByText(/records omitted/)).not.toBeInTheDocument()
   })
 
+  it('shows the hypothesis of a scheduled hunt', async () => {
+    const base = payload()
+    const hunt = {
+      ...base.rows[1],
+      id: 3,
+      kind: 'schedule',
+      kind_label: 'Schedule',
+      source: 'Schedule',
+      document: 'Hunt for T1059 on build hosts',
+    }
+    vi.mocked(triageApi.get).mockResolvedValue({ data: { ...base, rows: [hunt] } } as never)
+    renderScreen()
+    await screen.findByLabelText('Intake strip')
+    expect(screen.getByText('Hunt for T1059 on build hosts')).toBeInTheDocument()
+  })
+
   it('shows the loading state', async () => {
     vi.mocked(triageApi.get).mockReturnValue(new Promise(() => {}) as never)
     renderScreen()
