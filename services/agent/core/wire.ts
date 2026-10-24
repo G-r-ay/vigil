@@ -1,6 +1,6 @@
 import { SpanKind } from "@opentelemetry/api";
 import OpenAI from "openai";
-import type { TokenCounts } from "../contracts/budget.js";
+import { ZERO_TOKENS, type TokenCounts } from "../contracts/budget.js";
 import { estimateTokens, Limiter, statusOf } from "./limiter.js";
 import {
   ModelRefused,
@@ -425,8 +425,17 @@ class OpenAiSurface implements Provider {
 
   private async send(body: Body, cap: OutputCap, signal?: AbortSignal): Promise<OpenAI.Chat.ChatCompletion> {
     let wasted: TokenCounts = { input: 0, output: 0, cache_read: 0, cache_write: 0 };
+    // A cancel mid-retry still owes what the empty replies before it burned.
+    const cancelled = (error: unknown): unknown => {
+      if (signal?.aborted !== true || wasted.input + wasted.output === 0) return error;
+      const burned = error instanceof ProviderError ? error.tokens : ZERO_TOKENS;
+      const tokens = { ...burned, input: burned.input + wasted.input, output: burned.output + wasted.output };
+      return new ProviderError(error instanceof Error ? error.message : String(error), tokens);
+    };
     for (let attempt = 0; ; attempt += 1) {
-      const { response, reported } = await this.sendOnce(body, cap, signal);
+      const { response, reported } = await this.sendOnce(body, cap, signal).catch((error: unknown) => {
+        throw cancelled(error);
+      });
       const finish: string | undefined = response.choices[0]?.finish_reason;
       if (finish === "refusal" || finish === "content_filter") {
         throw new ModelRefused(`the model refused to answer (finish_reason=${finish}) from ${this.wire_model}`, tokensOf(plus(response.usage, wasted)));
@@ -447,7 +456,9 @@ class OpenAiSurface implements Provider {
         throw new ModelSilent(`the model stopped answering: ${attempt + 1} empty replies in a row from ${this.wire_model}`, wasted);
       }
       log.warn("model returned an empty reply, asking again", { model: this.wire_model, attempt: attempt + 1, pause_ms: pause });
-      await pauseFor(pause, signal);
+      await pauseFor(pause, signal).catch((error: unknown) => {
+        throw cancelled(error);
+      });
     }
   }
 
@@ -485,8 +496,12 @@ class OpenAiSurface implements Provider {
         }
         const response = await assemble(stream);
         reported = response.usage !== undefined;
-        return response.usage === undefined ? { ...response, usage: guessed(estimate, response) } : response;
-      });
+        const usage = response.usage ?? guessed(estimate, response);
+        // The SDK ends a stream aborted mid-body as if it had finished. A cut-off answer
+        // is not one, but what it burned before the cut is still spend.
+        if (signal?.aborted === true) throw new ProviderError(`the call was cancelled: ${String(signal.reason)}`, tokensOf(usage));
+        return { ...response, usage };
+      }, signal);
       const tokens = tokensOf(response.usage);
       span.setAttributes({
         "gen_ai.response.model": response.model,

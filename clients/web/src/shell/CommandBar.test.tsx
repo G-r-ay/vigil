@@ -1,14 +1,15 @@
-import { useState, type ComponentProps } from 'react'
+import type { ComponentProps } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom'
+import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import CommandBar from './CommandBar'
 import CaseDrawer from './CaseDrawer'
+import { heldCase, holdCase } from './heldCase'
 import { ToastProvider } from './toast'
 import type { BoardLink } from './commandBarModel'
 import shellCss from './shell.css?inline'
 
-const { execute, createCase, deleteCase, readDoc, checkCoverage, attachDocument, getCase, getFinding, findFindings, getIntegrations, apiGet, apiPost } = vi.hoisted(() => ({
+const { execute, createCase, deleteCase, readDoc, checkCoverage, attachDocument, getCase, getFinding, findFindings, getIntegrations, exportJira, apiGet } = vi.hoisted(() => ({
   execute: vi.fn((..._args: unknown[]) => Promise.resolve({ data: {} })),
   createCase: vi.fn((..._args: unknown[]) => Promise.resolve({ data: { case_id: 'case-new' } })),
   deleteCase: vi.fn((..._args: unknown[]) => Promise.resolve({ data: {} })),
@@ -19,8 +20,8 @@ const { execute, createCase, deleteCase, readDoc, checkCoverage, attachDocument,
   getFinding: vi.fn(),
   findFindings: vi.fn(),
   getIntegrations: vi.fn(),
+  exportJira: vi.fn(),
   apiGet: vi.fn(),
-  apiPost: vi.fn(),
 }))
 
 vi.mock('../contexts/AuthContext', () => ({
@@ -43,6 +44,7 @@ vi.mock('../services/api', () => ({
     create: (data: unknown) => createCase(data),
     delete: (id: string) => deleteCase(id),
     attachDocument: (id: string, file: File, opts: unknown) => attachDocument(id, file, opts),
+    exportJira: (id: string, projectKey: string) => exportJira(id, projectKey),
     getSLA: () => Promise.resolve({ data: {} }),
     getRecord: () => Promise.resolve({ data: { rows: [], run_id: null, investigation_id: null } }),
     getComments: () => Promise.resolve({ data: { comments: [] } }),
@@ -66,7 +68,6 @@ vi.mock('../services/api', () => ({
     get: vi.fn(() => Promise.resolve({ data: { messages: [] } })),
     update: vi.fn(() => Promise.resolve({ data: {} })),
     delete: vi.fn(),
-    importHistory: vi.fn(() => Promise.resolve({ data: {} })),
   },
   reasoningApi: {
     getSessionSummary: vi.fn(() => Promise.resolve(null)),
@@ -88,7 +89,6 @@ vi.mock('../services/api', () => ({
   },
   default: {
     get: (path: string, config?: unknown) => apiGet(path, config),
-    post: (path: string, body?: unknown) => apiPost(path, body),
   },
 }))
 
@@ -119,8 +119,10 @@ const tags = () => screen.getAllByRole('option').map((o) => o.querySelector('.vg
 const sections = () => screen.getAllByRole('group').map((g) => g.getAttribute('aria-label'))
 
 function Shell() {
-  const [caseId, setCaseId] = useState<string | null>(null)
   const location = useLocation()
+  const navigate = useNavigate()
+  const caseId = heldCase(location.state)
+  const setCaseId = (id: string | null) => navigate(location, { replace: true, state: holdCase(location.state, id) })
   return (
     <>
       <div data-testid="where">{location.pathname}{location.search}</div>
@@ -144,7 +146,7 @@ beforeEach(() => {
   attachDocument.mockReset()
   attachDocument.mockResolvedValue({ data: {} })
   createCase.mockResolvedValue({ data: { case_id: 'case-new' } })
-  apiPost.mockReset()
+  exportJira.mockReset()
   getIntegrations.mockResolvedValue({ data: { enabled_integrations: [], integrations: {}, secrets_set: {} } })
   getCase.mockImplementation((id: string) => {
     if (id === 'case') return Promise.resolve({ data: { case_id: 'case', title: 'Exact case', priority: 'high', status: 'open', finding_ids: [] } })
@@ -529,10 +531,9 @@ describe('CommandBar', () => {
     }
     await runCommand('/investigate f-1', 'Started Incident response workflow')
     await runCommand('/hunt rare beacon', 'Hunt started on case "rare beacon"')
-    apiPost.mockResolvedValueOnce({ data: { success: true, issue_key: 'SOC-12' } })
+    exportJira.mockResolvedValueOnce('Created SOC-12')
     await runCommand('/ticket case-9', 'Created SOC-12')
-    apiPost.mockResolvedValueOnce({ data: { success: true } })
-    await runCommand('/ticket case-9', 'Ticket created')
+    expect(exportJira).toHaveBeenCalledWith('case-9', 'SOC')
   })
 
   it('opens the case drawer from /replay, expands to the cases route, and closes in place', async () => {
@@ -691,6 +692,8 @@ describe('CommandBar', () => {
         fireEvent.change(screen.getByLabelText('Intelligence text'), { target: { value: REPORT } })
         fireEvent.click(screen.getByRole('button', { name: 'Attach text' }))
         expect(await screen.findByText('Pasted text')).toBeInTheDocument()
+        // The name shows while the text is still being read; Run only carries it once read.
+        expect(await screen.findByText('3 pages')).toBeInTheDocument()
         fireEvent.click(screen.getByRole('button', { name: 'Run' }))
         await waitFor(() => expect(attachDocument).toHaveBeenCalled())
         expect(attachDocument.mock.calls[0][2]).toEqual({ name: 'Pasted text', pages: 3 })

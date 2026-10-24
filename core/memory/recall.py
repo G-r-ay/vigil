@@ -55,9 +55,12 @@ from sqlalchemy import bindparam, text
 from sqlalchemy.dialects.postgresql import ARRAY as PGArray
 from sqlalchemy.orm import Session
 
-from core.memory.entity_keys import normalise_keys
+from core.agents.attribution import column_present, current_claims
+from core.agents.mcp_tools import MCPFailure
+from core.memory.entity_keys import normalise_key, normalise_keys
 from core.memory.recall_contract import (
     DROPPED_KINDS,
+    ENTITY_KEY_TYPES,
     RECALL_IGNORED_ARGS,
     RECALL_KEY_ARGS,
     RECALL_ORDER,
@@ -185,8 +188,29 @@ _LOG_READ = text("""
          CAST(:row_counts AS jsonb), CAST(:dropped AS jsonb), CAST(:ranking AS jsonb))
     """).bindparams(bindparam("keys", type_=PGArray(SAText)))
 
+_LOG_READ_PRINCIPAL = text("""
+    INSERT INTO episodic_read_log
+        (caller_kind, caller_id, caller_principal_id, keys, as_of,
+         row_counts, dropped, ranking)
+    VALUES
+        (:caller_kind, :caller_id, :caller_principal_id, CAST(:keys AS text[]), :as_of,
+         CAST(:row_counts AS jsonb), CAST(:dropped AS jsonb), CAST(:ranking AS jsonb))
+    """).bindparams(bindparam("keys", type_=PGArray(SAText)))
+
 
 _EXPIRE_READ_LOG = text("DELETE FROM episodic_read_log WHERE ts < :cutoff")
+
+_has_caller_principal: Optional[bool] = None
+
+
+def _caller_principal_column(session: Session) -> bool:
+    """Cached: a process started before the revision does not grow the column."""
+    global _has_caller_principal
+    if _has_caller_principal is None:
+        _has_caller_principal = column_present(
+            session, "episodic_read_log", "caller_principal_id"
+        )
+    return _has_caller_principal
 
 
 def _iso(value: Any) -> Any:
@@ -196,14 +220,8 @@ def _iso(value: Any) -> Any:
     return value
 
 
-# What tools_router._is_bad_arguments matches on, so a mistake the caller can fix
-# comes back as invalid_args and not backend_error -- the contract keeps "the call
-# was wrong" apart from "the tool could not answer", and only the first tells the
-# model to try again. Coupling to the router's wording is fragile in both
-# directions; it is the router's contract, and stating it once here is better than
-# two error classes for two spellings of the same caller mistake.
-def _refuse(detail: str) -> TypeError:
-    return TypeError(f"{RECALL_TOOL}: {detail} (required keyword-only argument)")
+def _refuse(detail: str) -> MCPFailure:
+    return MCPFailure("invalid_args", f"{RECALL_TOOL}: {detail}")
 
 
 def _as_of(raw: Any) -> datetime:
@@ -398,6 +416,7 @@ def _log(
     as_of: datetime,
     caller_kind: str,
     caller_id: str,
+    caller_principal_id: Optional[str] = None,
 ) -> None:
     """Record that the read happened, whoever asked.
 
@@ -407,18 +426,20 @@ def _log(
     nobody made. A failure here means the table is gone or the database is down,
     in which case the query above would not have answered either.
     """
-    session.execute(
-        _LOG_READ,
-        {
-            "caller_kind": caller_kind,
-            "caller_id": caller_id,
-            "keys": list(result["keys"]),
-            "as_of": as_of,
-            "row_counts": json.dumps({kind: len(result[kind]) for kind in KINDS}),
-            "dropped": json.dumps(result["dropped"]),
-            "ranking": json.dumps(result["ranking"]),
-        },
-    )
+    params = {
+        "caller_kind": caller_kind,
+        "caller_id": caller_id,
+        "keys": list(result["keys"]),
+        "as_of": as_of,
+        "row_counts": json.dumps({kind: len(result[kind]) for kind in KINDS}),
+        "dropped": json.dumps(result["dropped"]),
+        "ranking": json.dumps(result["ranking"]),
+    }
+    statement = _LOG_READ
+    if caller_principal_id and _caller_principal_column(session):
+        params["caller_principal_id"] = caller_principal_id
+        statement = _LOG_READ_PRINCIPAL
+    session.execute(statement, params)
 
 
 def recall(
@@ -427,6 +448,7 @@ def recall(
     as_of: Any = None,
     caller_kind: str = UNKNOWN_CALLER,
     caller_id: str = UNKNOWN_CALLER,
+    caller_principal_id: Optional[str] = None,
     session: Optional[Session] = None,
 ) -> Dict[str, Any]:
     """What is remembered about these entities, and a log row saying it was asked.
@@ -471,7 +493,7 @@ def recall(
 
             _attach_sources(db, kept["verdicts"])
 
-        _log(db, result, moment, caller_kind, caller_id)
+        _log(db, result, moment, caller_kind, caller_id, caller_principal_id)
 
     return result
 
@@ -496,12 +518,24 @@ def recall_entity(args: Args) -> Dict[str, Any]:
         keys = [single] if single else []
     if not keys:
         raise _refuse("a call needs " + " or ".join(RECALL_KEY_ARGS))
+    unknown = [
+        key
+        for key in keys
+        if normalise_key(str(key)).partition(":")[0] not in ENTITY_KEY_TYPES
+    ]
+    if unknown:
+        raise _refuse(
+            f"{unknown} are not type:value with a type in {list(ENTITY_KEY_TYPES)}"
+        )
 
+    claims = current_claims()
+    principal = None if claims is None else (claims.agent_id or claims.person_id)
     return recall(
         keys,
         as_of=supplied.get("as_of"),
         caller_kind=str(supplied.get("caller_kind") or UNKNOWN_CALLER),
         caller_id=str(supplied.get("caller_id") or UNKNOWN_CALLER),
+        caller_principal_id=principal,
     )
 
 

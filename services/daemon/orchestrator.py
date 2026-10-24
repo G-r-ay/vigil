@@ -100,10 +100,8 @@ from core.workflows.workflow_run_service import WorkflowRunService
 from core.workflows.workflows_service import WorkflowsService
 from services.daemon.plan_generator import (
     _infer_title,
-    count_steps,
     generate_initial_context,
     generate_initial_state,
-    generate_plan,
     select_workflow,
 )
 from services.daemon.shared_intel import SharedIntelligence
@@ -255,18 +253,17 @@ def intake_severity_band(
     return name if name in _BAND_RANK else "unknown"
 
 
-def rank_intake_row(
+def intake_rank_inputs(
     row: Dict,
     *,
     now: datetime,
     ttl_seconds: int,
     promote_fraction: float,
-) -> tuple:
-    """Sort key: last-quarter TTL promotion, then severity band, then oldest.
+) -> tuple[str, bool, float]:
+    """``(band, promoted, age_seconds)`` of a row: what ``rank_intake_row`` sorts on.
 
-    Lower sorts first. Never ``ORDER BY`` the severity string: alphabetically
-    ``low`` precedes ``medium``. Detection rows read current finding severity
-    from ``_finding``; ``schedule`` and ``human_ask`` read the row's ``priority``.
+    Detection rows read current finding severity from ``_finding``;
+    ``schedule`` and ``human_ask`` read the row's ``priority``.
     """
     age = intake_age_seconds(row, now)
     remaining = ttl_seconds - age
@@ -277,6 +274,24 @@ def rank_intake_row(
         row.get("kind"),
         finding_severity=finding_severity,
         priority=row.get("priority"),
+    )
+    return band, promoted, age
+
+
+def rank_intake_row(
+    row: Dict,
+    *,
+    now: datetime,
+    ttl_seconds: int,
+    promote_fraction: float,
+) -> tuple:
+    """Sort key: last-quarter TTL promotion, then severity band, then oldest.
+
+    Lower sorts first. Never ``ORDER BY`` the severity string: alphabetically
+    ``low`` precedes ``medium``.
+    """
+    band, promoted, _ = intake_rank_inputs(
+        row, now=now, ttl_seconds=ttl_seconds, promote_fraction=promote_fraction
     )
     created = _as_naive_utc(row.get("created_at"))
     return (
@@ -314,6 +329,112 @@ def _caller(investigation_id: str) -> tuple[Optional[str], Optional[str]]:
     username = name if isinstance(name, str) and name else None
     principal = token if isinstance(token, str) and token else None
     return username, principal
+
+
+def _stamp_phases(context: Dict[str, Any], workflow_id: str, workflows) -> None:
+    """The phase agents as the definition names them now, stored on the run."""
+    from core.agents.attribution import phase_actors
+
+    try:
+        workflow = workflows.get_workflow(workflow_id)
+    except Exception:  # noqa: BLE001 - a run with no snapshot uses its plugin
+        return
+    if workflow is None:
+        return
+    agents = phase_actors(workflow.phases)
+    if agents:
+        context["phase_agents"] = agents
+
+
+def _principal_of(started_by: Optional[str], principal: Optional[str]) -> Optional[str]:
+    """The principal beside triggered_by. A person when the token names one, else system.
+
+    ``started_by`` is the text column. orchestrator is not an agent principal.
+    """
+    del started_by
+    from core.auth import tool_principal
+    from core.auth.principals import SYSTEM_PRINCIPAL_ID
+
+    if principal:
+        try:
+            claims = tool_principal.read(principal)
+        except tool_principal.InvalidPrincipal:
+            return SYSTEM_PRINCIPAL_ID
+        if claims.person_id:
+            return claims.person_id
+        if claims.username:
+            from core.agents.attribution import principal_id_for_username
+
+            return principal_id_for_username(claims.username)
+    return SYSTEM_PRINCIPAL_ID
+
+
+def _start_principal(
+    run_id: str,
+    run_kind: str,
+    started_by: Optional[str],
+    principal: Optional[str],
+    trigger_type: Optional[str],
+) -> tuple[str, str, str, Optional[str]]:
+    """Token, actor principal, origin kind, person principal. The agent does not sign."""
+    from core.agents.attribution import plugin_actor
+    from core.auth import tool_principal
+
+    actor = plugin_actor(run_kind)
+    person_id: Optional[str] = None
+    username: Optional[str] = None
+    if principal:
+        try:
+            claims = tool_principal.read(principal)
+        except tool_principal.InvalidPrincipal:
+            logger.warning("stored principal for %s did not verify", run_id)
+            claims = None
+        if claims is not None:
+            person_id = claims.person_id
+            username = claims.username
+    if username and not person_id:
+        from core.agents.attribution import principal_id_for_username
+
+        person_id = principal_id_for_username(username)
+    if person_id or username:
+        origin = "person"
+    elif trigger_type in ("schedule", "scheduled"):
+        origin = "schedule"
+    else:
+        origin = "alert"
+    token = tool_principal.mint(
+        username,
+        person_id=person_id,
+        agent_id=actor,
+        run_id=run_id,
+        origin=origin,
+        ttl=tool_principal.RUN_TTL,
+    )
+    return token, actor, origin, person_id
+
+
+def _record_start(
+    run_id: str,
+    actor: str,
+    origin: str,
+    person_id: Optional[str],
+    spec: Dict[str, Any],
+) -> None:
+    from core.agents.attribution import TrailWriteError, note_run_start
+
+    origin_value = (person_id or "") if origin == "person" else origin
+    try:
+        note_run_start(
+            run_id=run_id,
+            actor=actor,
+            origin_kind=origin,
+            origin=origin_value,
+            spec=spec,
+        )
+    except TrailWriteError:
+        raise
+    except Exception:  # noqa: BLE001 - a database without the trail keeps today's path
+        logger.warning("run %s started without a trail entry", run_id)
 
 
 def insert_intake_trigger(
@@ -544,20 +665,6 @@ class _TriggerAlreadyDecided(Exception):
     """The CAS on a queued trigger matched zero rows."""
 
 
-def _inv_as_dict(inv):
-    """Serialize an investigation to a dict, passing through one already a dict.
-
-    The polling loops receive investigations already serialized; the model
-    branch is a safety net. Imports the schema lazily to keep this module
-    importable without a database.
-    """
-    if isinstance(inv, dict):
-        return inv
-    from core.storage.schemas import InvestigationSchema
-
-    return InvestigationSchema.dump(inv)
-
-
 class Orchestrator:
     """Master agent that manages autonomous SOC investigations."""
 
@@ -630,7 +737,12 @@ class Orchestrator:
             )
             logger.info(f"  Dry run: {self.config.dry_run}")
 
-            await self._complete_legacy_review_rows()
+            try:
+                await self._complete_legacy_review_rows()
+            except Exception as e:
+                logger.error(
+                    "Completing legacy review rows failed: %s", e, exc_info=True
+                )
 
             tasks = [
                 asyncio.create_task(self._intake_loop(shutdown_event)),
@@ -935,20 +1047,13 @@ class Orchestrator:
         and none of them is on a Case: not a merge, so the caller goes on to
         Claim. Anything else is ``HOLD`` — the row stays ``queued`` and the
         next tick retries.
-
-        ``check_overlap`` names only rows that are live, so an investigation
-        that will not read is a failed read rather than a caseless run:
-        ``get_investigation`` answers ``None`` for a database error the same
-        way it does for a row that is gone. Launching on that would open a
-        second run on an entity a Case already covers, so an unreadable row
-        holds.
         """
         for inv_id in overlapping:
             investigation = self.get_investigation(inv_id)
             if investigation is None:
                 logger.warning(
                     f"Finding {finding_id} overlaps investigation {inv_id} "
-                    f"but it would not read; leaving queued"
+                    f"but it is gone; leaving queued"
                 )
                 return _Overlap.HOLD, None
             case_id = investigation.get("case_id")
@@ -1026,16 +1131,9 @@ class Orchestrator:
             raise ValueError("a run opened on findings needs a case")
 
         inv_id = f"inv-{utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
-        total_steps = count_steps(workflow_id)
-
         workdir = self.workdir.create(inv_id)
 
-        plan_md = generate_plan(inv_id, workflow_id, findings, case_id, hypothesis)
-        self.workdir.write_file(inv_id, "plan.md", plan_md)
-
-        state = generate_initial_state(
-            inv_id, workflow_id, case_id, findings, total_steps
-        )
+        state = generate_initial_state(inv_id, workflow_id, case_id, findings)
         self.workdir.write_state(inv_id, state)
 
         self.workdir.write_file(
@@ -1110,7 +1208,6 @@ class Orchestrator:
             "status": "assigned",
             "workdir": str(workdir),
             "current_step": 1,
-            "total_steps": total_steps,
             "priority": priority,
             "max_iterations": self.config.max_iterations_per_agent,
             "max_cost_usd": self.config.max_cost_per_investigation,
@@ -1155,7 +1252,7 @@ class Orchestrator:
         )
 
         logger.info(
-            f"Created investigation {inv_id} (workflow={workflow_id}, priority={priority}, steps={total_steps})"
+            f"Created investigation {inv_id} (workflow={workflow_id}, priority={priority})"
         )
 
         await self._check_cross_correlations(inv_id)
@@ -1169,18 +1266,14 @@ class Orchestrator:
             return
 
         for inv in self._get_investigations_by_status("assigned"):
-            inv_id = inv.get("investigation_id") or (
-                inv.investigation_id if hasattr(inv, "investigation_id") else None
-            )
+            inv_id = inv.get("investigation_id")
             if not inv_id:
                 continue
             if self._running() >= self.config.max_concurrent_agents:
                 return
 
             self._update_investigation_status(inv_id, "assigned")
-            inv_dict = _inv_as_dict(inv)
-            inv_dict["status"] = "assigned"
-            await self._enqueue_investigation(inv_dict)
+            await self._enqueue_investigation(inv)
 
     # -------------------------------------------------------------------------
     # Supervision Loop
@@ -1200,14 +1293,13 @@ class Orchestrator:
                 # them only here. They are never stale- or cost-checked below.
                 for status in ("executing", "waiting_approval", "paused"):
                     for inv in self._get_investigations_by_status(status):
-                        reconciling = _inv_as_dict(inv).get("investigation_id")
+                        reconciling = inv.get("investigation_id")
                         if reconciling:
                             await self._reconcile(reconciling)
 
                 waiting = self._get_investigations_by_status("waiting_approval")
                 for inv in waiting:
-                    inv_dict = _inv_as_dict(inv)
-                    w_inv_id = inv_dict.get("investigation_id")
+                    w_inv_id = inv.get("investigation_id")
                     if not w_inv_id:
                         continue
                     notified_key = f"approval_notified:{w_inv_id}"
@@ -1230,8 +1322,7 @@ class Orchestrator:
                 executing = self._get_investigations_by_status("executing")
                 now = utcnow()
 
-                for inv in executing:
-                    inv_dict = _inv_as_dict(inv)
+                for inv_dict in executing:
                     inv_id = inv_dict.get("investigation_id")
                     if not inv_id:
                         continue
@@ -1295,8 +1386,7 @@ class Orchestrator:
                 self._supervision_tick += 1
                 if self._supervision_tick % 5 == 0:
                     for inv in executing:
-                        inv_dict = _inv_as_dict(inv)
-                        x_inv_id = inv_dict.get("investigation_id")
+                        x_inv_id = inv.get("investigation_id")
                         if x_inv_id:
                             await self._check_cross_correlations(x_inv_id)
 
@@ -1340,7 +1430,7 @@ class Orchestrator:
     def _abandon_in_flight(self) -> None:
         for status in self.IN_FLIGHT:
             for inv in self._get_investigations_by_status(status):
-                inv_id = _inv_as_dict(inv).get("investigation_id")
+                inv_id = inv.get("investigation_id")
                 if inv_id:
                     self._update_investigation_status(
                         inv_id,
@@ -1441,6 +1531,7 @@ class Orchestrator:
                     case_id = inv_record.get("case_id")
                     if case_id:
                         context["case_id"] = case_id
+                    _stamp_phases(context, inv_record["workflow_id"], self._workflows)
                     row = runs.begin_run(
                         run_id=run_id,
                         workflow_id=inv_record["workflow_id"],
@@ -1451,6 +1542,7 @@ class Orchestrator:
                         ),
                         trigger_context=context,
                         triggered_by=started_by or "orchestrator",
+                        triggered_by_principal_id=_principal_of(started_by, principal),
                     )
                     if row is None:
                         logger.warning("no workflow_runs row for %s", run_id)
@@ -1460,12 +1552,19 @@ class Orchestrator:
                 logger.warning("no workflow_runs row for %s: %s", run_id, exc)
                 row = None
 
+            token, actor, origin, person = _start_principal(
+                run_id, run_kind, started_by, principal, inv_record.get("trigger_type")
+            )
+            if row is not None:
+                _record_start(run_id, actor, origin, person, request)
             job = build_start_job(
                 run_id,
                 run_kind,
                 request,
                 enqueued_by=started_by or "orchestrator",
-                principal=principal,
+                principal=token,
+                actor=actor,
+                origin=origin,
             )
             await enqueue_run(job)
         except Exception as exc:  # noqa: BLE001 — a queue that refuses is not a crash
@@ -1475,6 +1574,9 @@ class Orchestrator:
                 runs.finalize_run(
                     run_id, status="failed", error=f"Could not enqueue: {exc}"
                 )
+                from core.agents.attribution import note_terminal
+
+                note_terminal(run_id, "failed", "")
             self._update_investigation_status(
                 inv_id, "failed", f"Could not enqueue: {exc}"
             )
@@ -1556,16 +1658,35 @@ class Orchestrator:
                 "intake_workflow_id": intake_workflow,
             },
             triggered_by="orchestrator",
+            triggered_by_principal_id=_principal_of(started_by, principal),
         )
         if row is None:
             logger.warning("no workflow_runs row for shadow run %s", shadow_id)
 
+        # The shadow is the system's second opinion, not the person's run.
+        token, actor, origin, person = _start_principal(
+            shadow_id, "adjudicate", None, None, "finding"
+        )
+        if row is not None:
+            try:
+                _record_start(shadow_id, actor, origin, person, shadow)
+            except (
+                Exception
+            ):  # noqa: BLE001 - a refused trail must not leave the row running
+                runs.finalize_run(
+                    shadow_id,
+                    status="failed",
+                    error="the action could not be recorded",
+                )
+                raise
         job = build_start_job(
             shadow_id,
             "adjudicate",
             shadow,
             enqueued_by=started_by or "orchestrator",
-            principal=principal,
+            principal=token,
+            actor=actor,
+            origin=origin,
         )
         try:
             await enqueue_run(job, job_id=shadow_id)
@@ -1575,6 +1696,9 @@ class Orchestrator:
                 runs.finalize_run(
                     shadow_id, status="failed", error=f"Could not enqueue: {exc}"
                 )
+                from core.agents.attribution import note_terminal
+
+                note_terminal(shadow_id, "failed", "")
             raise
         logger.info("enqueued shadow adjudication of %s as run %s", inv_id, shadow_id)
 
@@ -1687,8 +1811,7 @@ class Orchestrator:
     def _hourly_cost_limit(self) -> float:
         """The cap as saved in Settings, falling back to startup config.
 
-        Read live so the daemon's gate and the API's status payload (a separate
-        process on default config) agree, and a saved change applies at once.
+        Read live so a saved change reaches the running daemon at once.
         """
         try:
             from core.storage.connection import get_db_manager
@@ -1825,7 +1948,7 @@ class Orchestrator:
     async def _complete_legacy_review_rows(self) -> None:
         """Finish rows a pre-#2324 daemon left in ``review_submitted``."""
         for inv in self._get_investigations_by_status("review_submitted"):
-            inv_id = _inv_as_dict(inv).get("investigation_id")
+            inv_id = inv.get("investigation_id")
             if not inv_id:
                 continue
             # One bad row must not keep the loops from starting.
@@ -2017,31 +2140,6 @@ class Orchestrator:
                         f"Failed to link cases {case_a} <-> {case_b}", exc_info=True
                     )
 
-            cross_note = (
-                f"\n\n## Cross-Investigation Note\n"
-                f"Related investigation {other_id} shares IOCs: {', '.join(shared_keys[:10])}. "
-                f"Review for campaign correlation.\n"
-            )
-            other_note = (
-                f"\n\n## Cross-Investigation Note\n"
-                f"Related investigation {inv_id} shares IOCs: {', '.join(shared_keys[:10])}. "
-                f"Review for campaign correlation.\n"
-            )
-
-            try:
-                plan_a = self.workdir.read_file(inv_id, "plan.md")
-                if f"Related investigation {other_id}" not in plan_a:
-                    self.workdir.append_file(inv_id, "plan.md", cross_note)
-            except Exception:
-                pass
-
-            try:
-                plan_b = self.workdir.read_file(other_id, "plan.md")
-                if f"Related investigation {inv_id}" not in plan_b:
-                    self.workdir.append_file(other_id, "plan.md", other_note)
-            except Exception:
-                pass
-
             self.workdir.append_log(
                 inv_id,
                 {
@@ -2179,7 +2277,6 @@ class Orchestrator:
                     status=inv_record.get("status", "assigned"),
                     workdir=inv_record["workdir"],
                     current_step=inv_record.get("current_step", 0),
-                    total_steps=inv_record.get("total_steps", 0),
                     priority=inv_record.get("priority", "medium"),
                     max_iterations=inv_record.get(
                         "max_iterations", self.config.max_iterations_per_agent
@@ -2277,56 +2374,40 @@ class Orchestrator:
         except Exception as e:
             logger.error(f"Failed to decide intake row {trigger_id}: {e}")
 
-    def _get_investigations_by_status(self, status: str) -> List:
+    def _get_investigations_by_status(self, status: str) -> List[Dict]:
         """Query investigations by status from the database."""
-        try:
-            from core.storage.connection import get_db_manager
-            from core.storage.models import Investigation
+        from core.storage.connection import get_db_manager
+        from core.storage.models import Investigation
+        from core.storage.schemas import InvestigationSchema
 
-            with get_db_manager().session_scope() as session:
-                from core.storage.schemas import InvestigationSchema
-
-                results = session.query(Investigation).filter_by(status=status).all()
-                return InvestigationSchema.dump_many(results)
-        except Exception as e:
-            logger.debug(f"DB query for status={status} failed: {e}")
-            return []
+        with get_db_manager().session_scope() as session:
+            results = session.query(Investigation).filter_by(status=status).all()
+            return InvestigationSchema.dump_many(results)
 
     def get_all_investigations(self, status: Optional[str] = None) -> List[Dict]:
         """Get all investigations, optionally filtered by status."""
-        try:
-            from core.storage.connection import get_db_manager
-            from core.storage.models import Investigation
+        from core.storage.connection import get_db_manager
+        from core.storage.models import Investigation
+        from core.storage.schemas import InvestigationSchema
 
-            with get_db_manager().session_scope() as session:
-                from core.storage.schemas import InvestigationSchema
-
-                query = session.query(Investigation)
-                if status:
-                    query = query.filter_by(status=status)
-                return InvestigationSchema.dump_many(
-                    query.order_by(Investigation.created_at.desc()).all()
-                )
-        except Exception as e:
-            logger.debug(f"DB query failed: {e}")
-            return []
+        with get_db_manager().session_scope() as session:
+            query = session.query(Investigation)
+            if status:
+                query = query.filter_by(status=status)
+            return InvestigationSchema.dump_many(
+                query.order_by(Investigation.created_at.desc()).all()
+            )
 
     def get_investigation(self, inv_id: str) -> Optional[Dict]:
-        try:
-            from core.storage.connection import get_db_manager
-            from core.storage.models import Investigation
+        from core.storage.connection import get_db_manager
+        from core.storage.models import Investigation
+        from core.storage.schemas import InvestigationSchema
 
-            with get_db_manager().session_scope() as session:
-                inv = (
-                    session.query(Investigation)
-                    .filter_by(investigation_id=inv_id)
-                    .first()
-                )
-                from core.storage.schemas import InvestigationSchema
-
-                return InvestigationSchema.dump(inv) if inv else None
-        except Exception:
-            return None
+        with get_db_manager().session_scope() as session:
+            inv = (
+                session.query(Investigation).filter_by(investigation_id=inv_id).first()
+            )
+            return InvestigationSchema.dump(inv) if inv else None
 
     # Returns the status the row had, or None when it was not read. Activity is
     # the park reason a paused row shows; any other status clears it.

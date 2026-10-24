@@ -1,7 +1,7 @@
 import type { Announce } from "../../core/checkpoints.js";
 import { childOrdinal, runAgent, runChild, type AgentKinds } from "../../core/agent.js";
 import type { Harness, TurnConfig } from "../../core/loop.js";
-import type { RunKind, RunOutcome, TerminalHandoff } from "../../contracts/events.js";
+import type { RunKind, RunOutcome, RunPayload, TerminalHandoff } from "../../contracts/events.js";
 import type { RunSpec } from "../../core/spec.js";
 import { narrativeWriter } from "./adapters.js";
 import { narrativeInput, type Narrative } from "./narrative.js";
@@ -26,6 +26,7 @@ export interface HuntOptions {
   queue: DirectiveQueue;
   started_by?: string;
   principal?: string;
+  origin?: RunPayload["origin"];
   announce?: Announce;
   // Told the moment a handoff is journaled, not held back to the terminal. A hunt
   // escalates and keeps hunting, so its terminal can be far off or never come; the
@@ -79,6 +80,7 @@ export async function runHunt(harness: Harness<HuntKinds>, options: HuntOptions)
     tools: toolsFrom(options.spec.tools),
     started_by: options.started_by ?? "worker",
     ...(options.principal === undefined ? {} : { principal: options.principal }),
+    ...(options.origin === undefined ? {} : { origin: options.origin }),
     // The hunt's own: declared subjects first, else what its statements name.
     recall_keys: recallKeysOf(huntSpec(options.spec)),
     ...(options.announce === undefined ? {} : { announce: options.announce }),
@@ -106,7 +108,7 @@ export async function narrateRun(
   // The kind is on the run's own events, so a rewrite stamps the narrative with the
   // same kind the run carried rather than assuming "hunt".
   const runKind: RunKind = events[0]?.run_kind ?? "hunt";
-  const harness = build<HuntKinds>(runKind, spec, state);
+  const harness = build<HuntKinds>(spec, state);
   // Empty recall_keys: the write-up recalls nothing. It runs after the terminal,
   // over a projection, and a keyed read there would be a read no decision was
   // made on.

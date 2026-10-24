@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 # Same ceiling as GET /workflows/{workflow_id}/runs.
 LIST_RUNS_MAX = 200
 
+IN_FLIGHT_STATUSES = ("running", "paused")
+
 _runs_finished: Any = None
 
 
@@ -59,6 +61,7 @@ class WorkflowRunService:
         workflow_version: Optional[int] = None,
         trigger_context: Optional[Dict[str, Any]] = None,
         triggered_by: Optional[str] = None,
+        triggered_by_principal_id: Optional[str] = None,
         run_id: Optional[str] = None,
     ) -> Optional[str]:
         """Create a ``workflow_runs`` row with ``status='running'``.
@@ -82,6 +85,7 @@ class WorkflowRunService:
                     workflow_name=workflow_name,
                     status="running",
                     triggered_by=triggered_by,
+                    triggered_by_principal_id=triggered_by_principal_id,
                     trigger_context=trigger_context or {},
                     started_at=utcnow(),
                 )
@@ -109,14 +113,14 @@ class WorkflowRunService:
         ``reason`` clears it. A run already finished stays finished: a late
         write from a worker that was mid-iteration must not reopen it.
         """
-        if status not in ("running", "paused"):
+        if status not in IN_FLIGHT_STATUSES:
             logger.error("set_status: invalid non-terminal status %r", status)
             return False
         try:
             db = get_db_manager()
             with db.session_scope() as session:
                 row = session.get(WorkflowRun, run_id)
-                if row is None or row.status not in ("running", "paused"):
+                if row is None or row.status not in IN_FLIGHT_STATUSES:
                     return False
                 row.status = status
                 if reason is not None:
@@ -160,7 +164,7 @@ class WorkflowRunService:
             db = get_db_manager()
             with db.session_scope() as session:
                 row = session.get(WorkflowRun, run_id)
-                if row is None or row.status not in ("running", "paused"):
+                if row is None or row.status not in IN_FLIGHT_STATUSES:
                     return False
                 row.iteration_count = iteration
                 row.max_cost_usd = max_cost_usd

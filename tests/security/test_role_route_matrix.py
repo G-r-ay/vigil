@@ -25,7 +25,7 @@ from sqlalchemy.pool import StaticPool
 from core.auth import current_user as current_user_module
 from core.auth.auth_service import AuthService
 from core.routing import request_unit_of_work
-from core.storage.models import Role, User
+from core.storage.models import Principal, Role, User
 from core.storage.models.base import Base
 from services.api import main as backend_main
 from tests.security.test_route_permissions import _dependencies
@@ -44,13 +44,27 @@ def _jsonb_is_json_on_sqlite(type_, compiler, **kw):
 
 
 def _seeded_roles() -> dict[str, dict[str, bool]]:
-    """``{role_id: permissions}`` as the init SQL seeds them."""
+    """``{role_id: permissions}`` as the init SQL seeds them, plus revision grants.
+
+    ``06`` is the baseline seed. Later revisions add keys (``0002`` adds the
+    audit permissions). Existing keys win, matching ``grants || permissions``.
+    """
     rows = re.findall(
         r"\('(role-[\w-]+)', '[^']+', '[^']*', '(\{.*?\})', true\)",
         ROLES_SQL.read_text(),
         re.DOTALL,
     )
-    return {role_id: json.loads(grants) for role_id, grants in rows}
+    roles = {role_id: json.loads(grants) for role_id, grants in rows}
+    revisions = Path(__file__).parents[2] / "core" / "upgrade" / "versions"
+    for path in sorted(revisions.glob("*.sql")):
+        for role_id, grants in re.findall(
+            r"\('(role-[\w-]+)',\s*'(\{.*?\})'::jsonb\)",
+            path.read_text(),
+            re.DOTALL,
+        ):
+            if role_id in roles:
+                roles[role_id] = {**json.loads(grants), **roles[role_id]}
+    return roles
 
 
 def _gated_routes() -> list[tuple[str, str, tuple[tuple[str, bool], ...]]]:
@@ -111,22 +125,48 @@ def maker():
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
     )
-    Base.metadata.create_all(engine, tables=[Role.__table__, User.__table__])
+    Base.metadata.create_all(
+        engine, tables=[Principal.__table__, Role.__table__, User.__table__]
+    )
     maker = sessionmaker(bind=engine)
     with maker() as s:
         for role_id, grants in ROLES.items():
             s.add(
                 Role(role_id=role_id, name=role_id, description="", permissions=grants)
             )
+            # A person, so the audit.forward kind check reaches the role grant.
+            s.add(Principal(principal_id=f"u-{role_id}", kind="person", label=role_id))
             s.add(
                 User(
                     user_id=f"u-{role_id}",
+                    principal_id=f"u-{role_id}",
                     username=role_id,
                     email=f"{role_id}@example.com",
                     password_hash="x",
                     full_name=role_id,
                     role_id=role_id,
                     is_active=True,
+                )
+            )
+            # Poll's other audience. Its gate is audit.read, not audit.forward.
+            s.add(
+                Principal(
+                    principal_id=f"sa-{role_id}",
+                    kind="service_account",
+                    label=role_id,
+                )
+            )
+            s.add(
+                User(
+                    user_id=f"sa-{role_id}",
+                    principal_id=f"sa-{role_id}",
+                    username=f"sa-{role_id}",
+                    email=f"sa-{role_id}@example.com",
+                    password_hash="x",
+                    full_name=role_id,
+                    role_id=role_id,
+                    is_active=True,
+                    service_account=True,
                 )
             )
         s.commit()
@@ -153,11 +193,37 @@ def client(maker, monkeypatch):
         backend_main.app.dependency_overrides.pop(request_unit_of_work, None)
 
 
-def _bearer(maker, role_id: str) -> dict[str, str]:
+def _bearer(maker, role_id: str, *, service: bool = False) -> dict[str, str]:
     with maker() as s:
-        user = s.get(User, f"u-{role_id}")
-        token = AuthService.generate_jwt_token(user, "access")
+        user = s.get(User, f"{'sa' if service else 'u'}-{role_id}")
+        # Poll refuses a token with no sign-in before it consults the role.
+        token = AuthService.generate_jwt_token(user, "access", sid="si-matrix")
     return {"Authorization": f"Bearer {token}"}
+
+
+def _service_account_poll_denials():
+    """Service accounts on poll only, for roles that lack ``audit.read``.
+
+    The person matrix still reads ``audit.forward`` off the dependency, so a
+    Manager person stays a denial. Manager and Admin hold ``audit.read`` and
+    are not denials for this audience.
+    """
+    cases = []
+    for method, path, _gates in ROUTES:
+        if path != "/api/audit/poll":
+            continue
+        for role_id, grants in ROLES.items():
+            if grants.get("audit.read"):
+                continue
+            cases.append(
+                pytest.param(
+                    role_id,
+                    method,
+                    path,
+                    id=f"sa-{role_id}:{method} {path}",
+                )
+            )
+    return cases
 
 
 def _filled(path: str) -> str:
@@ -167,6 +233,9 @@ def _filled(path: str) -> str:
 def test_the_matrix_is_not_vacuous():
     assert len(ROLES) == 5
     assert len(ROUTES) > 50
+    poll = [gates for _, path, gates in ROUTES if path == "/api/audit/poll"]
+    assert poll == [(("audit.forward", False),)]
+    assert _service_account_poll_denials()
 
 
 def test_every_gate_names_a_permission_some_seeded_role_holds():
@@ -174,6 +243,30 @@ def test_every_gate_names_a_permission_some_seeded_role_holds():
     held = {p for grants in ROLES.values() for p, on in grants.items() if on}
     unknown = {p for _, _, gates in ROUTES for p, _ in gates} - held
     assert not unknown
+
+
+@pytest.mark.parametrize("role_id,method,path", _service_account_poll_denials())
+def test_a_service_account_without_audit_read_cannot_poll(
+    client, maker, role_id, method, path
+):
+    response = client.request(
+        method, _filled(path), headers=_bearer(maker, role_id, service=True)
+    )
+
+    assert response.status_code == 403, (role_id, method, path, response.text[:200])
+    assert response.json()["detail"] == "Permission denied: audit.read required"
+
+
+def test_a_service_account_with_audit_read_is_not_refused_on_poll(client, maker):
+    holders = {role_id for role_id, grants in ROLES.items() if grants.get("audit.read")}
+    assert {"role-admin", "role-manager"} <= holders
+    for role_id in sorted(holders):
+        response = client.request(
+            "GET", "/api/audit/poll", headers=_bearer(maker, role_id, service=True)
+        )
+        # The gate let them through: poll then asks for ``after``, and writes nothing.
+        assert response.status_code == 422, (role_id, response.text[:200])
+        assert response.json()["detail"] == "poll needs after"
 
 
 @pytest.mark.parametrize("role_id,method,path,missing", _denied_cases())

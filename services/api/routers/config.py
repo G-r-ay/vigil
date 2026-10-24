@@ -9,8 +9,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, create_model
 
 from core.api.v1.findings_router import data_service as findings_data_service
+from core.audit.feed import INTEGRATION_ID as AUDIT_FEED_INTEGRATION_ID
 from core.auth.permissions import permission_gate
 from core.config import (
+    _load_json_config,
     get_settings,
     is_demo_mode,
     load_integrations_config,
@@ -35,7 +37,10 @@ from core.integrations.integration_secrets import (
 )
 from core.intent import intent_file
 from core.llm.defaults import DEFAULT_MODEL
-from core.response.approval_service import APPROVAL_CONFIG_KEY
+from core.response.approval_service import (
+    APPROVAL_CONFIG_KEY,
+    read_stored_force_manual_approval,
+)
 from core.routing import Auth, RouterMeta, UnitOfWorkSession
 from core.secrets import (
     SECRET_WRITE_REFUSED_DETAIL,
@@ -130,9 +135,7 @@ class IntegrationsConfig(BaseModel):
 class GeneralConfig(BaseModel):
     """General application settings."""
 
-    auto_start_sync: bool = False
     show_notifications: bool = True
-    theme: str = "dark"
     enable_keyring: bool = False  # Whether to use OS keyring for secrets
 
 
@@ -635,6 +638,20 @@ def assigned_model_ids(session) -> set[str]:
     return found
 
 
+class SetupStep(BaseModel):
+    id: str
+    title: str
+    state_line: str
+    done: bool
+    href: str
+
+
+class SetupStepsResponse(BaseModel):
+    steps: List[SetupStep]
+    alerts_exist: int
+    demo_enabled: bool
+
+
 def _step(step_id: str, title: str, state_line: str, done: bool, href: str) -> dict:
     return {
         "id": step_id,
@@ -737,7 +754,7 @@ def build_setup_steps(
     }
 
 
-@router.get("/setup-steps")
+@router.get("/setup-steps", response_model=SetupStepsResponse)
 def get_setup_steps(
     session: UnitOfWorkSession,
     detection_rules: DetectionRulesService = Depends(provide_detection_rules),
@@ -802,14 +819,23 @@ def get_integrations_config():
         redacted = {
             iid: redact_secrets(iid, cfg or {})
             for iid, cfg in loaded["integrations"].items()
+            if iid != AUDIT_FEED_INTEGRATION_ID
         }
         return {
             "configured": True,
-            "enabled_integrations": loaded["enabled_integrations"],
+            "enabled_integrations": [
+                iid
+                for iid in loaded["enabled_integrations"]
+                if iid != AUDIT_FEED_INTEGRATION_ID
+            ],
             "integrations": redacted,
             "secrets_set": _secrets_set_map(redacted),
             # {id: {at, success, error}} from POST .../test; untested ids absent
-            "last_test": loaded.get("last_test", {}),
+            "last_test": {
+                iid: info
+                for iid, info in (loaded.get("last_test") or {}).items()
+                if iid != AUDIT_FEED_INTEGRATION_ID
+            },
         }
     except Exception as e:
         logger.error(f"Error getting integrations config: {e}")
@@ -854,6 +880,10 @@ def set_integrations_config(
     # one requires the caller to supply the credential again. Checked for every
     # integration before anything is written.
     for integration_id, raw_config in config.integrations.items():
+        # The syslog feed has its own route and audit.forward. A settings save
+        # must not retarget it, and must not write a second trail entry for it.
+        if integration_id == AUDIT_FEED_INTEGRATION_ID:
+            continue
         stored = config_service.get_integration_config(integration_id) or {}
         missing = credentials_to_resupply(
             integration_id, stored.get("config") or {}, raw_config or {}
@@ -881,6 +911,8 @@ def set_integrations_config(
     sanitized_integrations: dict = {}
     not_stored: list[str] = []
     for integration_id, raw_config in config.integrations.items():
+        if integration_id == AUDIT_FEED_INTEGRATION_ID:
+            continue
         secrets, non_secrets = split_secrets(integration_id, raw_config)
         field_by_env = {
             env: field for field, env in secret_fields_for(integration_id).items()
@@ -1158,7 +1190,11 @@ def get_general_config():
         config_value = config_service.get_system_config("general.settings")
 
         if config_value:
-            return config_value
+            # Rows written before the removal still carry the dead keys
+            return {
+                "show_notifications": config_value.get("show_notifications", True),
+                "enable_keyring": config_value.get("enable_keyring", False),
+            }
 
         # Fallback to file-based config
         config_file = vigil_path("general_config.json")
@@ -1167,25 +1203,19 @@ def get_general_config():
             with open(config_file, "r") as f:
                 config = json.load(f)
                 return {
-                    "auto_start_sync": config.get("auto_start_sync", False),
                     "show_notifications": config.get("show_notifications", True),
-                    "theme": config.get("theme", "dark"),
                     "enable_keyring": config.get("enable_keyring", False),
                 }
 
         # Default values
         return {
-            "auto_start_sync": False,
             "show_notifications": True,
-            "theme": "dark",
             "enable_keyring": False,
         }
     except Exception as e:
         logger.error(f"Error getting general config: {e}")
         return {
-            "auto_start_sync": False,
             "show_notifications": True,
-            "theme": "dark",
             "enable_keyring": False,
         }
 
@@ -1205,9 +1235,7 @@ def set_general_config(
         Success status
     """
     config_data = {
-        "auto_start_sync": config.auto_start_sync,
         "show_notifications": config.show_notifications,
-        "theme": config.theme,
         "enable_keyring": config.enable_keyring,
     }
 
@@ -1226,7 +1254,8 @@ def set_general_config(
             status_code=500, detail="Failed to save configuration to database"
         )
 
-    _mirror_to_file("general_config.json", config_data)
+    existing = _load_json_config(vigil_path("general_config.json"))
+    _mirror_to_file("general_config.json", {**existing, **config_data})
 
     # Update the global secrets manager if keyring setting changed
     try:
@@ -1614,9 +1643,7 @@ def set_orchestrator_config(
     config: OrchestratorSettingsConfig,
     current_user: User = Depends(get_current_active_user),
 ):
-    """Set orchestrator configuration. Persists settings AND syncs the
-    runtime enabled flag used by GET /api/orchestrator/status (which
-    NavigationRail uses to show/hide the Auto Ops tab).
+    """Set orchestrator configuration.
 
     A ``profiles`` field on the body is ignored. The stored object stays the
     flat keys; no profile name is written.
@@ -1636,22 +1663,6 @@ def set_orchestrator_config(
         raise HTTPException(
             status_code=500, detail="Failed to save orchestrator config to database"
         )
-
-    # Poke the in-process orchestrator (if the API happens to share one)
-    # so a running daemon reacts immediately. No-op in backend-only
-    # deployments — the daemon polls orchestrator.settings every few
-    # seconds.
-    try:
-        from services.api.routers.orchestrator import _get_orchestrator
-
-        orch = _get_orchestrator()
-        if orch is not None:
-            if config_data.get("enabled"):
-                orch.enable()
-            else:
-                orch.disable()
-    except Exception as e:
-        logger.debug("In-process orchestrator runtime apply skipped: %s", e)
 
     return {"success": True, "message": "Orchestrator settings saved"}
 
@@ -1674,13 +1685,6 @@ def _environment_wins() -> bool:
     return bool(settings.daemon_force_approval) or not settings.daemon_auto_response
 
 
-def _stored_force_manual(config_service) -> bool:
-    value = config_service.read_system_config(APPROVAL_CONFIG_KEY)
-    if isinstance(value, dict):
-        return bool(value.get("enabled", False))
-    return False
-
-
 @router.get("/force-manual-approval", response_model=ForceManualApprovalResponse)
 def get_force_manual_approval():
     """Read ``approval.force_manual_approval`` without inserting a default row.
@@ -1689,7 +1693,7 @@ def get_force_manual_approval():
     approvals as off while the stored flag may be forcing them on.
     """
     try:
-        enabled = _stored_force_manual(get_config_service())
+        enabled = read_stored_force_manual_approval()
     except Exception as e:
         logger.error(f"Error getting force-manual approval: {e}")
         raise HTTPException(

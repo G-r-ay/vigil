@@ -41,6 +41,9 @@ HELM_SKIPS = (
     "28_case_closure_actor.sql",
     "39_case_findings_finding_index.sql",
     "34_drop_skills.sql",
+    # create_all builds conversations. A new install already has these columns;
+    # a 0.7 or 0.8 database does not, and the baseline expects them.
+    "47_conversation_generation.sql",
 )
 MCP_CREDENTIALS = "34_mcp_credentials.sql"
 # Helm never re-ran 06, so a Helm install can lack this column.
@@ -63,11 +66,14 @@ FORWARD = (
     NOISE_STEP,
     "44_medic_last_seen.sql",
     "45_medic_permissions.sql",
+    "46_users_tokens_valid_after.sql",
 )
 # The stamps adoption accepts, and the suffix each one runs. A 0.8.0 stamp
 # can be a 0.7 install upgraded in place, which never got the two columns
 # only 06 and create_all build; both steps are no-ops where they exist.
-FORWARD_BY_STAMP = {"0.7.0": FORWARD, "0.8.0": FORWARD[-4:]}
+# 0.8.0 already applied everything before the mfa step.
+_FROM_0_8 = FORWARD[-5:]
+FORWARD_BY_STAMP = {"0.7.0": FORWARD, "0.8.0": _FROM_0_8}
 # Waits for a lock longer than this fail the run instead of queueing the app
 # behind an ALTER.
 LOCK_TIMEOUT = "30s"

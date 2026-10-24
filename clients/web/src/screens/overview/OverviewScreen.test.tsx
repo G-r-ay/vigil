@@ -2,10 +2,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter, useLocation } from 'react-router-dom'
 import OverviewScreen from './OverviewScreen'
-import api, { configApi, findingsApi, overviewApi, type OverviewAgent, type OverviewFeedItem, type OverviewPayload } from '../../services/api'
+import { heldCase } from '../../shell/heldCase'
+import { casesApi, configApi, findingsApi, overviewApi, type OverviewAgent, type OverviewFeedItem, type OverviewPayload } from '../../services/api'
 
 vi.mock('../../services/api', () => ({
-  default: { post: vi.fn() },
+  casesApi: { exportJira: vi.fn() },
   overviewApi: { get: vi.fn(), alert: vi.fn() },
   findingsApi: {
     markNoise: vi.fn(),
@@ -24,13 +25,11 @@ vi.mock('../../services/api', () => ({
 }))
 
 const SOURCE = 'Findings created today (UTC) with this data source.'
-const OUTCOME = 'Alerts that arrived today (UTC) and reached this state. Each alert is counted once.'
 
 const measured = (state: string, label: string, count: number, info: string | null = null) => ({
   state,
   label,
   count,
-  source_text: OUTCOME,
   info,
   unmeasured_text: null,
 })
@@ -38,7 +37,6 @@ const unmeasured = (state: string, label: string) => ({
   state,
   label,
   count: null,
-  source_text: `${label} is not measured.`,
   info: `${label} is not measured.`,
   unmeasured_text: 'Not measured yet',
 })
@@ -72,7 +70,6 @@ function payload(overrides: Partial<OverviewPayload> = {}): OverviewPayload {
     day: '2026-10-01',
     empty: false,
     arrivals: [{ data_source: 'splunk', count: 2, source_text: SOURCE }],
-    engine: { source_text: 'No count. The outcome counts partition today\'s arrivals.' },
     outcomes: OUTCOMES,
     running_source: 'Runs still in history whose status is running or paused.',
     step_source: 'The open phase on the newest live run, or that run\'s status when it has no phase row.',
@@ -85,11 +82,9 @@ function payload(overrides: Partial<OverviewPayload> = {}): OverviewPayload {
       severity: 'high',
       data_source: 'splunk',
       terminal_state: 'waiting',
-      terminal_label: 'Not in a case',
       title: null,
       description: 'Odd login',
       created_at: '2026-10-01T00:01:00',
-      evidence_links: [{ ref: 'https://example.test/alert/1' }],
       source_link: 'https://example.test/alert/1',
       case_id: null,
       noise_marked: false,
@@ -108,7 +103,8 @@ function payload(overrides: Partial<OverviewPayload> = {}): OverviewPayload {
 }
 
 function Where() {
-  return <output data-testid="where">{useLocation().search}</output>
+  const { search, state } = useLocation()
+  return <output data-testid="where" data-held={heldCase(state) ?? ''}>{search}</output>
 }
 
 function renderScreen(url = '/overview', chatOpen = false) {
@@ -127,6 +123,7 @@ function renderScreen(url = '/overview', chatOpen = false) {
 }
 
 const where = () => screen.getByTestId('where').textContent
+const held = () => screen.getByTestId('where').dataset.held
 
 const item = (id: string, over: Partial<OverviewFeedItem> = {}): OverviewFeedItem => ({ ...payload().feed[0], finding_id: id, ...over })
 
@@ -257,12 +254,25 @@ describe('OverviewScreen', () => {
     expect(within(flow).queryByText('g')).not.toBeInTheDocument()
   })
 
+  it('disables Create ticket and names the gap when Jira is not ready', async () => {
+    vi.mocked(configApi.getIntegrations).mockResolvedValueOnce({
+      data: { enabled_integrations: [], integrations: {}, secrets_set: {} },
+    } as never)
+    vi.mocked(overviewApi.get).mockResolvedValue({ data: payload({ feed: [{ ...payload().feed[0], case_id: 'case-1' }] }) } as never)
+    renderScreen()
+    fireEvent.click(await screen.findByText('f-1'))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Create ticket' }).parentElement).toHaveAttribute('title', 'Jira is not enabled'))
+    const ticket = screen.getByRole('button', { name: 'Create ticket' })
+    expect(ticket).toBeDisabled()
+    fireEvent.click(ticket)
+    expect(casesApi.exportJira).not.toHaveBeenCalled()
+  })
+
   it('marks then clears, says a second launch is already queued, and shows a Jira error', async () => {
     const item = {
       ...payload().feed[0],
       source_link: null,
       case_id: 'case-1',
-      evidence_links: [{ ref: 'https://example.test/raw' }],
     }
     vi.mocked(overviewApi.get).mockResolvedValue({ data: payload({ feed: [item] }) } as never)
     vi.mocked(findingsApi.markNoise).mockResolvedValue({ data: {} } as never)
@@ -270,34 +280,33 @@ describe('OverviewScreen', () => {
     vi.mocked(findingsApi.launchIntake)
       .mockResolvedValueOnce({ data: { queued: true, already_queued: false, trigger_id: 1 } } as never)
       .mockResolvedValueOnce({ data: { queued: false, already_queued: true, trigger_id: null } } as never)
-    vi.mocked(api.post).mockRejectedValue({ response: { data: { detail: 'JIRA not configured' } } })
+    vi.mocked(casesApi.exportJira).mockRejectedValue({ response: { data: { detail: 'JIRA not configured' } } })
     renderScreen()
     fireEvent.click(await screen.findByText('f-1'))
     expect(screen.queryByRole('link', { name: /^Open in/ })).not.toBeInTheDocument()
-    expect(screen.queryByRole('link', { name: 'https://example.test/raw' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: /^The alert reads Dropped and leaves this feed/ })).toBeInTheDocument()
     const facts = screen.getByRole('dialog').querySelector('.ov-facts')!
     expect(facts).toHaveTextContent('StatusNew')
     // the read after the mark answers the state the alert landed in
     vi.mocked(overviewApi.alert)
-      .mockResolvedValueOnce({ data: { ...item, terminal_state: 'dismissed', terminal_label: 'Dropped', noise_marked: true } } as never)
+      .mockResolvedValueOnce({ data: { ...item, terminal_state: 'dismissed', noise_marked: true } } as never)
       .mockResolvedValueOnce({ data: item } as never)
-    fireEvent.click(screen.getByRole('button', { name: 'Mark as noise (teaches triage)' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Mark as noise' }))
     expect(await screen.findByRole('button', { name: 'Undo' })).toBeInTheDocument()
     expect(facts).toHaveTextContent('StatusDropped')
     expect(findingsApi.markNoise).toHaveBeenCalledWith('f-1')
     fireEvent.click(screen.getByRole('button', { name: 'Undo' }))
-    expect(await screen.findByRole('button', { name: 'Mark as noise (teaches triage)' })).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: 'Mark as noise' })).toBeInTheDocument()
     await waitFor(() => expect(facts).toHaveTextContent('StatusNew'))
     expect(findingsApi.clearNoise).toHaveBeenCalledWith('f-1')
     fireEvent.click(screen.getByRole('button', { name: 'Send to triage' }))
     expect(await screen.findByRole('link', { name: 'Waiting in the Triage queue' })).toHaveAttribute('href', '/triage')
     fireEvent.click(screen.getByRole('button', { name: 'Send to triage' }))
     expect(await screen.findByRole('link', { name: 'Already waiting in the Triage queue.' })).toHaveAttribute('href', '/triage')
-    await waitFor(() => expect(configApi.getIntegrations).toHaveBeenCalled())
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Create ticket' })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: 'Create ticket' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('JIRA not configured')
-    await waitFor(() => expect(api.post).toHaveBeenCalledWith('/cases/case-1/export/jira', { project_key: 'SOC' }))
+    expect(casesApi.exportJira).toHaveBeenCalledWith('case-1', 'SOC')
     expect(screen.getByRole('button', { name: 'ServiceNow' })).toBeDisabled()
   })
 
@@ -355,7 +364,7 @@ describe('OverviewScreen', () => {
     vi.mocked(overviewApi.get).mockResolvedValue({ data: payload() } as never)
     vi.mocked(overviewApi.alert).mockClear()
     renderScreen('/overview?alert=f-1&keep=1')
-    expect(await screen.findByRole('button', { name: 'Mark as noise (teaches triage)' })).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: 'Mark as noise' })).toBeInTheDocument()
     expect(within(screen.getByRole('dialog')).getByText('Odd login')).toBeInTheDocument()
     expect(overviewApi.alert).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: /close/i }))
@@ -391,7 +400,7 @@ describe('OverviewScreen', () => {
   })
 
   it('opens the case from the popup and from the Case column, without stacking overlays', async () => {
-    const item = { ...payload().feed[0], case_id: 'case-7', terminal_state: 'working', terminal_label: 'Still working' }
+    const item = { ...payload().feed[0], case_id: 'case-7', terminal_state: 'working' }
     const other = { ...payload().feed[0], finding_id: 'f-2', case_id: null }
     vi.mocked(overviewApi.get).mockResolvedValue({ data: payload({ feed: [item, other] }) } as never)
     const { openCase } = renderScreen()
@@ -407,7 +416,8 @@ describe('OverviewScreen', () => {
     fireEvent.click(screen.getByRole('button', { name: /close/i }))
     fireEvent.click(screen.getByText('f-1'))
     fireEvent.click(await screen.findByRole('button', { name: 'Open case' }))
-    expect(openCase).toHaveBeenLastCalledWith('case-7')
+    expect(openCase).toHaveBeenCalledTimes(1)
+    expect(held()).toBe('case-7')
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
     expect(where()).toBe('')
   })
@@ -428,8 +438,8 @@ describe('OverviewScreen', () => {
 
   it('rail: rows as served with severity, time, description, badge and id; tabs filter and All restores', async () => {
     const feed = [
-      item('f-new', { severity: 'critical', description: 'Newest thing', created_at: '2026-10-01T09:08:07', terminal_state: 'waiting', terminal_label: 'Not in a case' }),
-      item('f-mid', { severity: 'Medium', description: 'Middle thing', terminal_state: 'resolved_auto', terminal_label: 'Resolved automatically', case_id: 'case-3' }),
+      item('f-new', { severity: 'critical', description: 'Newest thing', created_at: '2026-10-01T09:08:07', terminal_state: 'waiting' }),
+      item('f-mid', { severity: 'Medium', description: 'Middle thing', terminal_state: 'resolved_auto', case_id: 'case-3' }),
       item('f-old', { severity: 'low', description: 'Oldest thing', data_source: 'crowdstrike' }),
     ]
     vi.mocked(overviewApi.get).mockResolvedValue({ data: payload({ feed }) } as never)
@@ -457,7 +467,7 @@ describe('OverviewScreen', () => {
   })
 
   it('rail: a row click and Enter set ?alert=, and the Case pill opens the case without the alert', async () => {
-    vi.mocked(overviewApi.get).mockResolvedValue({ data: payload({ feed: [item('f-1', { description: 'One' }), item('f-2', { description: 'Two', case_id: 'case-7', terminal_state: 'needs_you', terminal_label: 'Needs you' })] }) } as never)
+    vi.mocked(overviewApi.get).mockResolvedValue({ data: payload({ feed: [item('f-1', { description: 'One' }), item('f-2', { description: 'Two', case_id: 'case-7', terminal_state: 'needs_you' })] }) } as never)
     const { openCase } = renderScreen()
     const rail = await screen.findByRole('complementary', { name: 'Incoming alerts' })
     fireEvent.click(within(rail).getByRole('button', { name: /One/ }))
@@ -475,10 +485,10 @@ describe('OverviewScreen', () => {
 
   it('rail: the agent mark shows for working and resolved automatically only', async () => {
     const feed = [
-      item('f-w', { terminal_state: 'working', terminal_label: 'Still working', case_id: 'case-2' }),
-      item('f-w0', { terminal_state: 'working', terminal_label: 'Still working' }),
-      item('f-r', { terminal_state: 'resolved_auto', terminal_label: 'Resolved automatically', case_id: 'case-1' }),
-      item('f-n', { terminal_state: 'needs_you', terminal_label: 'Needs you' }),
+      item('f-w', { terminal_state: 'working', case_id: 'case-2' }),
+      item('f-w0', { terminal_state: 'working' }),
+      item('f-r', { terminal_state: 'resolved_auto', case_id: 'case-1' }),
+      item('f-n', { terminal_state: 'needs_you' }),
     ]
     vi.mocked(overviewApi.get).mockResolvedValue({ data: payload({ feed }) } as never)
     renderScreen()
@@ -536,13 +546,14 @@ describe('OverviewScreen', () => {
 
   it('popup: header, fact grid and "Open in <source> ↗" only with a source link', async () => {
     const feed = [
-      item('f-1', { severity: 'high', title: 'Odd login alert', description: 'Odd login', case_id: 'case-7', terminal_state: 'working', terminal_label: 'Still working' }),
+      item('f-1', { severity: 'high', title: 'Odd login alert', description: 'Odd login', case_id: 'case-7', terminal_state: 'working' }),
       item('f-2', { source_link: null, title: null, description: 'Quiet one' }),
     ]
     vi.mocked(overviewApi.get).mockResolvedValue({ data: payload({ feed }) } as never)
-    const { openCase } = renderScreen('/overview?alert=f-1')
+    renderScreen('/overview?alert=f-1')
     const dialog = await screen.findByRole('dialog')
-    expect(dialog).toHaveTextContent('High')
+    // The dialog opens on ?alert= before the feed arrives, so wait for the row.
+    expect(await within(dialog).findByText('High')).toBeInTheDocument()
     expect(dialog).toHaveTextContent('f-1 · 00:01:00')
     expect(dialog.querySelector('.ov-pop-d')).toHaveTextContent('Odd login alert')
     expect(dialog.querySelector('.ov-pop-desc')).toHaveTextContent('Odd login')
@@ -552,7 +563,7 @@ describe('OverviewScreen', () => {
     expect(facts).not.toHaveTextContent('Triage')
     expect(within(dialog).getByRole('link', { name: 'Open in Splunk ↗' })).toBeInTheDocument()
     fireEvent.click(within(facts as HTMLElement).getByRole('button', { name: 'Case case-7' }))
-    expect(openCase).toHaveBeenCalledWith('case-7')
+    expect(held()).toBe('case-7')
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
     fireEvent.click(screen.getByRole('button', { name: /Quiet one/ }))
     const second = await screen.findByRole('dialog')

@@ -15,7 +15,7 @@ from core.storage.models.ai import (
     LLMInteractionLog,
     LLMProviderConfig,
 )
-from core.storage.models.auth import McpCredential, Role, User
+from core.storage.models.auth import McpCredential, Principal, Role, SignIn, User
 from core.storage.models.base import Base, JSONBList, case_findings
 from core.storage.models.case import Case
 from core.storage.models.case_entities import (
@@ -59,6 +59,7 @@ from core.storage.models.finding import Finding, FindingMitrePrediction
 from core.storage.models.medic import MedicLastSeen
 from core.storage.models.skill import SkillRead
 from core.storage.models.workflow import (
+    FINISHED_INVESTIGATION_STATUSES,
     IN_FLIGHT_INVESTIGATION_STATUSES,
     LIVE_CASE_STATES,
     LIVE_INVESTIGATION_STATUSES,
@@ -108,6 +109,7 @@ __all__ = [
     "FederationSource",
     "Finding",
     "FindingMitrePrediction",
+    "FINISHED_INVESTIGATION_STATUSES",
     "IntakeTrigger",
     "IN_FLIGHT_INVESTIGATION_STATUSES",
     "IntegrationConfig",
@@ -121,6 +123,8 @@ __all__ = [
     "LLMInteractionLog",
     "LLMProviderConfig",
     "McpCredential",
+    "Principal",
+    "SignIn",
     "MedicLastSeen",
     "Role",
     "SLAPolicy",

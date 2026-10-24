@@ -1,15 +1,14 @@
-import json
 import logging
 import time
 import uuid
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from core.config import is_demo_mode
 from core.exceptions import DatabaseError
 from core.storage.connection import (
     SchemaDriftError,
+    SchemaRevisionError,
     get_db_manager,
     init_database,
 )
@@ -83,7 +82,7 @@ class DatabaseDataService:
 
     def _init_database(self):
         try:
-            init_database(echo=False, create_tables=True)
+            init_database(echo=False)
             db_manager = get_db_manager()
             if not db_manager.health_check():
                 raise DatabaseError("Database health check failed")
@@ -93,9 +92,9 @@ class DatabaseDataService:
             if self._db_was_down:
                 self._db_was_down = False
                 logger.info("PostgreSQL reconnected")
-        except SchemaDriftError:
-            # DB_STRICT_SCHEMA is set, so the operator asked for this to be
-            # fatal (#562).
+        except (SchemaDriftError, SchemaRevisionError):
+            # Drift is fatal only when DB_STRICT_SCHEMA is set (#562). A
+            # revision that is not this image's head is always fatal.
             self._db_connected = False
             self._db_service = None
             raise
@@ -179,27 +178,23 @@ class DatabaseDataService:
         if self._demo_mode and self._demo_service:
             return self._demo_service.get_findings(limit)
         if self._db_available:
-            try:
-                findings = self._db_service.get_findings(
-                    severity=severity,
-                    data_source=data_source,
-                    cluster_id=cluster_id,
-                    min_anomaly_score=min_anomaly_score,
-                    state=state,
-                    search_query=search_query,
-                    limit=limit,
-                    offset=offset,
-                    sort_by=sort_by,
-                    sort_order=sort_order,
-                    timestamp_start=timestamp_start,
-                    timestamp_end=timestamp_end,
-                    exclusions=exclusions,
-                    dated_only=dated_only,
-                )
-                return FindingSchema.dump_many(findings)
-            except Exception as e:
-                logger.error(f"Error getting findings from DB: {e}")
-                return []
+            findings = self._db_service.get_findings(
+                severity=severity,
+                data_source=data_source,
+                cluster_id=cluster_id,
+                min_anomaly_score=min_anomaly_score,
+                state=state,
+                search_query=search_query,
+                limit=limit,
+                offset=offset,
+                sort_by=sort_by,
+                sort_order=sort_order,
+                timestamp_start=timestamp_start,
+                timestamp_end=timestamp_end,
+                exclusions=exclusions,
+                dated_only=dated_only,
+            )
+            return FindingSchema.dump_many(findings)
         return []
 
     def get_findings_missing_enrichment(
@@ -233,19 +228,15 @@ class DatabaseDataService:
         if self._demo_mode and self._demo_service:
             return len(self._demo_service.get_findings(10000))
         if self._db_available:
-            try:
-                return self._db_service.count_findings(
-                    severity=severity,
-                    data_source=data_source,
-                    cluster_id=cluster_id,
-                    min_anomaly_score=min_anomaly_score,
-                    state=state,
-                    search_query=search_query,
-                    exclusions=exclusions,
-                )
-            except Exception as e:
-                logger.error(f"Error counting findings from DB: {e}")
-                return 0
+            return self._db_service.count_findings(
+                severity=severity,
+                data_source=data_source,
+                cluster_id=cluster_id,
+                min_anomaly_score=min_anomaly_score,
+                state=state,
+                search_query=search_query,
+                exclusions=exclusions,
+            )
         return 0
 
     def get_findings_summary(
@@ -300,12 +291,8 @@ class DatabaseDataService:
         if self._demo_mode and self._demo_service:
             return self._demo_service.get_finding(finding_id)
         if self._db_available:
-            try:
-                finding = self._db_service.get_finding(finding_id)
-                return FindingSchema.dump(finding) if finding else None
-            except Exception as e:
-                logger.error(f"Error getting finding from DB: {e}")
-                return None
+            finding = self._db_service.get_finding(finding_id)
+            return FindingSchema.dump(finding) if finding else None
         return None
 
     def get_findings_by_technique(
@@ -555,23 +542,3 @@ class DatabaseDataService:
                 logger.error(f"Error adding finding to case in DB: {e}")
                 return False
         return False
-
-    # The formats this knows how to write. Named here rather than at the route,
-    # because the branch below is what decides them: a route that keeps its own
-    # list can come to disagree with the writer, and answer 200 for a format
-    # that silently lands as JSON.
-    EXPORT_FORMATS = ("json", "jsonl")
-
-    def export_findings(self, output_path: Path, fmt: str = "json") -> bool:
-        findings = self.get_findings()
-        try:
-            with open(output_path, "w") as f:
-                if fmt == "jsonl":
-                    for finding in findings:
-                        f.write(json.dumps(finding) + "\n")
-                else:
-                    json.dump({"findings": findings}, f, indent=2)
-            return True
-        except Exception as e:
-            logger.error(f"Error exporting findings: {e}")
-            return False

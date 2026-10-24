@@ -236,7 +236,7 @@ describe("a subturn on its own model", () => {
 
 describe("harnessFor resolves a subturn's model as it resolves the spec's", () => {
   it("names the spec's provider on the wire and prices the bare id under it", () => {
-    const harness = harnessFor("hunt", { ...huntSpecFor(), model: "claude-opus-4-8", provider: "vertex" }, new InProcessState());
+    const harness = harnessFor({ ...huntSpecFor(), model: "claude-opus-4-8", provider: "vertex" }, new InProcessState());
     const own = harness.provider_for!(STEP_MODEL);
     expect([own.model, own.provider_type, own.sampling]).toEqual([STEP_MODEL, "vertex", { ...harness.provider.sampling, wire_model: `vertex/${STEP_MODEL}` }]);
     const same = harness.provider_for!("claude-opus-4-8");
@@ -244,7 +244,7 @@ describe("harnessFor resolves a subturn's model as it resolves the spec's", () =
   });
 
   it("leaves the id bare and the gateway the provider when the spec names none", () => {
-    const harness = harnessFor("hunt", huntSpecFor(), new InProcessState());
+    const harness = harnessFor(huntSpecFor(), new InProcessState());
     const own = harness.provider_for!(STEP_MODEL);
     expect([own.model, own.provider_type, (own.sampling as { wire_model: string }).wire_model]).toEqual([STEP_MODEL, "bifrost", STEP_MODEL]);
   });

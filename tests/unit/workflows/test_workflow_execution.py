@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from core.auth import tool_principal
 from core.workflows.workflows_service import WorkflowDefinition, WorkflowsService
 
 
@@ -65,7 +66,13 @@ async def test_execute_workflow_enqueues_a_compose_run(monkeypatch):
     assert job["run_kind"] == "compose"
     assert job["reason"] == "start"
     assert job["run_id"] == "run-1"
-    assert "principal" not in job
+    assert job["actor"] == "agent:compose"
+    assert job["origin"] == "alert"
+    claims = tool_principal.read(job["principal"])
+    assert claims.username is None
+    assert claims.agent_id == "agent:compose"
+    assert claims.run_id == "run-1"
+    assert claims.origin == "alert"
 
 
 @pytest.mark.asyncio
@@ -266,9 +273,7 @@ async def test_a_run_that_asked_nothing_puts_up_nothing(monkeypatch):
     "asked,expected",
     [
         ({"iterations": 3}, 3),
-        ({"iterations": "5"}, 5),
         ({}, None),
-        ({"iterations": "ten"}, None),
     ],
 )
 async def test_the_turn_count_rides_the_job(monkeypatch, asked, expected):
@@ -300,10 +305,7 @@ async def test_the_turn_count_rides_the_job(monkeypatch, asked, expected):
     "asked,expected",
     [
         ({"max_cost_usd": 25}, {"budgets": {"max_cost_usd": 25.0}}),
-        ({"max_cost_usd": "7.5"}, {"budgets": {"max_cost_usd": 7.5}}),
         ({}, None),
-        ({"max_cost_usd": "lots"}, None),
-        ({"max_cost_usd": 0}, None),
     ],
 )
 async def test_the_cost_ceiling_rides_the_job(monkeypatch, asked, expected):

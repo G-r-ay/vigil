@@ -54,6 +54,7 @@ def _grant(monkeypatch, username: str, permissions: dict) -> None:
     session.add(
         User(
             user_id="u-1",
+            principal_id="u-1",
             username=username,
             email=f"{username}@example.com",
             password_hash="x",
@@ -193,6 +194,30 @@ class TestFailureKinds:
     def test_bad_arguments_are_invalid_args(self, client, monkeypatch):
         _raises(monkeypatch, TypeError("unexpected keyword argument 'nope'"))
         assert _invoke(client).json()["failure"]["kind"] == "invalid_args"
+
+    def test_a_refusal_in_any_words_is_invalid_args(self, client, monkeypatch):
+        _raises(
+            monkeypatch, MCPFailure("invalid_args", "step must be a whole step number")
+        )
+        failure = _invoke(client).json()["failure"]
+        assert failure == {
+            "kind": "invalid_args",
+            "detail": "step must be a whole step number",
+        }
+
+    @pytest.mark.parametrize(
+        "tool,args",
+        [
+            ("lookup_indicators", {}),
+            ("replay_hunt", {"run_id": ""}),
+            ("replay_hunt", {"run_id": "r-1", "step": "abc"}),
+        ],
+    )
+    def test_a_real_tool_refusing_its_arguments_is_invalid_args(
+        self, client, tool, args
+    ):
+        body = _invoke(client, tool=tool, args=args).json()
+        assert body["failure"]["kind"] == "invalid_args"
 
     # A TypeError from inside a tool is not a bad call. Reported as invalid_args it
     # tells the model to retry with different arguments, which it does until the cap.

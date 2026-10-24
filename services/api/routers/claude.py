@@ -1,11 +1,13 @@
-"""Claude endpoints: model listing and the chat stream the console uses."""
+"""Claude endpoints: the chat stream the console uses."""
 
 import asyncio
 import json
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
@@ -16,19 +18,21 @@ from core.agents.projections import agent_route
 from core.agents.prompts import _skills_section
 from core.auth import tool_principal
 from core.auth.permissions import permission_gate
-from core.cases.case_brief import case_brief
-from core.deps import provide_mcp_registry, provide_workflows
+from core.auth.principals import CHAT_PLUGIN_ID, agent_principal_id
+from core.cases.case_brief import RULES, case_brief
+from core.chat import conversation_service
+from core.deps import provide_agent_http, provide_mcp_registry, provide_workflows
 from core.integrations.mcp.registry import MCPRegistry, live_mcp_tools
 from core.llm.chat_layers import (
     chat_config,
     granted_ids,
+    integrations_how,
     integrations_line,
     run_id_for,
 )
 from core.llm.defaults import DEFAULT_MODEL
-from core.llm.providers.registry import get_registry, is_chat_model
+from core.llm.providers.registry import get_registry
 from core.llm.router.router import get_provider_spec
-from core.llm.system_prompt import validate_system_prompt
 from core.llm.target import (
     component_fallback,
     first_servable,
@@ -92,14 +96,12 @@ def _persist_chat_turn(
     the user turn (always complete) and the assistant turn (``complete=False``
     on abort/error). Each ``conversation_service`` call is itself fail-open;
     this wrapper adds a final guard so nothing here can surface into the
-    request path. The authoritative per-iteration record (including full tool
-    calls / results) remains in ``llm_interaction_logs`` keyed by the same
-    ``session_id``.
+    request path. The text is stored in ``conversations`` / ``chat_messages``.
+    Tool calls, results, and cost are recorded in the agent ledger under this
+    conversation's run id.
     """
     try:
-        from core.chat import conversation_service
-
-        conversation_service.ensure_conversation(
+        if not conversation_service.ensure_conversation(
             session_id=session_id,
             user_id=user_id,
             agent_id=agent_id,
@@ -107,7 +109,8 @@ def _persist_chat_turn(
             first_user_text=user_text,
             case_id=case_id,
             page_context=page_context,
-        )
+        ):
+            return
         conversation_service.append_message(
             session_id=session_id,
             role="user",
@@ -130,9 +133,6 @@ def _persist_chat_turn(
 logger = logging.getLogger(__name__)
 
 
-# Structured payload returned when no Anthropic provider is configured.
-# The chat drawer matches on ``code`` and renders a "Configure a provider"
-# CTA instead of a generic ``Error: ...`` bubble.
 NO_PROVIDER_DETAIL: Dict[str, str] = {
     "code": "no_llm_provider_configured",
     "message": (
@@ -143,39 +143,24 @@ NO_PROVIDER_DETAIL: Dict[str, str] = {
 }
 
 
-def _raise_no_provider() -> None:
-    """Raise the canonical 503 for an unconfigured chat backend."""
-    raise HTTPException(status_code=503, detail=NO_PROVIDER_DETAIL)
+def _agent_for(agent_id: Optional[str]) -> Any:
+    """The named agent, or None; a failed lookup never fails the turn. Blocking."""
+    if not agent_id:
+        return None
+    try:
+        from core.agents.manager import AgentManager
+
+        return AgentManager().agents.get(agent_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("agent lookup failed: %s", exc)
+        return None
 
 
-def _resolve_provider_model_for_request(
-    requested_model: Optional[str], agent_id: Optional[str]
-) -> Tuple[Optional[str], str]:
-    """Resolve provider + model for chat requests.
-
-    Older Chat UI state can persist model ids as ``provider_id::model_id``.
-    Keep accepting that shape so a stale localStorage value does not route an
-    Ollama/OpenAI model through the wrong provider.
-    """
-    if requested_model:
-        if "::" in requested_model:
-            provider_id, model_id = requested_model.split("::", 1)
-            return (provider_id or None, model_id or requested_model)
-        return (None, requested_model)
-
+def _resolve_provider_model_for_request(agent: Any) -> Tuple[Optional[str], str]:
     registry = get_registry()
-    agent = None
     category: str = "chat_default"
-
-    if agent_id:
-        try:
-            from core.agents.manager import AgentManager
-
-            agent = AgentManager().agents.get(agent_id)
-            if agent is not None:
-                category = getattr(agent, "component_category", None) or "investigation"
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("agent lookup in model resolution failed: %s", exc)
+    if agent is not None:
+        category = getattr(agent, "component_category", None) or "investigation"
 
     resolved = registry.resolve_model_for_component(category)
     if resolved is None:
@@ -263,14 +248,9 @@ class ChatRequest(BaseModel):
     """Chat request model."""
 
     messages: List[ChatMessage]
-    system_prompt: Optional[str] = None
-    # None means "resolve via ai_model_configs" (GH #89). Callers may still
-    # override with an explicit model id.
-    model: Optional[str] = None
-    max_tokens: int = 4096
     agent_id: Optional[str] = None
     session_id: Optional[str] = (
-        None  # Chat session identifier for reasoning-trace persistence (GH #79)
+        None  # Conversation id. Its text is stored on that row; the ledger run is derived from it.
     )
     # A run this conversation follows up on. The console does not send one yet
     # (#634); when it does, the turn opens with what that run concluded.
@@ -280,12 +260,8 @@ class ChatRequest(BaseModel):
     case_id: Optional[str] = None
     page_context: Optional[str] = None
 
-    @field_validator("system_prompt")
-    @classmethod
-    def _check_system_prompt(cls, v: Optional[str]) -> Optional[str]:
-        return validate_system_prompt(v, source="chat")
 
-
+# In the system prompt on every turn: Q3 was opening by restating Q2's answer.
 LATEST_ONLY = (
     "Answer only the latest question; do not restate or summarise earlier answers."
 )
@@ -296,28 +272,26 @@ def _page_case_sentence(page_context: Optional[str], case_id: Optional[str]) -> 
     page = (page_context or "").strip()
     case = (case_id or "").strip()
     if page and case:
-        sentence = f"The analyst opened this from page {page} about case {case}."
-    elif page:
+        return f"The analyst opened this from page {page} about case {case}."
+    if page:
         return f"The analyst opened this from page {page}."
-    elif case:
-        sentence = f"The analyst opened this about case {case}."
-    else:
-        return ""
-    # Q3 was opening by restating Q2's answer.
-    return f"{sentence} {LATEST_ONLY}"
+    if case:
+        return f"The analyst opened this about case {case}."
+    return ""
 
 
-def _with_page_case(
-    system_prompt: Optional[str], page_context: Optional[str], case_id: Optional[str]
+def _turn_context(
+    page_context: Optional[str], case_id: Optional[str], connected: str, case_data: str
 ) -> str:
-    """Append the page/case sentence after whatever prompt was chosen."""
-    sentence = _page_case_sentence(page_context, case_id)
-    base = (system_prompt or "").strip()
-    if not sentence:
-        return base
-    if not base:
-        return sentence
-    return f"{base}\n\n{sentence}"
+    """What changes between turns, put ahead of the latest question rather than in
+    the system prompt, so the prompt cache on tools plus system carries over."""
+    lines = [
+        _page_case_sentence(page_context, case_id),
+        f"Today is {datetime.now(timezone.utc):%Y-%m-%d} (UTC).",
+        connected,
+        case_data,
+    ]
+    return "\n".join(line for line in lines if line)
 
 
 def _context_window(provider_id: Optional[str], provider_type: str, model: str) -> int:
@@ -336,63 +310,102 @@ async def chat_stream(
     current_user: User = Depends(get_current_user),
     registry: MCPRegistry = Depends(provide_mcp_registry),
     workflows: WorkflowsService = Depends(provide_workflows),
+    agent_http: httpx.AsyncClient = Depends(provide_agent_http),
 ):
     """Stream a chat turn from the agent layer, holding this wire contract."""
-    # Before model resolution, whose agent lookup swallows errors.
-    if request.agent_id and request.agent_id in disabled_agent_ids():
-        raise HTTPException(status_code=409, detail=disabled_message(request.agent_id))
-    # Resolved here because this is the side that knows what an agent is: the
-    # harness is handed a prompt, a model and a tool list, never an agent id.
-    provider_id, resolved_model = _resolve_provider_model_for_request(
-        request.model, request.agent_id
-    )
-    request.model = resolved_model
+    user_id = getattr(current_user, "user_id", None)
+    if request.session_id and await asyncio.to_thread(
+        conversation_service.held_by_another, request.session_id, user_id
+    ):
+        raise HTTPException(
+            status_code=403, detail="This conversation belongs to another user."
+        )
+    case_id = (request.case_id or "").strip()
 
-    system_prompt = request.system_prompt
-    tools: Optional[List[str]] = None
-    if request.agent_id:
-        from core.agents.manager import AgentManager
+    # Every blocking read of the setup (database, skill files, MCP status,
+    # registries) in one hop off the event loop.
+    def setup():
+        # Before the agent lookup, which swallows errors.
+        if request.agent_id and request.agent_id in disabled_agent_ids():
+            raise HTTPException(
+                status_code=409, detail=disabled_message(request.agent_id)
+            )
+        agent = _agent_for(request.agent_id)
+        # Resolved here because this is the side that knows what an agent is: the
+        # harness is handed a prompt, a model and a tool list, never an agent id.
+        provider_id, resolved_model = _resolve_provider_model_for_request(agent)
+        tools = (
+            list(agent.recommended_tools)
+            if agent is not None and agent.recommended_tools
+            else None
+        )
 
-        agent = AgentManager().agents.get(request.agent_id)
-        if agent:
-            system_prompt = agent.system_prompt
-            tools = list(agent.recommended_tools) if agent.recommended_tools else None
+        # Only what holds for the whole conversation, so the cache carries over.
+        system = [agent.system_prompt if agent is not None else "", LATEST_ONLY]
+        if case_id:
+            system.append(RULES)
+        # Chat never goes through prompt_for_row, so a granted read_skill would
+        # have no index. Read per turn so a newly saved skill shows on the next
+        # message; skipped when an agent's own prompt already carries it.
+        if "<available_skills>" not in "\n\n".join(p or "" for p in system):
+            system.append(_skills_section(granted_ids(tools), None))
 
-    system_prompt = _with_page_case(
-        system_prompt, request.page_context, request.case_id
-    )
-    # Rebuilt every turn, so a live run's new evidence is in the next answer.
-    if (request.case_id or "").strip():
-        brief = await case_brief(request.case_id.strip(), workflows)
-        if brief:
-            system_prompt = f"{system_prompt}\n\n{brief}"
-    # Chat never goes through prompt_for_row, so a granted read_skill would have
-    # no index. Read per turn so a newly saved skill shows on the next message;
-    # skipped when an agent's own prompt already carries it.
-    if "<available_skills>" not in system_prompt:
-        skills = _skills_section(granted_ids(tools), None)
-        if skills:
-            system_prompt = f"{system_prompt}\n\n{skills}".strip()
+        active_provider = provider_for(provider_id)
+        if active_provider is None:
+            raise HTTPException(status_code=503, detail=NO_PROVIDER_DETAIL)
+        model = model_for(active_provider, resolved_model)
+        provider_type = active_provider.provider_type
 
-    active_provider = provider_for(provider_id)
-    if active_provider is None:
-        _raise_no_provider()
-    model = request.model = model_for(active_provider, request.model)
-    provider_type = active_provider.provider_type
+        # Whatever MCP integrations are connected right now (VirusTotal, OTX,
+        # MISP, Shodan, …), refreshed per turn, no restart. Not declared one by
+        # one: the model finds and calls their tools on demand.
+        mcp_tools = live_mcp_tools(registry) or None
+        system.append(integrations_how(mcp_tools))
+        return (
+            "\n\n".join(p.strip() for p in system if p and p.strip()),
+            tools,
+            model,
+            provider_type,
+            mcp_tools,
+            integrations_line(mcp_tools, registry.tool_servers()),
+            _context_window(provider_id, provider_type, model),
+        )
 
-    # Whatever MCP integrations are connected right now (VirusTotal, OTX, MISP,
-    # Shodan, …), refreshed per turn, no restart. Named in the prompt rather than
-    # declared: the model finds and calls their tools on demand.
-    mcp_tools = live_mcp_tools(registry) or None
-    connected = integrations_line(mcp_tools, registry.tool_servers())
-    if connected:
-        system_prompt = f"{system_prompt}\n\n{connected}".strip()
+    (
+        system_prompt,
+        tools,
+        model,
+        provider_type,
+        mcp_tools,
+        connected,
+        context_window,
+    ) = await asyncio.to_thread(setup)
+
+    turns = _turns_of(request.messages)
+    if not turns:
+        raise HTTPException(status_code=400, detail="No messages provided")
+    question = turns[-1]["content"]
+    if turns[-1]["role"] == "user":
+        # Rebuilt every turn, so a live run's new evidence is in the next answer.
+        case_data = await case_brief(case_id, workflows) if case_id else ""
+        context = _turn_context(request.page_context, case_id, connected, case_data)
+        turns[-1]["content"] = f"{context}\n\n{question}"
 
     session_id = request.session_id or str(uuid.uuid4())
+    # Read before the payload is built. Generation 0 (every row that exists
+    # today, and a session with no row) keeps run_id_for(session_id). A
+    # deleted conversation's later life uses a new run, so its old tool
+    # reads are not loaded. A missing row is a new session.
+    ledger_session = session_id
+    if request.session_id:
+        ledger_session = await asyncio.to_thread(
+            conversation_service.ledger_key, request.session_id
+        )
+    run_id = run_id_for(ledger_session)
     payload = {
-        "run_id": run_id_for(session_id),
-        "turns": _turns_of(request.messages),
-        "system_prompt": system_prompt or "",
+        "run_id": run_id,
+        "turns": turns,
+        "system_prompt": system_prompt,
         # The provider rides alongside the model so the gateway routes to the
         # account this request resolved to, rather than to whichever provider
         # claims the bare model name first.
@@ -402,11 +415,20 @@ async def chat_stream(
             mcp_tools,
             provider=provider_type,
             effort=resolve_effort("chat_default"),
-            context_window=_context_window(provider_id, provider_type, model),
+            context_window=context_window,
         ),
         # So the tools this turn calls record the person driving it, the same
         # name the /mcp door binds. Signed here; the agent layer only carries it.
-        "principal": tool_principal.mint(current_user.username),
+        "principal": tool_principal.mint(
+            current_user.username,
+            person_id=getattr(current_user, "principal_id", None)
+            or getattr(current_user, "user_id", None),
+            agent_id=agent_principal_id(CHAT_PLUGIN_ID),
+            run_id=run_id,
+            origin="person",
+        ),
+        "actor": agent_principal_id(CHAT_PLUGIN_ID),
+        "origin": "person",
     }
     if request.parent_run_id:
         payload["parent_run_id"] = request.parent_run_id
@@ -416,15 +438,15 @@ async def chat_stream(
     if request.agent_id:
         payload["agent_id"] = request.agent_id
 
-    if not payload["turns"]:
-        raise HTTPException(status_code=400, detail="No messages provided")
-
     return StreamingResponse(
         _relay(
             payload,
             request,
+            model,
             session_id,
-            getattr(current_user, "user_id", None),
+            user_id,
+            question,
+            agent_http,
         ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
@@ -454,36 +476,36 @@ def _turns_of(messages: List[ChatMessage]) -> List[Dict[str, str]]:
 async def _relay(
     payload: Dict[str, Any],
     request: ChatRequest,
+    model: str,
     session_id: str,
     user_id: Optional[str],
+    question: Optional[str],
+    client: httpx.AsyncClient,
 ):
-    import httpx
-
     said: List[str] = []
     finished = False
     # The turn's own failure, stored as the failed reply so a reload shows it.
     failure: Optional[str] = None
     try:
-        async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream(
-                "POST",
-                agent_route("/chat/stream"),
-                json=payload,
-                headers=_internal_headers(),
-            ) as upstream:
-                if upstream.status_code != 200:
-                    detail = (await upstream.aread()).decode("utf-8", "replace")
-                    failure = f"agent layer refused the turn: {detail}"
-                    yield _frame({"error": failure})
-                    return
-                async for line in upstream.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    said.append(_text_in(line[6:]))
-                    error = _event_in(line[6:]).get("error")
-                    if error:
-                        failure = str(error)
-                    yield f"{line}\n\n"
+        async with client.stream(
+            "POST",
+            agent_route("/chat/stream"),
+            json=payload,
+            headers=_internal_headers(),
+        ) as upstream:
+            if upstream.status_code != 200:
+                detail = (await upstream.aread()).decode("utf-8", "replace")
+                failure = f"agent layer refused the turn: {detail}"
+                yield _frame({"error": failure})
+                return
+            async for line in upstream.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                said.append(_text_in(line[6:]))
+                error = _event_in(line[6:]).get("error")
+                if error:
+                    failure = str(error)
+                yield f"{line}\n\n"
         finished = True
     except Exception as exc:  # noqa: BLE001 — the reader gets a frame, not a 500
         logger.error("chat stream relay failed: %s", exc, exc_info=True)
@@ -497,9 +519,11 @@ async def _relay(
                 session_id=session_id,
                 user_id=user_id,
                 agent_id=request.agent_id,
-                model=request.model,
-                # The question as asked: the agent turns merge consecutive user messages.
+                model=model,
+                # The question as asked: the agent turns merge consecutive user
+                # messages, and the latest carries the turn's context block.
                 user_text=_user_text_from_content(request.messages[-1].content).strip()
+                or question
                 or payload["turns"][-1]["content"],
                 assistant_text=failure or "".join(said),
                 assistant_thinking=None,
@@ -540,85 +564,3 @@ def _internal_headers() -> Dict[str, str]:
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
-
-
-@router.get("/models")
-async def get_models():
-    """List available models for the Chat UI model picker.
-
-    Backward-compatible alias for `/api/ai/models` (GH #89). Returns every
-    model across all *active* providers (Anthropic, Ollama, OpenAI, …) so the
-    picker reflects what the instance can actually run: an Ollama-only
-    deployment shows its Ollama models instead of Claude models it will never
-    call. IDs stay as bare model ids so a persisted `chat_default.model_id`
-    selection still matches a menu entry; the chat send path resolves the
-    provider from the active default when no `provider_id::` prefix is present
-    (see `_resolve_provider_model_for_request`).
-    """
-    registry = get_registry()
-    try:
-        all_models = await registry.list_available_models()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("get_models: registry lookup failed: %s", exc)
-        all_models = []
-
-    if not all_models:
-        # Live discovery returned nothing. Before rendering anything, reflect
-        # the providers the instance actually has configured — an Ollama-only
-        # deployment must not be shown Claude models it can't call (#409).
-        try:
-            all_models = await registry.fallback_models()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("get_models: provider fallback failed: %s", exc)
-            all_models = []
-
-    if not all_models:
-        # Genuinely nothing configured (fresh install / no DB). Last-resort
-        # default so the Chat UI still renders a picker.
-        return {
-            "models": [
-                {
-                    "id": "claude-sonnet-4-5-20250929",
-                    "name": "Claude Sonnet 4.5",
-                    "description": "Most intelligent model, best for complex tasks",
-                },
-                {
-                    "id": "claude-sonnet-4-6",
-                    "name": "Claude Sonnet 4.6",
-                    "description": "Balanced speed and intelligence",
-                },
-                {
-                    "id": "claude-haiku-4-5-20251001",
-                    "name": "Claude Haiku 4.5",
-                    "description": "Fastest model, good for simple tasks",
-                },
-            ]
-        }
-
-    # Dedupe by bare model_id: the picker uses it as both the menu key and the
-    # stored value, and two providers can advertise the same id. First wins.
-    # Embedding-only models (e.g. nomic-embed-text) are dropped here: they show
-    # up in provider discovery but can't hold a chat, so they must not appear in
-    # the chat picker. Kept even though fetch_provider_models() now filters too,
-    # because pinned embedding models still arrive as deprecated orphans and
-    # fallback_models() never passes through that reader.
-    seen: set = set()
-    models = []
-    for m in all_models:
-        if m.is_embedding or not is_chat_model(m.provider_type, m.model_id):
-            continue
-        if m.model_id in seen:
-            continue
-        seen.add(m.model_id)
-        models.append(
-            {
-                "id": m.model_id,
-                "name": m.display_name,
-                "description": (
-                    f"{m.context_window // 1000}K context, "
-                    f"${m.input_cost_per_1k:.4f}/1K in / "
-                    f"${m.output_cost_per_1k:.4f}/1K out"
-                ),
-            }
-        )
-    return {"models": models}

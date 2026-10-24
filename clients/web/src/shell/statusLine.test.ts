@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest'
-import { foldStatus, type StatusReads } from './statusLine'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { authBypassed, foldStatus, type ProcessesRead, type StatusReads } from './statusLine'
 
 const reads = (health: StatusReads['health']): StatusReads => ({
   health,
@@ -39,7 +39,7 @@ describe('foldStatus processes', () => {
     processes,
   })
 
-  it.each([
+  it.each<[ProcessesRead['agent_layer'], string]>([
     ['no_token', 'Agent layer has no internal token.'],
     ['not_running', 'Agent layer is not running.'],
     ['unhealthy', 'Agent layer is not ready.'],
@@ -62,7 +62,7 @@ describe('foldStatus processes', () => {
   })
 
   it('says nothing when the read failed or the state is unknown', () => {
-    for (const processes of [null, { agent_layer: 'unknown', daemon: 'unknown' }]) {
+    for (const processes of [null, { agent_layer: 'unknown', daemon: 'unknown' } as const]) {
       expect(foldStatus(healthy(processes))).toEqual({ level: 'good', sentence: 'No problems reported.' })
     }
   })
@@ -71,7 +71,7 @@ describe('foldStatus processes', () => {
     expect(
       foldStatus({
         ...reads({ status: 'degraded', storage: { database_available: false, demo_mode: false } }),
-        processes: { agent_layer: 'not_running' },
+        processes: { agent_layer: 'not_running', daemon: 'running' },
       }),
     ).toEqual({ level: 'poor', sentence: 'Database is unavailable.' })
     expect(
@@ -112,5 +112,33 @@ describe('foldStatus tool servers', () => {
         ]),
       ),
     ).toEqual({ level: 'fair', sentence: 'MCP server splunk-selfhosted is disconnected.' })
+  })
+})
+
+describe('authBypassed', () => {
+  afterEach(() => vi.unstubAllEnvs())
+
+  it('is on when the build was made with the bypass on, before any read', () => {
+    vi.stubEnv('VITE_DEV_MODE', 'true')
+    expect(authBypassed(null)).toBe(true)
+  })
+
+  // The deployment this exists for: a prebuilt bundle, built with auth on,
+  // served by a backend running DEV_MODE=true.
+  it('is on when the backend reports the bypass, whatever the build said', () => {
+    vi.stubEnv('VITE_DEV_MODE', 'false')
+    expect(authBypassed({ auth_bypassed: true })).toBe(true)
+  })
+
+  it('is off when neither says so', () => {
+    vi.stubEnv('VITE_DEV_MODE', 'false')
+    expect(authBypassed({ auth_bypassed: false })).toBe(false)
+    vi.stubEnv('VITE_DEV_MODE', '')
+    expect(authBypassed({})).toBe(false)
+  })
+
+  it('claims nothing from a failed read', () => {
+    vi.stubEnv('VITE_DEV_MODE', 'false')
+    expect(authBypassed(null)).toBe(false)
   })
 })
